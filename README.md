@@ -25,9 +25,9 @@ Before using this repository, make sure your machine supports `x86-64-v3` or hig
 Append the following configuration to the bottom of your `/etc/pacman.conf`:
 
 ```ini
-[nanoka]
+[88kbleirad]
 SigLevel = Optional TrustAll
-Server = https://github.com/nhktmdzhg/my-arch-repo/releases/download/repository
+Server = https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository
 ```
 
 ### 3. Sync and Install
@@ -143,9 +143,9 @@ Trước khi dùng repository này, hãy chắc chắn rằng máy của bạn h
 Thêm đoạn cấu hình sau vào cuối file `/etc/pacman.conf`:
 
 ```ini
-[nanoka]
+[88kbleirad]
 SigLevel = Optional TrustAll
-Server = https://github.com/nhktmdzhg/my-arch-repo/releases/download/repository
+Server = https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository
 ```
 
 #### 3. Đồng bộ và cài đặt
