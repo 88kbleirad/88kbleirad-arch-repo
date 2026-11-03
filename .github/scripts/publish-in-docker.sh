@@ -135,7 +135,7 @@ fi
 
 set -o pipefail
 docker exec \
-  -e GH_TOKEN="$GH_TOKEN" \
+  -e GH_TOKEN \
   -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
   -e RELEASE_TAG="$RELEASE_TAG" \
   -e REPO_DB_NAME="$REPO_DB_NAME" \

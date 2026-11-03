@@ -1,29 +1,21 @@
 #!/usr/bin/env bash
 #
-# Run a package build inside a cachyos/cachyos-v4 container with an
-# explicitly managed lifecycle and full phase diagnostics.
+# Build a package *targeting* x86-64-v4 inside a generic Arch Linux
+# container (ghcr.io/archlinux/archlinux), which itself only requires the
+# x86-64 baseline ISA and therefore runs on any GitHub-hosted ubuntu-24.04
+# runner.
 #
-# Observed failure mode (runs #1-#3 + production on 2026-11-03): the
-# runner-hosted Docker daemon intermittently kills freshly started
-# containers within ~150ms of `docker start` (container reports "Up" then
-# immediately "exited"; subsequent execs fail with "cannot exec in a
-# stopped container" / exit 128). The image itself is fine — the same
-# digest builds successfully when the container survives.
+# Why not the CachyOS v4 image: its system libraries/binaries are compiled
+# with -march=x86-64-v4 (AVX-512 required, see ELF GNU property notes in
+# libc.so.6/bash). On hosted runners without AVX-512 every process dies
+# with SIGILL (container exit 132). The generic Arch image has no such
+# requirement, so host execution is always safe; we *target* v4 with the
+# toolchain flags instead of *executing* v4 system code.
 #
-# This script:
-#   1. prints runner/docker context (no secrets) so a failure is
-#      self-explanatory
-#   2. splits the boot into explicit phases — create, start, probe, stable
-#      hold, bootstrap — logging the exact exit code of each command
-#   3. requires 3 consecutive successful exec probes 1s apart before
-#      considering the container stable (a container that dies 150ms
-#      after start is caught immediately)
-#   4. on any phase failure, captures the container's corpse: inspect
-#      state (status/exit code/OOMKilled/StartedAt/FinishedAt), logs,
-#      `docker ps` — before removing it
-#   5. retries the whole boot cycle up to MAX_BOOT_ATTEMPTS with backoff
-#   6. runs the build via `docker exec`, then removes the container
-#      (trap) and propagates the build exit code
+# Lifecycle is explicitly managed (create/start/probe/bootstrap/build),
+# with phase diagnostics, corpse capture, bounded retries, and build exit
+# code propagation — identical to previous versions, minus the CPU gate
+# (host CPU is now audited, not required).
 #
 # Environment:
 #   PKG                  - repository directory / base package name (matrix entry)
@@ -33,8 +25,8 @@
 #   GITHUB_REPOSITORY    - owner/repo (REQUIRED for gh calls)
 #   GITHUB_WORKSPACE     - workspace root (mounted at the same path)
 #   BUILD_PROFILE        - architecture profile, default "x86-64-v4"
-#   IMAGE                - container image (default cachyos/cachyos-v4@sha256:068fe3…)
-#   MAX_BOOT_ATTEMPTS    - boot retries (default 6)
+#   IMAGE                - container image (default ghcr.io/archlinux/archlinux:latest)
+#   MAX_BOOT_ATTEMPTS    - boot retries (default 3)
 #   PID1_MODE            - PID 1 command: "tail" (default) or "sleep"
 
 set -uo pipefail
@@ -42,19 +34,35 @@ set -uo pipefail
 PKG="${PKG:?PKG is required}"
 GH_TOKEN="${GH_TOKEN:?GH_TOKEN is required}"
 WS="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
-IMAGE="${IMAGE:-cachyos/cachyos-v4@sha256:068fe3e3e3f088590cef1fe542ee26eb392413d6d9dbdbfb22a64c6b0e6aed23}"
-MAX_BOOT_ATTEMPTS="${MAX_BOOT_ATTEMPTS:-6}"
+IMAGE="${IMAGE:-ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981}"
+MAX_BOOT_ATTEMPTS="${MAX_BOOT_ATTEMPTS:-3}"
 PID1_MODE="${PID1_MODE:-tail}"
+BUILD_PROFILE="${BUILD_PROFILE:-x86-64-v4}"
 
 CID=""
 SUMMARY_FILE="$WS/.step-summary-$PKG.md"
-rm -f "$SUMMARY_FILE"
+RUNNER_INFO="$WS/output/v4-runner-info-$PKG.json"
+rm -f "$SUMMARY_FILE" "$WS/output/v4-runner-info-$PKG.json"
 
 die() { echo "::error::[$PKG] $*" >&2; exit 1; }
 phase() { echo "[$PKG] [phase=$1] $2"; }
 
 cleanup() { [[ -n "$CID" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+
+# -- host audit (record, don't gate) ---------------------------------------
+# We deliberately do NOT require AVX-512 on the host: generic Arch tools
+# only need the baseline ISA. We record CPU/compiler facts for the run
+# report, and verify the toolchain can *target* v4.
+
+cpu_flags() {
+  local src="${CPUINFO_FILE:-/proc/cpuinfo}"
+  awk -F: '/^flags/{print $2; exit}' "$src" 2>/dev/null || true
+}
+
+host_cpu_model() {
+  awk -F: '/^model name/{print $2; exit}' "${CPUINFO_FILE:-/proc/cpuinfo}" 2>/dev/null | sed 's/^ *//'
+}
 
 # -- diagnostics ------------------------------------------------------------
 
@@ -63,13 +71,17 @@ docker_ctx() {
   phase diag "docker server: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unavailable)"
   phase diag "docker server api: $(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || echo unavailable)"
   phase diag "storage driver: $(docker info --format '{{.Driver}}' 2>/dev/null || echo unavailable)"
-  phase diag "runtime: $(docker info --format '{{.Runtimes}}' 2>/dev/null || echo unavailable)"
 }
 
 # Capture corpse diagnostics before removal. Never prints env/token values.
 collect_diagnostics() {
   local why="$1"
   echo "::warning::[$PKG] ${why}; capturing container diagnostics before removal"
+  {
+    echo "--- host CPU ---"
+    echo "model: $(host_cpu_model)"
+    echo "flags: $(cpu_flags | tr ' ' '\n' | grep -E 'avx|bmi|fma|movbe' | tr '\n' ' ')"
+  } | sed 's/^/  /'
   if [[ -n "$CID" ]]; then
     {
       echo "--- docker inspect state ---"
@@ -93,7 +105,6 @@ pid1_cmd() {
   esac
 }
 
-# Create the container. Returns 0 and sets CID on success.
 create_container() {
   local rc
   local -a PID1_ARGS=()
@@ -115,7 +126,6 @@ create_container() {
   phase create "docker create ok id=${CID:0:12}"
 }
 
-# Start + require the container to stay alive through 3 probes, 1s apart.
 start_stable() {
   local rc i
   phase start "docker start ${CID:0:12}"
@@ -142,35 +152,36 @@ start_stable() {
 }
 
 bootstrap_container() {
-  # Install build tooling, create the builder user, and apply the CachyOS
-  # v4 compiler profiles (same content as the former workflow steps).
+  # Generic Arch container: install build tooling (baseline ISA only),
+  # create the builder user, then apply the CachyOS v4 *compiler profile*
+  # (text config; the compiler itself remains a generic-x86_64 binary).
   local rc
   docker exec -i "$CID" bash -s <<'EOS'
 set -euo pipefail
 
-# pacman sandbox network isolation (unshare) is not permitted inside this
-# container environment; disable it (same setting as the production workflow).
-tmp=$(mktemp)
-awk '
-  BEGIN { inserted=0 }
-  /^\[options\]$/ && !inserted { print; print "DisableSandboxNetwork"; inserted=1; next }
-  { print }
-  END { if (!inserted) exit 1 }
-' /etc/pacman.conf > "$tmp"
-cat "$tmp" > /etc/pacman.conf
-rm -f "$tmp"
+# pacman network sandbox isolation may be unsupported in some container
+# environments; disable it when the [options] section exists.
+if grep -q '^\[options\]$' /etc/pacman.conf; then
+  tmp=$(mktemp)
+  awk '
+    BEGIN { inserted=0 }
+    /^\[options\]$/ && !inserted { print; print "DisableSandboxNetwork"; inserted=1; next }
+    { print }
+    END { if (!inserted) exit 1 }
+  ' /etc/pacman.conf > "$tmp"
+  cat "$tmp" > /etc/pacman.conf
+  rm -f "$tmp"
+fi
 
 pacman -Syu --noconfirm --needed \
-  git subversion mercurial sudo rsync github-cli fakeroot binutils \
-  pacman-contrib paru curl awk tar jq rustup
+  base-devel git subversion mercurial sudo rsync github-cli fakeroot \
+  binutils pacman-contrib curl awk tar jq rustup
 
 id builder >/dev/null 2>&1 || useradd -m builder
 grep -q '^builder ALL=(ALL) NOPASSWD: ALL$' /etc/sudoers \
   || echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-rustup default stable
-sudo -u builder rustup default stable
-
+# Target architecture = x86-64-v4 (host remains generic x86-64).
 curl -fSL --retry 3 -o /etc/makepkg.conf \
   https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/makepkg.conf
 mkdir -p /etc/makepkg.conf.d
@@ -178,18 +189,56 @@ curl -fSL --retry 3 -o /etc/makepkg.conf.d/rust.conf \
   https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/rust.conf
 
 if ! grep -q -- '-march=x86-64-v4' /etc/makepkg.conf; then
-  echo "::error::CachyOS v4 makepkg.conf does not contain -march=x86-64-v4"
+  echo "::error::v4 makepkg.conf does not contain -march=x86-64-v4"
   exit 1
 fi
 if ! grep -q -- 'target-cpu=x86-64-v4' /etc/makepkg.conf.d/rust.conf; then
-  echo "::error::CachyOS v4 rust.conf does not contain target-cpu=x86-64-v4"
+  echo "::error::v4 rust.conf does not contain target-cpu=x86-64-v4"
   exit 1
 fi
-echo "Confirmed x86-64-v4 compiler flags."
+echo "Confirmed x86-64-v4 target flags."
 
 sed -i 's/^PKGDEST=/#PKGDEST=/g' /etc/makepkg.conf
 sed -i 's/^LOGDEST=/#LOGDEST=/g' /etc/makepkg.conf
+# PACKAGECARCH is a CachyOS makepkg fork extension; upstream makepkg
+# (7.1) ignores it and emits standard CARCH (x86_64/any) package metadata.
+# Neutralize it so a custom arch is never relied upon: v4 targeting comes
+# purely from -march/-C target-cpu, not from a custom arch label.
 sed -i 's/^PACKAGECARCH=/#PACKAGECARCH=/g' /etc/makepkg.conf
+# Belt-and-braces: refuse a custom PACKAGECARCH if the config still sets it.
+if grep -q '^PACKAGECARCH=x86_64_v4' /etc/makepkg.conf; then
+  echo "::error::PACKAGECARCH would mask standard arch metadata; aborting"
+  exit 1
+fi
+
+rustup default stable
+sudo -u builder rustup default stable
+
+# Verify the toolchain can target v4 (this is a compile-target check, not
+# a runtime requirement). Use files, never stdin: this script's stdin is
+# the bootstrap heredoc.
+echo 'int main(void){return 0;}' > /tmp/v4probe.c
+echo "--- gcc target check:"
+if gcc -march=x86-64-v4 /tmp/v4probe.c -o /tmp/v4probe 2>&1; then
+  echo "gcc -march=x86-64-v4 compiles OK (binary carries target ISA only;"
+  echo "it is not executed on this host)."
+else
+  echo "::error::gcc cannot target x86-64-v4 on this container"
+  rm -f /tmp/v4probe.c
+  exit 1
+fi
+rm -f /tmp/v4probe.c /tmp/v4probe
+
+echo "--- rustc target check:"
+printf 'fn main(){}\n' > /tmp/v4probe.rs
+if rustc -C target-cpu=x86-64-v4 /tmp/v4probe.rs -o /tmp/v4probe-rs 2>&1; then
+  echo "rustc -C target-cpu=x86-64-v4 compiles OK (target-only; not executed)."
+else
+  echo "::error::rustc cannot target x86-64-v4 on this container"
+  rm -f /tmp/v4probe.rs
+  exit 1
+fi
+rm -f /tmp/v4probe.rs /tmp/v4probe-rs
 EOS
   rc=$?
 
@@ -198,9 +247,6 @@ EOS
     return 1
   fi
 
-  # Workspace is mounted from the host (checked out by the runner user);
-  # give builder full ownership so makepkg can create src/pkg dirs and
-  # update checksums (same step as the former workflow).
   docker exec "$CID" chown -R builder:builder "$WS" || {
     phase bootstrap "chown failed rc=$?"
     return 1
@@ -209,8 +255,11 @@ EOS
 
 # -- main -------------------------------------------------------------------
 
+phase info "host CPU (recorded, not required): $(host_cpu_model)"
+phase info "host CPU v4 flags present: $(cpu_flags | tr ' ' '\n' | grep -c '^avx512')"
+
 docker_ctx
-phase info "image=$IMAGE pid1=$PID1_MODE attempts=$MAX_BOOT_ATTEMPTS"
+phase info "image=$IMAGE (generic Arch, baseline ISA host) pid1=$PID1_MODE attempts=$MAX_BOOT_ATTEMPTS"
 
 boot_rc=1
 for attempt in $(seq 1 "$MAX_BOOT_ATTEMPTS"); do
@@ -236,8 +285,10 @@ fi
 
 # Run the build. Explicit env propagation into the exec'ed process.
 set -o pipefail
+# Pass GH_TOKEN via env inheritance (`-e NAME`), never as argv, so the
+# token value does not appear in the host process list.
 docker exec \
-  -e GH_TOKEN="$GH_TOKEN" \
+  -e GH_TOKEN \
   -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
   -e RELEASE_TAG="$RELEASE_TAG" \
   -e REPO_DB_NAME="$REPO_DB_NAME" \
@@ -251,6 +302,37 @@ if [[ $build_rc -ne 0 ]]; then
   collect_diagnostics "build script exited rc=$build_rc"
   [[ -s "$SUMMARY_FILE" ]] && cat "$SUMMARY_FILE" > "$GITHUB_STEP_SUMMARY"
   exit "$build_rc"
+fi
+
+# Record host/toolchain facts for the run (compiled outside the container).
+mkdir -p "$WS/output"
+{
+  printf '{\n'
+  printf '  "package": %s,\n' "$(printf '%s' "$PKG" | jq -R .)"
+  printf '  "profile": %s,\n' "$(printf '%s' "$BUILD_PROFILE" | jq -R .)"
+  printf '  "build_image": %s,\n' "$(printf '%s' "$IMAGE" | jq -R .)"
+  printf '  "host": {\n'
+  printf '    "cpu": %s,\n' "$(printf '%s' "$(host_cpu_model)" | jq -R .)"
+  printf '    "avx512_flags": %s\n' "$(cpu_flags | tr ' ' '\n' | grep '^avx512' | tr '\n' ' ' | jq -R .)"
+  printf '  },\n'
+  printf '  "target": {\n'
+  printf '    "cflags": "-march=x86-64-v4",\n'
+  printf '    "rustflags": "-C target-cpu=x86-64-v4",\n'
+  printf '    "note": "compile-target verified; runtime ISA of produced ELF binaries is NOT guaranteed by this metadata"\n'
+  printf '  }\n'
+  printf '}\n'
+} > "$RUNNER_INFO" 2>/dev/null || true
+
+# Post-build package ISA audit: scan every ELF member of the produced
+# package for x86-64-v4 requirement (GNU property notes) and for EVEX
+# (AVX-512) instructions. This flags upstream/prebuilt v4-only binaries
+# embedded in a package (e.g. nmtui-go ships a prebuilt Go binary whose
+# ISA the PKGBUILD does not control). It is an informational report, not
+# a gate -- the package may intentionally contain v4 binaries (that is the
+# repository's purpose), and static EVEX counts can over-report due to
+# data/padding false positives. See .github/scripts/audit-package-isa.sh.
+if command -v bash >/dev/null 2>&1 && [[ -f "$WS/.github/scripts/audit-package-isa.sh" ]]; then
+  docker exec "$CID" bash "$WS/.github/scripts/audit-package-isa.sh" "$WS/output" "$PKG" || true
 fi
 
 [[ -s "$SUMMARY_FILE" ]] && cat "$SUMMARY_FILE" > "$GITHUB_STEP_SUMMARY"

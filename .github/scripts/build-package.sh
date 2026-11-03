@@ -287,30 +287,44 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
     warn "updpkgsums failed for $PKG; proceeding with existing checksums"
   fi
 
-  say "building $PKG with paru"
+  say "building $PKG"
   ASSUME_PKGS=$(sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && source PKGBUILD && echo \${pkgname[@]}")
   ASSUME_ARGS=""
   for subpkg in $ASSUME_PKGS; do
     ASSUME_ARGS="$ASSUME_ARGS --assume-installed $subpkg"
   done
-  PARU_FLAGS="--noconfirm --skipreview --useask --removemake --nocheck -B$ASSUME_ARGS"
+
+  # Build driver selection. paru is the AUR helper used in the CachyOS
+  # environment; the generic Arch build environment has no paru (it lives
+  # in the AUR / CachyOS repos, whose binaries are v4-tuned and unsafe to
+  # execute on non-AVX-512 hosts). When paru is absent, fall back to
+  # makepkg directly -- all staging dependencies resolve from the official
+  # Arch repositories, so no AUR helper is required.
   PARU_RC=0
-  sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && paru $PARU_FLAGS '$WORKSPACE/$PKG'" || PARU_RC=$?
+  if command -v paru >/dev/null 2>&1; then
+    BUILDER_NAME="paru"
+    PARU_FLAGS="--noconfirm --skipreview --useask --removemake --nocheck -B$ASSUME_ARGS"
+    sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && paru $PARU_FLAGS '$WORKSPACE/$PKG'" || PARU_RC=$?
+  else
+    BUILDER_NAME="makepkg"
+    warn "paru not found; using makepkg (dependencies must resolve from official repos)"
+    sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && makepkg --noconfirm --nocheck --syncdeps --needed" || PARU_RC=$?
+  fi
 
   # distinct diagnostics for the most common failure modes
   case "$PARU_RC" in
     0) ;;
     137)
-      warn "paru was killed with exit code 137 (OOM / out of memory). Build environment may need more memory."
+      warn "${BUILDER_NAME} was killed with exit code 137 (OOM / out of memory). Build environment may need more memory."
       ;;
     1)
-      warn "paru exited with code 1 (build error) for $PKG; checking whether package files were produced anyway."
+      warn "${BUILDER_NAME} exited with code 1 (build error) for $PKG; checking whether package files were produced anyway."
       ;;
     128)
-      warn "paru exited with code 128 (fatal) for $PKG; checking whether package files were produced anyway."
+      warn "${BUILDER_NAME} exited with code 128 (fatal) for $PKG; checking whether package files were produced anyway."
       ;;
     *)
-      warn "paru exited with code $PARU_RC for $PKG; checking whether package files were produced anyway."
+      warn "${BUILDER_NAME} exited with code $PARU_RC for $PKG; checking whether package files were produced anyway."
       ;;
   esac
 
@@ -331,7 +345,7 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
     echo "$PKG" > "$WORKSPACE/output/status-built-$PKG.txt"
     write_meta built "$FINGERPRINT"
   else
-    echo "Build failed for $PKG (paru rc=$PARU_RC)"
+    echo "Build failed for $PKG (${BUILDER_NAME} rc=$PARU_RC)"
     echo "Triggering fallback mechanism for $PKG..."
     FALLBACK_CANDIDATES=()
     PROTECT_NAMES=()
