@@ -14,11 +14,11 @@ If you just want to install packages that have already been built in this reposi
 
 ### 1. Check CPU compatibility
 
-This repository currently builds packages inside the `cachyos/cachyos-v3` Docker container.
+This repository currently builds packages inside the `cachyos/cachyos-v4` Docker container.
 
-That means the published binaries are intended for systems that support the `x86-64-v3` instruction set or newer.
+That means the published binaries are intended for systems that support the `x86-64-v4` instruction set (AVX-512).
 
-Before using this repository, make sure your machine supports `x86-64-v3` or higher. If your CPU only supports generic `x86-64`, the packages from this repository may not run correctly on your system.
+Before using this repository, make sure your machine supports `x86-64-v4` or higher. If your CPU only supports `x86-64-v3` or lower, the packages from this repository may not run correctly on your system.
 
 ### 2. Edit your `pacman.conf`
 
@@ -49,7 +49,7 @@ Want to build your own automated AUR farm? Follow these steps to fork and config
 
 ### Step 2: Choose the correct Docker container
 
-This repository currently uses the `cachyos/cachyos-v3` Docker container in `build-release.yml`.
+This repository currently uses the `cachyos/cachyos-v4` Docker container in `build-release.yml`, and the workflow verifies the compiler flags actually target `x86-64-v4`.
 
 If you fork this repository, choose the container that matches your target machines:
 
@@ -70,7 +70,7 @@ CachyOS makepkg profiles include:
 - `docker-makepkg-v4` for `x86-64-v4` builds.
 - `docker-makepkg-znver4` for AMD Zen 4 optimized builds.
 
-In practice, if you want to customize your own fork, review both the container image and the downloaded makepkg profile so they match your intended CPU target.
+In practice, if you want to customize your own fork, review both the container image and the downloaded makepkg profile so they match your intended CPU target. The build workflow refuses to continue if the downloaded profiles do not contain `-march=x86-64-v4` / `target-cpu=x86-64-v4`.
 
 ### Step 4: Local packages are supported
 
@@ -115,6 +115,8 @@ The entire repository is controlled by a single file: `packages.txt`.
 
 - The Sync Workflow runs on a schedule and when `packages.txt` changes. It reads `packages.txt`, pulls the latest PKGBUILDs from the AUR, skips `local:` entries, deletes removed packages, and creates a clean Pull Request.
 - The Publish Workflow runs on schedule, on push to `main`, or manually. It checks existing assets, reuses cached packages when possible, falls back to previous release files if needed, generates a fresh pacman database, and uploads everything to the repository Release tag.
+- Matrix builds are limited to **2 concurrent jobs** (`max-parallel: 2`).
+- Caching is architecture-aware: each package carries a `v4-<pkg>.meta.json` metadata file (profile + fingerprint of the `PKGBUILD` and compiler config). A cached package is reused only when the profile matches the current build target and the fingerprint matches; `x86-64-v3`-era binaries are never reused for `x86-64-v4` builds.
 
 **Disclaimer:** `SigLevel = Optional TrustAll` is used for convenience in this personal setup, meaning packages are not GPG-signed. Only use this configuration for repositories you fully control or trust.
 
@@ -132,11 +134,11 @@ Nếu bạn chỉ muốn cài các gói đã được build sẵn từ repositor
 
 #### 1. Kiểm tra khả năng tương thích CPU
 
-Repository này hiện build package trực tiếp bên trong Docker container `cachyos/cachyos-v3`.
+Repository này hiện build package trực tiếp bên trong Docker container `cachyos/cachyos-v4`.
 
-Điều đó có nghĩa là các gói nhị phân được phát hành được nhắm tới các máy hỗ trợ tập lệnh `x86-64-v3` trở lên.
+Điều đó có nghĩa là các gói nhị phân được phát hành được nhắm tới các máy hỗ trợ tập lệnh `x86-64-v4` (AVX-512).
 
-Trước khi dùng repository này, hãy chắc chắn rằng máy của bạn hỗ trợ `x86-64-v3` hoặc cao hơn. Nếu CPU của bạn chỉ hỗ trợ mức `x86-64` generic, các gói từ repository này có thể không chạy đúng trên hệ thống của bạn.
+Trước khi dùng repository này, hãy chắc chắn rằng máy của bạn hỗ trợ `x86-64-v4` hoặc cao hơn. Nếu CPU của bạn chỉ hỗ trợ mức `x86-64-v3` hoặc thấp hơn, các gói từ repository này có thể không chạy đúng trên hệ thống của bạn.
 
 #### 2. Chỉnh sửa `pacman.conf`
 
@@ -167,7 +169,7 @@ Nếu bạn muốn tự dựng một hệ thống build AUR tự động cho tà
 
 #### Bước 2: Chọn Docker container phù hợp
 
-Repository này hiện đang dùng Docker container `cachyos/cachyos-v3` trong workflow `build-release.yml`.
+Repository này hiện đang dùng Docker container `cachyos/cachyos-v4` trong workflow `build-release.yml`, và workflow sẽ xác minh rằng cờ compiler thực sự nhắm `x86-64-v4`.
 
 Nếu bạn fork repository này, hãy chọn container phù hợp với máy đích của bạn:
 

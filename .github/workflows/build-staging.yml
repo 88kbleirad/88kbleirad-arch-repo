@@ -1,0 +1,255 @@
+name: Build and Publish Staging Repository (v4 test)
+
+# STAGING WORKFLOW — does NOT run on the production cron schedule.
+# Only runs when triggered manually with the "Run workflow" button
+# (workflow_dispatch) or via the gh CLI:
+#   gh workflow run build-staging.yml -f packages=nmtui-go,osu-mime
+# It publishes to the `repository-v4-test` release tag only; the
+# production `repository` release is never touched by this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Comma-separated package directories to build (default: nmtui-go,osu-mime)'
+        required: false
+        default: 'nmtui-go,osu-mime'
+      include-ksuperkey:
+        description: 'Include ksuperkey (3rd noncritical package)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-repo-v4-test
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: repository-v4-test
+  REPO_DB_NAME: 88kbleirad
+  BUILD_PROFILE: x86-64-v4
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Build staging matrix
+        id: set-matrix
+        run: |
+          set -euo pipefail
+          # default set from input, or the two canonical smoke packages
+          IN="${{ inputs.packages }}"
+          if [[ -z "$IN" ]]; then
+            IN="nmtui-go,osu-mime"
+          fi
+          if [[ "${{ inputs.include-ksuperkey }}" == "true" ]]; then
+            IN="${IN},ksuperkey"
+          fi
+
+          pkgs=()
+          IFS=',' read -r -a requested <<< "$IN"
+          for pkg in "${requested[@]}"; do
+            pkg="$(echo "$pkg" | xargs)"
+            [[ -n "$pkg" ]] || continue
+            if [[ ! -f "$pkg/PKGBUILD" ]]; then
+              echo "::error::requested package '$pkg' has no PKGBUILD directory; aborting"
+              exit 1
+            fi
+            # staging safety: never allow system-critical packages
+            case "$pkg" in
+              pacman|nvidia-utils|lib32-nvidia-utils|xlibre-xserver|networkmanager-iwd|linux-nanoka)
+                echo "::error::system-critical package '$pkg' is forbidden in staging"
+                exit 1
+                ;;
+            esac
+            pkgs+=("$pkg")
+          done
+
+          if (( ${#pkgs[@]} == 0 )); then
+            echo "::error::no valid packages requested"
+            exit 1
+          fi
+
+          MATRIX_JSON=$(printf '%s\n' "${pkgs[@]}" | jq -R . | jq -s -c .)
+          echo "staging matrix: $MATRIX_JSON"
+          echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Staging build ($RELEASE_TAG)"
+            echo ""
+            echo "- Packages: ${pkgs[*]}"
+            echo "- Target: x86-64-v4 (CachyOS)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: cachyos/cachyos-v4
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        package: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      PKG: ${{ matrix.package }}
+    steps:
+      - name: Install base dependencies
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed git subversion mercurial sudo rsync github-cli fakeroot binutils pacman-contrib paru curl awk tar jq rustup
+          id builder >/dev/null 2>&1 || useradd -m builder
+          grep -q '^builder ALL=(ALL) NOPASSWD: ALL$' /etc/sudoers || echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          rustup default stable
+          sudo -u builder rustup default stable
+
+      - name: Configure makepkg for x86-64-v4 optimization
+        run: |
+          set -euo pipefail
+          curl -fSL --retry 3 -o /etc/makepkg.conf \
+            https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/makepkg.conf
+          mkdir -p /etc/makepkg.conf.d
+          curl -fSL --retry 3 -o /etc/makepkg.conf.d/rust.conf \
+            https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/rust.conf
+          if ! grep -q -- '-march=x86-64-v4' /etc/makepkg.conf; then
+            echo "::error::CachyOS v4 makepkg.conf does not contain -march=x86-64-v4"
+            exit 1
+          fi
+          if ! grep -q -- 'target-cpu=x86-64-v4' /etc/makepkg.conf.d/rust.conf; then
+            echo "::error::CachyOS v4 rust.conf does not contain target-cpu=x86-64-v4"
+            exit 1
+          fi
+          echo "Confirmed x86-64-v4 compiler flags."
+          sed -i 's/^PKGDEST=/#PKGDEST=/g' /etc/makepkg.conf
+          sed -i 's/^LOGDEST=/#LOGDEST=/g' /etc/makepkg.conf
+          sed -i 's/^PACKAGECARCH=/#PACKAGECARCH=/g' /etc/makepkg.conf
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Fix workspace ownership for build user
+        run: chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Build package (architecture-aware cache)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/build-package.sh"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pkg-${{ matrix.package }}
+          path: output/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    container:
+      image: ghcr.io/archlinux/archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed github-cli pacman-contrib jq libarchive
+
+      - name: Checkout repository (for validation scripts)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: output
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Validate package archives and metadata
+        run: |
+          set -euo pipefail
+          cd output
+          shopt -s nullglob
+          pkgs=( *.pkg.tar.zst )
+          if (( ${#pkgs[@]} == 0 )); then
+            echo "::error::No package files produced in this run."
+            exit 1
+          fi
+          for pkg in "${pkgs[@]}"; do
+            if ! bsdtar -tf "$pkg" >/dev/null 2>&1; then
+              echo "::error::Package archive corrupt: $pkg"
+              exit 1
+            fi
+            if ! bsdtar -xOf "$pkg" .PKGINFO 2>/dev/null | grep -q '^pkgname = '; then
+              echo "::error::Package missing .PKGINFO: $pkg"
+              exit 1
+            fi
+            echo "Validated: $pkg"
+          done
+
+      - name: Generate fresh pacman database for staging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd output
+          shopt -s nullglob
+          pkgs=( *.pkg.tar.zst )
+          rm -f status-*.txt protect-*.txt
+          repo-add "${REPO_DB_NAME}.db.tar.gz" "${pkgs[@]}"
+
+      - name: Validate repository consistency
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD/output" "$REPO_DB_NAME" | tee "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish to staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          REPO="${{ github.repository }}"
+          TAG="${{ env.RELEASE_TAG }}"
+          cd output
+
+          pkg_assets=( *.pkg.tar.zst )
+          if (( ${#pkg_assets[@]} == 0 )); then
+            echo "::error::No package files in output/; refusing to publish."
+            exit 1
+          fi
+          db_assets=( "${REPO_DB_NAME}".db* "${REPO_DB_NAME}".files* )
+          if (( ${#db_assets[@]} == 0 )); then
+            echo "::error::No pacman database files in output/; refusing to publish a repository without a database."
+            exit 1
+          fi
+          meta_assets=( v4-*.meta.json )
+          if (( ${#meta_assets[@]} == 0 )); then
+            echo "::error::No architecture metadata files; refusing to publish."
+            exit 1
+          fi
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Staging release $TAG exists; replacing it."
+            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+          fi
+          echo "Creating staging release $TAG."
+          gh release create "$TAG" --repo "$REPO" \
+            --title "Staging repository (v4 test)" \
+            --notes "Staging buildup: $(date -u '+%Y-%m-%d %H:%M UTC') — x86-64-v4"
+          gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" \
+            --repo "$REPO" --clobber
+          echo "Published staging release: $REPO/releases/tag/$TAG"

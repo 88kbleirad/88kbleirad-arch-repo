@@ -105,6 +105,8 @@ jobs:
             case "$dir" in
               .github) continue ;;
             esac
+            # Never treat metadata files or helper dirs as packages.
+            [[ -f "$dir/PKGBUILD" ]] || continue
             if ! printf '%s\n' "${VALID_PKGS[@]}" | grep -q -x "$dir"; then
               echo "Removing obsolete package directory: $dir"
               rm -rf "$dir"
@@ -198,6 +200,24 @@ jobs:
 
           echo "synced=${SYNCED[*]:-}" >> "$GITHUB_OUTPUT"
           echo "failed=${FAILED[*]:-}" >> "$GITHUB_OUTPUT"
+
+          # Definition validation: every enabled entry in packages.txt must now
+          # have a PKGBUILD (or the sync of that package failed).
+          MISSING_DEFS=()
+          while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+            pkg_entry="$(echo "$raw_line" | sed 's/#.*//' | xargs)"
+            [[ -z "$pkg_entry" ]] && continue
+            pkg="${pkg_entry#local:}"
+            if [[ ! -f "$pkg/PKGBUILD" ]]; then
+              echo "::warning::Invalid package definition: packages.txt entry '$pkg_entry' has no PKGBUILD"
+              MISSING_DEFS+=("$pkg_entry")
+            fi
+          done < packages.txt
+
+          if (( ${#MISSING_DEFS[@]} > 0 )); then
+            echo "missing_defs=${MISSING_DEFS[*]}" >> "$GITHUB_OUTPUT"
+            echo "::warning::The following packages.txt entries have missing definitions; they will be skipped by the build: ${MISSING_DEFS[*]}"
+          fi
           echo "removed=${REMOVED[*]:-}" >> "$GITHUB_OUTPUT"
 
           echo "### Sync summary" >> "$GITHUB_STEP_SUMMARY"
