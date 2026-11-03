@@ -20,7 +20,7 @@ concurrency:
 
 env:
   RELEASE_TAG: repository
-  REPO_DB_NAME: nanoka
+  REPO_DB_NAME: 88kbleirad
 
 jobs:
   prepare:
