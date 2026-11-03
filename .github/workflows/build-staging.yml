@@ -94,69 +94,27 @@ jobs:
   build:
     needs: prepare
     runs-on: ubuntu-latest
-    container:
-      image: cachyos/cachyos-v4
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Temporary isolation test: sequential builds while the container
+      # lifecycle fix is validated. Restore to 2 once staging is stable.
+      max-parallel: 1
       matrix:
         package: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:
       PKG: ${{ matrix.package }}
     steps:
-      - name: Verify container health
-        run: |
-          set -euo pipefail
-          # Exit code 128 at this point previously meant the container init
-          # process died before the first step could run (a runner-level
-          # lifecycle failure, not a command failure). Fail fast with a clear
-          # message so the run is obviously retryable.
-          [[ -x /usr/bin/pacman ]] || { echo "::error::container binary missing; container init failed"; exit 128; }
-          echo "container healthy: $(cat /etc/os-release | grep '^PRETTY_NAME=' | head -1)"
-
-      - name: Install base dependencies
-        run: |
-          set -euo pipefail
-          pacman -Syu --noconfirm --needed git subversion mercurial sudo rsync github-cli fakeroot binutils pacman-contrib paru curl awk tar jq rustup
-          id builder >/dev/null 2>&1 || useradd -m builder
-          grep -q '^builder ALL=(ALL) NOPASSWD: ALL$' /etc/sudoers || echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          rustup default stable
-          sudo -u builder rustup default stable
-
-      - name: Configure makepkg for x86-64-v4 optimization
-        run: |
-          set -euo pipefail
-          curl -fSL --retry 3 -o /etc/makepkg.conf \
-            https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/makepkg.conf
-          mkdir -p /etc/makepkg.conf.d
-          curl -fSL --retry 3 -o /etc/makepkg.conf.d/rust.conf \
-            https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/rust.conf
-          if ! grep -q -- '-march=x86-64-v4' /etc/makepkg.conf; then
-            echo "::error::CachyOS v4 makepkg.conf does not contain -march=x86-64-v4"
-            exit 1
-          fi
-          if ! grep -q -- 'target-cpu=x86-64-v4' /etc/makepkg.conf.d/rust.conf; then
-            echo "::error::CachyOS v4 rust.conf does not contain target-cpu=x86-64-v4"
-            exit 1
-          fi
-          echo "Confirmed x86-64-v4 compiler flags."
-          sed -i 's/^PKGDEST=/#PKGDEST=/g' /etc/makepkg.conf
-          sed -i 's/^LOGDEST=/#LOGDEST=/g' /etc/makepkg.conf
-          sed -i 's/^PACKAGECARCH=/#PACKAGECARCH=/g' /etc/makepkg.conf
-
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
-      - name: Fix workspace ownership for build user
-        run: chown -R builder:builder "$GITHUB_WORKSPACE"
-
-      - name: Build package (architecture-aware cache)
+      - name: Build package in managed container (architecture-aware cache)
         env:
           GH_TOKEN: ${{ github.token }}
+          IMAGE: cachyos/cachyos-v4:latest
         run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/build-package.sh"
+          bash "$GITHUB_WORKSPACE/.github/scripts/build-in-docker.sh"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
@@ -171,12 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    container:
-      image: ghcr.io/archlinux/archlinux:latest
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed github-cli pacman-contrib jq libarchive
-
       - name: Checkout repository (for validation scripts)
         uses: actions/checkout@v7
         with:
@@ -189,77 +142,9 @@ jobs:
           pattern: pkg-*
           merge-multiple: true
 
-      - name: Validate package archives and metadata
-        run: |
-          set -euo pipefail
-          cd output
-          shopt -s nullglob
-          pkgs=( *.pkg.tar.zst )
-          if (( ${#pkgs[@]} == 0 )); then
-            echo "::error::No package files produced in this run."
-            exit 1
-          fi
-          for pkg in "${pkgs[@]}"; do
-            if ! bsdtar -tf "$pkg" >/dev/null 2>&1; then
-              echo "::error::Package archive corrupt: $pkg"
-              exit 1
-            fi
-            if ! bsdtar -xOf "$pkg" .PKGINFO 2>/dev/null | grep -q '^pkgname = '; then
-              echo "::error::Package missing .PKGINFO: $pkg"
-              exit 1
-            fi
-            echo "Validated: $pkg"
-          done
-
-      - name: Generate fresh pacman database for staging
+      - name: Validate, build database and publish in managed container
         env:
           GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/archlinux/archlinux:latest
         run: |
-          set -euo pipefail
-          cd output
-          shopt -s nullglob
-          pkgs=( *.pkg.tar.zst )
-          rm -f status-*.txt protect-*.txt
-          repo-add "${REPO_DB_NAME}.db.tar.gz" "${pkgs[@]}"
-
-      - name: Validate repository consistency
-        run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD/output" "$REPO_DB_NAME" | tee "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish to staging release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          REPO="${{ github.repository }}"
-          TAG="${{ env.RELEASE_TAG }}"
-          cd output
-
-          pkg_assets=( *.pkg.tar.zst )
-          if (( ${#pkg_assets[@]} == 0 )); then
-            echo "::error::No package files in output/; refusing to publish."
-            exit 1
-          fi
-          db_assets=( "${REPO_DB_NAME}".db* "${REPO_DB_NAME}".files* )
-          if (( ${#db_assets[@]} == 0 )); then
-            echo "::error::No pacman database files in output/; refusing to publish a repository without a database."
-            exit 1
-          fi
-          meta_assets=( v4-*.meta.json )
-          if (( ${#meta_assets[@]} == 0 )); then
-            echo "::error::No architecture metadata files; refusing to publish."
-            exit 1
-          fi
-
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Staging release $TAG exists; replacing it."
-            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
-          fi
-          echo "Creating staging release $TAG."
-          gh release create "$TAG" --repo "$REPO" \
-            --title "Staging repository (v4 test)" \
-            --notes "Staging buildup: $(date -u '+%Y-%m-%d %H:%M UTC') — x86-64-v4"
-          gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" \
-            --repo "$REPO" --clobber
-          echo "Published staging release: $REPO/releases/tag/$TAG"
+          bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
