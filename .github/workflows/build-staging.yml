@@ -34,7 +34,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -93,7 +93,7 @@ jobs:
 
   build:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       # Temporary isolation test: sequential builds while the container
@@ -112,7 +112,7 @@ jobs:
       - name: Build package in managed container (architecture-aware cache)
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE: cachyos/cachyos-v4:latest
+          IMAGE: cachyos/cachyos-v4@sha256:068fe3e3e3f088590cef1fe542ee26eb392413d6d9dbdbfb22a64c6b0e6aed23
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/build-in-docker.sh"
 
@@ -126,7 +126,7 @@ jobs:
 
   publish:
     needs: [prepare, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
