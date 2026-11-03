@@ -104,6 +104,16 @@ jobs:
     env:
       PKG: ${{ matrix.package }}
     steps:
+      - name: Verify container health
+        run: |
+          set -euo pipefail
+          # Exit code 128 at this point previously meant the container init
+          # process died before the first step could run (a runner-level
+          # lifecycle failure, not a command failure). Fail fast with a clear
+          # message so the run is obviously retryable.
+          [[ -x /usr/bin/pacman ]] || { echo "::error::container binary missing; container init failed"; exit 128; }
+          echo "container healthy: $(cat /etc/os-release | grep '^PRETTY_NAME=' | head -1)"
+
       - name: Install base dependencies
         run: |
           set -euo pipefail

@@ -43,13 +43,29 @@ note() { printf '::notice::[%s] %s\n' "$PKG" "$*"; }
 
 gh_download_retry() {
   # usage: gh_download_retry <pattern> <dir>
+  # Returns:
+  #   0 - downloaded and verified (file exists, non-empty)
+  #   1 - command failed
+  #   2 - command succeeded but no/empty file was produced (pattern matched nothing)
   local pattern="$1" dir="$2" attempt rc
   for attempt in 1 2 3; do
-    if gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-        --dir "$dir" --pattern "$pattern" 2>/dev/null; then
-      return 0
-    fi
+    gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+        --dir "$dir" --pattern "$pattern" 2>/dev/null
     rc=$?
+    if [[ $rc -eq 0 ]]; then
+      # gh exits 0 even when the pattern matches nothing; verify the file.
+      local f=""
+      shopt -s nullglob
+      for candidate in "$dir"/$(basename "$pattern"); do
+        [[ -s "$candidate" ]] && f="$candidate"
+      done
+      shopt -u nullglob
+      if [[ -n "$f" ]]; then
+        return 0
+      fi
+      warn "download reported success for '$pattern' but no file was produced"
+      return 2
+    fi
     warn "download attempt $attempt/3 failed for '$pattern' (rc=$rc)"
     [[ $attempt -lt 3 ]] && sleep 5
   done
@@ -168,7 +184,9 @@ if gh_download_retry "${REPO_DB_NAME}.files.tar.gz" /tmp/repo-db; then
     warn "cannot extract ${REPO_DB_NAME}.files.tar.gz; every package will be rebuilt"
   fi
 else
-  warn "no ${REPO_DB_NAME}.files.tar.gz asset in release '$RELEASE_TAG'; every package will be rebuilt"
+  # rc=2 means the release has no such asset yet: expected on the very first
+  # run against a new tag; rc=1 means the command itself failed.
+  say "no ${REPO_DB_NAME}.files.tar.gz in release '$RELEASE_TAG' (expected on first run); every package will be rebuilt"
 fi
 
 PREV_META=""
@@ -230,8 +248,14 @@ if [[ "$NEEDS_BUILD" == "false" ]]; then
   CACHE_OK=true
   for pkg_path in $EXPECTED_PKGS; do
     pkg_basename=$(basename "$pkg_path")
-    if ! gh_download_retry "$pkg_basename" "$WORKSPACE/output"; then
-      warn "failed to fetch $pkg_basename; forcing rebuild"
+    gh_download_retry "$pkg_basename" "$WORKSPACE/output"
+    download_rc=$?
+    if [[ $download_rc -ne 0 ]]; then
+      if [[ $download_rc -eq 2 ]]; then
+        warn "cached binary $pkg_basename not in release (expected after an update); forcing rebuild"
+      else
+        warn "failed to fetch $pkg_basename (rc=$download_rc); forcing rebuild"
+      fi
       CACHE_OK=false
       break
     fi
@@ -349,8 +373,12 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
 
     for file_name in "${FALLBACK_CANDIDATES[@]}"; do
       echo "Restoring $file_name from previous release"
-      if gh_download_retry "$file_name" "$WORKSPACE/output"; then
+      gh_download_retry "$file_name" "$WORKSPACE/output"
+      restore_rc=$?
+      if [[ $restore_rc -eq 0 ]]; then
         RESTORED_COUNT=$(( RESTORED_COUNT + 1 ))
+      elif [[ $restore_rc -eq 2 ]]; then
+        warn "restore candidate $file_name is no longer in the release; skipping"
       else
         warn "could not restore $file_name for $PKG; it will be kept in the release"
         PROTECT_NAMES+=("$file_name")
