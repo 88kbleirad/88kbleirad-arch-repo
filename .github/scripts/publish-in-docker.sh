@@ -25,7 +25,9 @@ set -uo pipefail
 
 GH_TOKEN="${GH_TOKEN:?GH_TOKEN is required}"
 WS="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
-IMAGE="${IMAGE:-ghcr.io/archlinux/archlinux:latest}"
+IMAGE="${IMAGE:-ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981}"
+# publish script to run inside the container (default: staging publish)
+PUBLISH_SCRIPT="${PUBLISH_SCRIPT:-publish-stage.sh}"
 MAX_BOOT_ATTEMPTS="${MAX_BOOT_ATTEMPTS:-6}"
 PID1_MODE="${PID1_MODE:-tail}"
 
@@ -140,7 +142,8 @@ docker exec \
   -e RELEASE_TAG="$RELEASE_TAG" \
   -e REPO_DB_NAME="$REPO_DB_NAME" \
   -e GITHUB_STEP_SUMMARY="$SUMMARY_FILE" \
-  "$CID" bash "$WS/.github/scripts/publish-stage.sh"
+  -e EXCLUDED_BASES_FILE="${EXCLUDED_BASES_FILE:-}" \
+  "$CID" bash "$WS/.github/scripts/$PUBLISH_SCRIPT"
 rc=$?
 
 if [[ $rc -ne 0 ]]; then

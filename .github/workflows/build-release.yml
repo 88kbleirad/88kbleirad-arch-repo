@@ -1,15 +1,45 @@
 name: Build and Publish Arch Repository
 
+# PRODUCTION WORKFLOW — migration to GitHub-hosted runners + generic Arch
+# container (see build-in-docker.sh for the ISA rationale).
+#
+# RUN MODE (manual-only until explicitly approved):
+#   - The cron schedule is DISABLED. The workflow can only be started by
+#     `workflow_dispatch` (UI button or `gh workflow run`), with an extra
+#     confirmation input `confirm-production`).
+#   - Enable the schedule only after a successful manual production
+#     verification run (change `schedule:` back to `- cron: '15 * * * *'`
+#     in a PR approved by the repository owner).
+#
+# The publish job is non-destructive: it uploads refreshed assets with
+# `--clobber` into the existing release, deletes only assets that are
+# stale relative to packages.txt AND not protected by a failed/restored
+# build, and never deletes/recreates the release itself. The repository
+# database is generated AFTER validate-release.sh confirms archive
+# integrity and DB↔asset consistency.
+
 on:
-  schedule:
-    - cron: '15 * * * *'
-  push:
-    branches: [main]
-    paths-ignore:
-      - '.github/**'
-      - 'README.md'
-      - 'packages.txt'
-  workflow_dispatch: {}
+  # DISABLED during migration: re-enable only after manual production
+  # verification passes.
+  # schedule:
+  #   - cron: '15 * * * *'
+  workflow_dispatch:
+    inputs:
+      confirm-production:
+        description: 'Type YES to run a production build/update (manual verification)'
+        required: true
+        type: string
+        default: ''
+      packages:
+        description: 'Comma-separated package names to build from packages.txt. Leave empty to build the full packages.txt matrix (minus system-critical packages).'
+        required: false
+        type: string
+        default: ''
+      allow-critical:
+        description: 'Comma-separated system-critical packages to include (e.g. linux-nanoka). Leave empty to exclude them all.'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -22,18 +52,31 @@ env:
   RELEASE_TAG: repository
   REPO_DB_NAME: 88kbleirad
   BUILD_PROFILE: x86-64-v4
+  # digest-pinned generic Arch Linux container (baseline x86-64 ISA)
+  BUILD_IMAGE: ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       missing: ${{ steps.set-matrix.outputs.missing }}
+      excluded_bases_file: ${{ steps.set-matrix.outputs.excluded_bases_file }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+
+      - name: Require explicit production confirmation (manual mode)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          CONFIRM="${{ github.event.inputs.confirm-production }}"
+          if [[ "$CONFIRM" != "YES" ]]; then
+            echo "::error::Production runs require the 'confirm-production' input set to YES (manual verification mode)."
+            exit 1
+          fi
 
       - name: Generate matrix from packages.txt (single source of truth)
         id: set-matrix
@@ -44,23 +87,125 @@ jobs:
             exit 1
           fi
 
+          # System-critical packages are EXCLUDED from the automatic matrix.
+          # They are built only when a manual run explicitly approves them
+          # by exact name via the `allow-critical` input (and never on a
+          # scheduled run, which has no inputs).
+          CRITICAL=(
+            pacman
+            nvidia-utils lib32-nvidia-utils
+            xlibre-xserver xlibre-xserver-src xlibre-input-libinput
+            linux-nanoka
+            networkmanager-iwd
+          )
+          APPROVED_CRITICAL=()
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            IFS=',' read -r -a requested_critical <<< "${{ inputs.allow-critical }}"
+            for c in "${requested_critical[@]}"; do
+              c="$(echo "$c" | xargs)"
+              [[ -n "$c" ]] || continue
+              if ! printf '%s\n' "${CRITICAL[@]}" | grep -qx "$c"; then
+                echo "::error::'$c' is not a known system-critical package; refusing the approval list."
+                exit 1
+              fi
+              APPROVED_CRITICAL+=("$c")
+            done
+          fi
+          is_approved() {
+            local pkg="$1" c
+            for c in "${APPROVED_CRITICAL[@]:-}"; do
+              [[ "$pkg" == "$c" ]] && return 0
+            done
+            return 1
+          }
+          is_critical() {
+            local pkg="$1" c
+            for c in "${CRITICAL[@]}"; do
+              [[ "$pkg" == "$c" ]] && return 0
+            done
+            return 1
+          }
+          # true when the package appears in the dispatch `packages` input
+          is_requested() {
+            local pkg="$1" req
+            [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || return 1
+            [[ -n "${{ inputs.packages }}" ]] || return 1
+            IFS=',' read -r -a _reqs <<< "${{ inputs.packages }}"
+            for req in "${_reqs[@]}"; do
+              [[ "$(echo "$req" | xargs)" == "$pkg" ]] && return 0
+            done
+            return 1
+          }
+
           pkgs=()
           missing=()
+          excluded=()
+          REQUESTED_SUBSET=false
+
+          # Optional subset: validate every requested name against
+          # packages.txt (single source of truth). Unknown names fail the
+          # run loudly instead of silently building nothing.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.packages }}" ]]; then
+            REQUESTED_SUBSET=true
+            declare -A PACKAGES_TXT=()
+            while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+              pkg_entry="$(echo "$raw_line" | sed 's/#.*//' | xargs)"
+              [[ -z "$pkg_entry" ]] && continue
+              PACKAGES_TXT["${pkg_entry#local:}"]=1
+            done < packages.txt
+
+            IFS=',' read -r -a requested <<< "${{ inputs.packages }}"
+            for req in "${requested[@]}"; do
+              req="$(echo "$req" | xargs)"
+              [[ -n "$req" ]] || continue
+              if [[ -z "${PACKAGES_TXT[$req]:-}" ]]; then
+                echo "::error::Requested package '$req' is not listed in packages.txt; refusing subset selection."
+                exit 1
+              fi
+            done
+          fi
+
           while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
             pkg_entry="$(echo "$raw_line" | sed 's/#.*//' | xargs)"
             [[ -z "$pkg_entry" ]] && continue
             # local: prefix marks manually maintained packages inside the repo
             pkg="${pkg_entry#local:}"
-            if [[ -f "$pkg/PKGBUILD" ]]; then
-              pkgs+=("$pkg")
-            else
+            if [[ ! -f "$pkg/PKGBUILD" ]]; then
               echo "::warning::packages.txt entry '$pkg' has no PKGBUILD directory; skipped"
               missing+=("$pkg")
+              continue
             fi
+            if is_critical "$pkg"; then
+              if is_approved "$pkg"; then
+                echo "::notice::system-critical package '$pkg' explicitly approved for this run."
+                pkgs+=("$pkg")
+              elif is_requested "$pkg"; then
+                # explicit user request for a system-critical package
+                # without allow-critical approval: fail loudly, never
+                # silently drop the request
+                echo "::error::Requested system-critical package '$pkg' requires explicit approval. Add '$pkg' to the 'allow-critical' input to build it."
+                exit 1
+              else
+                echo "::warning::system-critical package '$pkg' excluded from the default matrix (requires explicit 'allow-critical' approval)."
+                excluded+=("$pkg")
+              fi
+              continue
+            fi
+            if [[ "$REQUESTED_SUBSET" == "true" ]]; then
+              # subset mode: keep only requested noncritical packages
+              selected=0
+              IFS=',' read -r -a requested <<< "${{ inputs.packages }}"
+              for req in "${requested[@]}"; do
+                req="$(echo "$req" | xargs)"
+                [[ "$req" == "$pkg" ]] && { selected=1; break; }
+              done
+              [[ $selected -eq 1 ]] || continue
+            fi
+            pkgs+=("$pkg")
           done < packages.txt
 
           if (( ${#pkgs[@]} == 0 )); then
-            echo "::error::No buildable packages found in packages.txt"
+            echo "::error::No buildable packages found (empty selection). Refusing to run."
             exit 1
           fi
 
@@ -70,6 +215,14 @@ jobs:
           if (( ${#missing[@]} > 0 )); then
             echo "missing=$(printf '%s,' "${missing[@]}" | sed 's/,$//')" >> "$GITHUB_OUTPUT"
           fi
+          if (( ${#excluded[@]} > 0 )); then
+            echo "excluded=$(printf '%s,' "${excluded[@]}" | sed 's/,$//')" >> "$GITHUB_OUTPUT"
+            # publish-prod.sh must never prune assets of excluded packages
+            printf '%s\n' "${excluded[@]}" > output-excluded-bases.txt
+            # also expose as a job output so downstream jobs can pass it
+            # through to the publish container
+            echo "excluded_bases_file=output-excluded-bases.txt" >> "$GITHUB_OUTPUT"
+          fi
 
           {
             echo "## Package selection (packages.txt)"
@@ -78,14 +231,15 @@ jobs:
             if (( ${#missing[@]} > 0 )); then
               echo "- Missing PKGBUILD definitions (skipped): ${missing[*]}"
             fi
+            if (( ${#excluded[@]} > 0 )); then
+              echo "- System-critical packages excluded (explicit approval required): ${excluded[*]}"
+            fi
             echo "- Matrix built from packages.txt only."
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: prepare
-    runs-on: ubuntu-latest
-    container:
-      image: cachyos/cachyos-v4
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -94,102 +248,36 @@ jobs:
     env:
       PKG: ${{ matrix.package }}
     steps:
-      - name: Install base dependencies
-        run: |
-          set -euo pipefail
-          pacman -Syu --noconfirm --needed git subversion mercurial sudo rsync github-cli fakeroot binutils pacman-contrib paru curl awk tar jq rustup
-          id builder >/dev/null 2>&1 || useradd -m builder
-          grep -q '^builder ALL=(ALL) NOPASSWD: ALL$' /etc/sudoers || echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          rustup default stable
-          sudo -u builder rustup default stable
-
-      - name: Configure makepkg for x86-64-v4 optimization
-        run: |
-          set -euo pipefail
-
-          echo "Downloading CachyOS v4 makepkg.conf..."
-          curl -fSL --retry 3 -o /etc/makepkg.conf \
-            https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/makepkg.conf
-
-          echo "Downloading CachyOS v4 rust.conf..."
-          mkdir -p /etc/makepkg.conf.d
-          curl -fSL --retry 3 -o /etc/makepkg.conf.d/rust.conf \
-            https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/rust.conf
-
-          # Verify the architecture flags actually target x86-64-v4.
-          if ! grep -q -- '-march=x86-64-v4' /etc/makepkg.conf; then
-            echo "::error::CachyOS v4 makepkg.conf does not contain -march=x86-64-v4"
-            exit 1
-          fi
-          if ! grep -q -- 'target-cpu=x86-64-v4' /etc/makepkg.conf.d/rust.conf; then
-            echo "::error::CachyOS v4 rust.conf does not contain target-cpu=x86-64-v4"
-            exit 1
-          fi
-          echo "Confirmed x86-64-v4 compiler flags."
-
-          sed -i 's/^PKGDEST=/#PKGDEST=/g' /etc/makepkg.conf
-          sed -i 's/^LOGDEST=/#LOGDEST=/g' /etc/makepkg.conf
-          sed -i 's/^PACKAGECARCH=/#PACKAGECARCH=/g' /etc/makepkg.conf
-
-      - name: Configure pacman options and custom repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tmp=$(mktemp)
-          awk '
-            BEGIN { inserted=0 }
-            /^\[options\]$/ && !inserted { print; print "DisableSandboxNetwork"; inserted=1; next }
-            { print }
-            END { if (!inserted) exit 1 }
-          ' /etc/pacman.conf > "$tmp"
-          cat "$tmp" > /etc/pacman.conf
-          rm -f "$tmp"
-
-          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' | grep -qx "${REPO_DB_NAME}.db"; then
-            {
-              echo ""
-              echo [$REPO_DB_NAME]
-              echo SigLevel = Optional TrustAll
-              echo "Server = https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG"
-            } >> /etc/pacman.conf
-          fi
-          pacman -Sy
-
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
-      - name: Fix workspace ownership for build user
-        run: chown -R builder:builder "$GITHUB_WORKSPACE"
-
-      - name: Build package (architecture-aware cache)
+      - name: Build package in managed container (architecture-aware cache)
         env:
           GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ env.BUILD_IMAGE }}
         run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/build-package.sh"
-          # Make the log for this package searchable in the job output
-          echo "=== Build summary for $PKG ==="
+          bash "$GITHUB_WORKSPACE/.github/scripts/build-in-docker.sh"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
           name: pkg-${{ matrix.package }}
           path: output/*
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 1
 
   publish:
     needs: [prepare, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
-    container:
-      image: ghcr.io/archlinux/archlinux:latest
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed github-cli pacman-contrib jq libarchive
+      - name: Checkout repository (for validation scripts)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -198,255 +286,11 @@ jobs:
           pattern: pkg-*
           merge-multiple: true
 
-      - name: Validate package archives
-        run: |
-          set -euo pipefail
-          cd output
-          shopt -s nullglob
-          pkgs=( *.pkg.tar.zst )
-          if (( ${#pkgs[@]} == 0 )); then
-            echo "::error::No package files produced in this run."
-            exit 1
-          fi
-          for pkg in "${pkgs[@]}"; do
-            if ! bsdtar -tf "$pkg" >/dev/null 2>&1; then
-              echo "::error::Package archive corrupt: $pkg"
-              exit 1
-            fi
-            if ! bsdtar -xOf "$pkg" .PKGINFO 2>/dev/null | grep -q '^pkgname = '; then
-              echo "::error::Package missing .PKGINFO: $pkg"
-              exit 1
-            fi
-            echo "Validated: $pkg"
-          done
-
-      - name: Generate fresh pacman database & Prepare Release Notes
-        id: generate
+      - name: Validate, build database and publish in managed container
         env:
           GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ env.BUILD_IMAGE }}
+          PUBLISH_SCRIPT: publish-prod.sh
+          EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
         run: |
-          set -euo pipefail
-          cd output
-          shopt -s nullglob
-          pkgs=( *.pkg.tar.zst )
-
-          if (( ${#pkgs[@]} == 0 )); then
-            echo "No packages exist. Repository is empty. Halting."
-            echo "has_packages=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "has_packages=true" >> "$GITHUB_OUTPUT"
-
-          status_built_files=( status-built-*.txt )
-          status_skipped_files=( status-skipped-*.txt )
-          status_restored_files=( status-restored-*.txt )
-          status_failed_files=( status-failed-*.txt )
-          protect_files=( protect-*.txt )
-          BUILT=""
-          SKIPPED=""
-          RESTORED=""
-          FAILED=""
-          if (( ${#status_built_files[@]} > 0 )); then BUILT=$(cat "${status_built_files[@]}"); fi
-          if (( ${#status_skipped_files[@]} > 0 )); then SKIPPED=$(cat "${status_skipped_files[@]}"); fi
-          if (( ${#status_restored_files[@]} > 0 )); then RESTORED=$(cat "${status_restored_files[@]}"); fi
-          if (( ${#status_failed_files[@]} > 0 )); then FAILED=$(cat "${status_failed_files[@]}"); fi
-
-          declare -A PROTECTED=()
-          if (( ${#protect_files[@]} > 0 )); then
-            while IFS= read -r protected_name; do
-              [[ -n "$protected_name" ]] && PROTECTED["$protected_name"]=1
-            done < <(cat "${protect_files[@]}")
-          fi
-          rm -f status-*.txt protect-*.txt
-
-          if [[ -z "$BUILT" ]]; then
-            echo "has_new_changes=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_new_changes=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "Generating clean database from active packages only."
-          repo-add "${REPO_DB_NAME}.db.tar.gz" "${pkgs[@]}"
-
-          compute_repo_drift() {
-            local -A have=() rel=()
-            local name asset
-            STALE_ASSETS=()
-            MISSING_ASSETS=()
-            for name in "$@"; do
-              have["$name"]=1
-            done
-            while IFS= read -r asset; do
-              [[ -n "$asset" ]] || continue
-              [[ "$asset" == *.pkg.tar.zst ]] || continue
-              rel["$asset"]=1
-              if [[ -z "${have[$asset]:-}" ]]; then
-                STALE_ASSETS+=("$asset")
-              fi
-            done
-            for name in "$@"; do
-              if [[ -z "${rel[$name]:-}" ]]; then
-                MISSING_ASSETS+=("$name")
-              fi
-            done
-            REPO_DRIFT=false
-            if (( ${#STALE_ASSETS[@]} > 0 || ${#MISSING_ASSETS[@]} > 0 )); then
-              REPO_DRIFT=true
-            fi
-          }
-
-          release_assets=""
-          if release_assets=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null); then
-            compute_repo_drift "${pkgs[@]}" <<< "$release_assets"
-          else
-            echo "::warning::Release '$RELEASE_TAG' cannot be read; forcing a publish so it is created or repaired."
-            REPO_DRIFT=true
-            STALE_ASSETS=()
-            MISSING_ASSETS=()
-          fi
-
-          if (( ${#PROTECTED[@]} > 0 )); then
-            kept_protected=()
-            deletable=()
-            for asset in "${STALE_ASSETS[@]}"; do
-              if [[ -n "${PROTECTED[$asset]:-}" || -n "${PROTECTED["*"]:-}" ]]; then
-                kept_protected+=("$asset")
-              else
-                deletable+=("$asset")
-              fi
-            done
-            STALE_ASSETS=("${deletable[@]}")
-            if (( ${#kept_protected[@]} > 0 )); then
-              echo "Keeping assets of packages whose build failed: ${kept_protected[*]}"
-            fi
-            REPO_DRIFT=false
-            if (( ${#STALE_ASSETS[@]} > 0 || ${#MISSING_ASSETS[@]} > 0 )); then
-              REPO_DRIFT=true
-            fi
-          fi
-
-          echo "drift=$REPO_DRIFT stale=${#STALE_ASSETS[@]} missing=${#MISSING_ASSETS[@]}"
-          if (( ${#MISSING_ASSETS[@]} > 0 )); then
-            echo "Not in the release yet (will be uploaded): ${MISSING_ASSETS[*]}"
-          fi
-          if (( ${#STALE_ASSETS[@]} > 0 )); then
-            echo "Assets to delete (no longer part of the repository): ${STALE_ASSETS[*]}"
-          fi
-          echo "has_drift=$REPO_DRIFT" >> "$GITHUB_OUTPUT"
-          {
-            echo "STALE_ASSETS<<EOF"
-            if (( ${#STALE_ASSETS[@]} > 0 )); then
-              printf '%s\n' "${STALE_ASSETS[@]}"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-
-          FORMATTED_BUILT=$(echo "$BUILT" | sed '/^$/d' | sed 's/^/- 🟢 /')
-          FORMATTED_SKIPPED=$(echo "$SKIPPED" | sed '/^$/d' | sed 's/^/- 🟡 /')
-          FORMATTED_RESTORED=$(echo "$RESTORED" | sed '/^$/d' | sed 's/^/- 🟠 /' | sed 's/$/ (kept previous build, current build failed)/')
-          FORMATTED_FAILED=$(echo "$FAILED" | sed '/^$/d' | sed 's/^/- 🔴 /' | sed 's/$/ (dropped: build failed and nothing to restore)/')
-
-          [[ -z "$FORMATTED_BUILT" ]] && FORMATTED_BUILT="- None"
-          [[ -z "$FORMATTED_SKIPPED" ]] && FORMATTED_SKIPPED="- None"
-          [[ -z "$FORMATTED_RESTORED" ]] && FORMATTED_RESTORED="- None"
-          [[ -z "$FORMATTED_FAILED" ]] && FORMATTED_FAILED="- None"
-
-          {
-            echo "BUILT_LOG<<EOF"
-            echo "$FORMATTED_BUILT"
-            echo "EOF"
-            echo "SKIPPED_LOG<<EOF"
-            echo "$FORMATTED_SKIPPED"
-            echo "EOF"
-            echo "RESTORED_LOG<<EOF"
-            echo "$FORMATTED_RESTORED"
-            echo "EOF"
-            echo "FAILED_LOG<<EOF"
-            echo "$FORMATTED_FAILED"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-
-      - name: Publish to GitHub Release
-        if: ${{ steps.generate.outputs.has_packages == 'true' && (steps.generate.outputs.has_new_changes == 'true' || steps.generate.outputs.has_drift == 'true') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          REPO="${{ github.repository }}"
-          TAG="${{ env.RELEASE_TAG }}"
-
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release $TAG exists; uploading refreshed assets."
-          else
-            echo "Creating release $TAG."
-            gh release create "$TAG" --repo "$REPO" \
-              --title "Arch Package Repository" \
-              --notes "Auto-built pacman repository."
-          fi
-
-          pkg_assets=( output/*.pkg.tar.zst )
-          if (( ${#pkg_assets[@]} == 0 )); then
-            echo "::error::No package files in output/; refusing to publish."
-            exit 1
-          fi
-          echo "Uploading package files: ${#pkg_assets[@]} file(s)."
-          gh release upload "$TAG" "${pkg_assets[@]}" --repo "$REPO" --clobber
-
-          db_assets=( output/"${REPO_DB_NAME}".db* output/"${REPO_DB_NAME}".files* )
-          if (( ${#db_assets[@]} == 0 )); then
-            echo "::error::No pacman database files in output/; refusing to publish a repository without a database."
-            exit 1
-          fi
-          echo "Uploading pacman databases: ${db_assets[*]}"
-          gh release upload "$TAG" "${db_assets[@]}" --repo "$REPO" --clobber
-
-          # Architecture metadata: every package produced in this run carries a
-          # v4-<pkg>.meta.json file. Upload them so the next run can reuse
-          # only matching builds.
-          meta_assets=( output/v4-*.meta.json )
-          if (( ${#meta_assets[@]} > 0 )); then
-            echo "Uploading architecture metadata: ${#meta_assets[@]} file(s)."
-            gh release upload "$TAG" "${meta_assets[@]}" --repo "$REPO" --clobber
-          fi
-
-          if [[ -n "${STALE_ASSETS:-}" ]]; then
-            echo "Deleting assets that are no longer part of the repository:"
-            while IFS= read -r stale; do
-              [[ -n "$stale" ]] || continue
-              echo "  - $stale"
-              if ! gh release delete-asset "$TAG" "$stale" --repo "$REPO" -y; then
-                echo "::error::Cannot delete stale asset $stale; the next run will retry."
-                exit 1
-              fi
-            done <<< "$STALE_ASSETS"
-          else
-            echo "No stale assets to delete."
-          fi
-
-          RELEASE_NOTES=$(cat <<EOF
-          ### 📦 Repository Update Summary (Matrix Build)
-
-          **Last Updated:** $(date -u '+%Y-%m-%d %H:%M UTC')
-
-          **Architecture:** x86-64-v4 (CachyOS)
-
-          #### 🟢 Newly Built Packages
-          ${{ env.BUILT_LOG }}
-
-          #### 🟡 Cached / Skipped Packages
-          ${{ env.SKIPPED_LOG }}
-
-          #### 🟠 Kept Previous Build (build failed, previous version reused)
-          ${{ env.RESTORED_LOG }}
-
-          #### 🔴 Failed Packages
-          ${{ env.FAILED_LOG }}
-
-          ---
-          *Automated Scatter-Gather build by GitHub Actions.*
-          EOF
-          )
-
-          gh release edit "$TAG" --repo "$REPO" --notes "$RELEASE_NOTES"
+          bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
