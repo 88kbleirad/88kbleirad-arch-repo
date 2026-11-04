@@ -139,5 +139,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981
+          EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"

@@ -199,7 +199,45 @@ if ! sign_and_publish_db_signatures; then
 fi
 
 echo "== Validate repository consistency =="
-bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD" "$REPO_DB_NAME" | tee "$GITHUB_STEP_SUMMARY"
+if ! bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD" "$REPO_DB_NAME" | tee "$GITHUB_STEP_SUMMARY"; then
+  echo "::error::Staging validation failed; refusing to publish."
+  exit 1
+fi
+
+# -- expected package inventory enforcement (mirrors production) ------------
+# Every package the staging matrix selected MUST be present as a validated
+# archive in the fresh database. A silent miss (failed/restored/no-archive
+# metadata) fails here BEFORE any Release mutation.
+if [[ -n "${EXPECTED_PACKAGES:-}" ]]; then
+  echo "== Verify expected staging inventory =="
+  expected_names=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && expected_names+=("$name")
+  done < <(printf '%s\n' "$EXPECTED_PACKAGES" | jq -r '.[]')
+  (( ${#expected_names[@]} > 0 )) || { echo "::error::Expected package list parsed empty; refusing to publish."; exit 1; }
+
+  rm -rf .inv-db; mkdir -p .inv-db
+  bsdtar -xf "${REPO_DB_NAME}.db.tar.gz" -C .inv-db
+  db_pkg_names=()
+  for desc in .inv-db/*/desc; do
+    [[ -f "$desc" ]] || continue
+    db_pkg_names+=("$(awk '/^%NAME%/{getline; print}' "$desc")")
+  done
+  rm -rf .inv-db
+
+  missing_count=0
+  for name in "${expected_names[@]}"; do
+    if ! printf '%s\n' "${db_pkg_names[@]}" | grep -qx "$name"; then
+      echo "::error::Expected package '${name}' is missing from the regenerated staging database (silent-miss check)."
+      missing_count=$(( missing_count + 1 ))
+    fi
+  done
+  if (( missing_count > 0 )); then
+    echo "::error::Staging inventory check failed (${missing_count} missing). Refusing to publish; staging Release was not modified."
+    exit 1
+  fi
+  echo "Inventory OK: all ${#expected_names[@]} requested staging packages are present and validated."
+fi
 
 echo "== Publish to staging release =="
 
@@ -235,3 +273,14 @@ fi
 gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" "${pub_assets[@]}" \
   --repo "$REPO" --clobber
 echo "Published staging release: $REPO/releases/tag/$TAG"
+
+# -- mandatory remote post-publish verification ----------------------------
+echo "== Remote post-publish verification (staging) =="
+if ! bash "$GITHUB_WORKSPACE/.github/scripts/verify-remote-release.sh" \
+    "$TAG" "$REPO" "${EXPECTED_PACKAGES:-}" \
+    --manifest-dir "$PWD" \
+    --signing-mode "signed" | tee -a "$GITHUB_STEP_SUMMARY"; then
+  echo "::error::Staging remote verification failed; the Release may be incomplete. Refusing to report success."
+  exit 1
+fi
+echo "== Staging remote verification passed =="

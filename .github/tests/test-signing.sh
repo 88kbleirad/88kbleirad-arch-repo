@@ -223,6 +223,8 @@ mkdir -p "$REPO_COPY/.github/scripts"
 cp "$REPO_ROOT/.github/scripts/sign-helpers.sh" "$REPO_COPY/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/publish-stage.sh" "$REPO_COPY/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/validate-release.sh" "$REPO_COPY/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/gh-release-lib.sh" "$REPO_COPY/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/verify-remote-release.sh" "$REPO_COPY/.github/scripts/"
 
 export GITHUB_REPOSITORY="owner/repo"
 export RELEASE_TAG="repository-v4-test"
@@ -253,11 +255,29 @@ run_stage() {
   rm -rf "$REPO_COPY/output"; mkdir -p "$REPO_COPY/output"
   local a
   for a in "$@"; do cp "$a" "$REPO_COPY/output/"; done
+  # derive the expected staging inventory from the authoritative .PKGINFO
+  # of each package archive, so publish-stage.sh's mandatory inventory +
+  # remote verification run against the real set.
+  local expected_json="" names=() n
+  for a in "$@"; do
+    case "$a" in
+      *.pkg.tar.zst)
+        if command -v bsdtar >/dev/null 2>&1; then
+          n=$(bsdtar -xOf "$a" .PKGINFO 2>/dev/null | awk -F' = ' '/^pkgname/{print $2; exit}')
+        else
+          n=$(tar --zstd -xOf "$a" .PKGINFO 2>/dev/null | awk -F' = ' '/^pkgname/{print $2; exit}')
+        fi
+        [[ -n "$n" ]] && names+=("$n")
+        ;;
+    esac
+  done
+  expected_json=$(printf '%s\n' "${names[@]}" | jq -R . | jq -s -c .)
   ( cd "$REPO_COPY" && \
     GITHUB_WORKSPACE="$REPO_COPY" \
     REPO_DB_NAME="$REPO_DB_NAME" \
     GH_TOKEN="$GH_TOKEN" \
     GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+    EXPECTED_PACKAGES="$expected_json" \
     FAKE_RELEASE_DIR="$rel" \
     FAKE_EVENTS_LOG="$events" \
     PATH="$SHIM_BIN:$REPO_ROOT/.github/tests:$PATH" \

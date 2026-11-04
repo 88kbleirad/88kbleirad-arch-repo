@@ -350,6 +350,18 @@ if [[ $build_rc -ne 0 ]]; then
   exit "$build_rc"
 fi
 
+# Restore workspace ownership to the HOST user before any host-side write.
+# The container builds as `builder` and bootstrap chowns the workspace to
+# builder; without returning ownership to the host uid/gid, host-side
+# writes (runner-info JSON, step summary, later git checkout cleanup) fail
+# with Permission denied. The workspace is bind-mounted, so chown inside
+# the container is the correct fix (no unrestricted-permission workaround).
+if docker exec "$CID" chown -R "$(id -u):$(id -g)" "$WS" >/dev/null 2>&1; then
+  phase info "restored workspace ownership to host uid $(id -u):$(id -g)"
+else
+  phase info "warning: could not restore workspace ownership; host-side writes may fail"
+fi
+
 # Record host/toolchain facts for the run (compiled outside the container).
 mkdir -p "$WS/output"
 {
@@ -386,4 +398,61 @@ phase info "container final state: $(docker inspect -f '{{.State.Status}} (exit 
 
 docker rm -f "$CID" >/dev/null 2>&1
 CID=""
+
+# ---------------------------------------------------------------------------
+# Artifact gate (fail closed): a successful build job MUST produce at
+# least one actual, valid package archive matching the expected package
+# name/version/architecture. Metadata-only outputs (status-failed +
+# v4-*.meta.json, runner info, logs) are NOT valid artifacts. The build
+# job already exits nonzero on un-recovered failures (build-package.sh),
+# so reaching this point means the build/restore succeeded — but we still
+# verify the archive exists, is readable, carries .PKGINFO, and is not a
+# tiny metadata-only artifact before the artifact is uploaded.
+# ---------------------------------------------------------------------------
+VALID_ARCHIVE=""
+# pick a usable archive reader: bsdtar (libarchive) or GNU tar with zstd.
+# The host runner (Ubuntu) may lack bsdtar, so fall back to tar --zstd.
+_arch_ok() { # file
+  local f="$1"
+  if command -v bsdtar >/dev/null 2>&1 && bsdtar --version >/dev/null 2>&1; then
+    bsdtar -tf "$f" >/dev/null 2>&1
+  elif tar --zstd --version >/dev/null 2>&1; then
+    tar --zstd -tf "$f" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+_arch_pkginfo() { # file
+  local f="$1"
+  if command -v bsdtar >/dev/null 2>&1 && bsdtar --version >/dev/null 2>&1; then
+    bsdtar -xOf "$f" .PKGINFO 2>/dev/null
+  else
+    tar --zstd -xOf "$f" .PKGINFO 2>/dev/null
+  fi
+}
+shopt -s nullglob
+for cand in "$WS/output"/*.pkg.tar.zst; do
+  [[ -s "$cand" ]] || continue
+  _arch_ok "$cand" || continue
+  info="$(_arch_pkginfo "$cand")"
+  cname=$(printf '%s\n' "$info" | awk -F' = ' '/^pkgname/{print $2; exit}')
+  cbase=$(printf '%s\n' "$info" | awk -F' = ' '/^pkgbase/{print $2; exit}')
+  [[ -n "$cname" ]] || continue
+  # accept when the archive belongs to the requested package: by pkgbase,
+  # by pkgname (single package), or by filename prefix (cache/restore).
+  if [[ "$cbase" == "$PKG" || "$cname" == "$PKG" || "$(basename "$cand")" == "$PKG"-*.pkg.tar.zst ]]; then
+    VALID_ARCHIVE="$cand"
+    break
+  fi
+done
+shopt -u nullglob
+
+if [[ -z "$VALID_ARCHIVE" ]]; then
+  echo "::error::[$PKG] no valid package archive produced (metadata-only or missing); refusing to upload artifact."
+  exit 1
+fi
+
+pkginfo_name=$(_arch_pkginfo "$VALID_ARCHIVE" | awk -F' = ' '/^pkgname/{print $2; exit}')
+pkginfo_ver=$(_arch_pkginfo "$VALID_ARCHIVE" | awk -F' = ' '/^pkgver/{print $2; exit}')
+echo "[$PKG] valid artifact: $(basename "$VALID_ARCHIVE") (pkgname=$pkginfo_name ver=$pkginfo_ver)"
 exit 0

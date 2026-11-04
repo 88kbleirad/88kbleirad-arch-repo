@@ -479,7 +479,14 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
       gh_download_retry "$file_name" "$WORKSPACE/output"
       restore_rc=$?
       if [[ $restore_rc -eq 0 ]]; then
-        RESTORED_COUNT=$(( RESTORED_COUNT + 1 ))
+        # A restored archive must be a real, valid package archive (not a
+        # metadata-only or corrupt artifact) before it counts as recovery.
+        if validate_pkg_file "$WORKSPACE/output/$file_name"; then
+          RESTORED_COUNT=$(( RESTORED_COUNT + 1 ))
+        else
+          warn "restore candidate $file_name failed validation; discarding"
+          rm -f "$WORKSPACE/output/$file_name"
+        fi
       elif [[ $restore_rc -eq 2 ]]; then
         warn "restore candidate $file_name is no longer in the release; skipping"
       else
@@ -495,12 +502,20 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
       echo "Restored $RESTORED_COUNT file(s) of $PKG from the previous release"
       echo "$PKG" > "$WORKSPACE/output/status-restored-$PKG.txt"
       write_meta restored "$FINGERPRINT" '"restored_legacy": true'
+      exit 0
     else
-      echo "Fallback failed for $PKG: no previous files found. Gracefully exiting to ignore package."
+      # FAIL CLOSED: a requested package whose build failed and for which
+      # NO valid previously-published archive could be recovered MUST fail
+      # the build job. "Gracefully ignoring" an explicitly requested
+      # package is never allowed (it produces metadata-only uploads and
+      # false-green staging runs). status-failed + meta are still written
+      # so the publisher can protect last-known-good assets if it runs.
+      echo "::error::[$PKG] build failed (${BUILDER_NAME} rc=$PARU_RC) and no valid previously published archive could be restored; failing the build job."
+      echo "Fallback failed for $PKG: no valid previous files recovered."
       echo "$PKG" > "$WORKSPACE/output/status-failed-$PKG.txt"
       write_meta failed "$FINGERPRINT"
+      exit 1
     fi
-    exit 0
   fi
 fi
 

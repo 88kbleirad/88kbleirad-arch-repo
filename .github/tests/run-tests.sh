@@ -95,6 +95,13 @@ else
   bad "build-cache verification suite"
 fi
 
+note "rustc v4 build-script wrapper suite"
+if bash "$REPO_ROOT/.github/tests/test-rustc-wrapper.sh"; then
+  ok "rustc wrapper suite"
+else
+  bad "rustc wrapper suite"
+fi
+
 # -- 4. matrix gate tests ---------------------------------------------------
 note "matrix gate tests (approval / schedule / critical / subset)"
 if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then
