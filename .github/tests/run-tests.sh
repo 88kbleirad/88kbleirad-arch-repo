@@ -80,6 +80,21 @@ else
   bad "host suite"
 fi
 
+# -- 3b. content-aware + build-cache host suites ----------------------------
+note "content-aware publishing suite"
+if bash "$REPO_ROOT/.github/tests/test-content-aware.sh"; then
+  ok "content-aware publishing suite"
+else
+  bad "content-aware publishing suite"
+fi
+
+note "build-cache verification suite"
+if bash "$REPO_ROOT/.github/tests/test-build-cache.sh"; then
+  ok "build-cache verification suite"
+else
+  bad "build-cache verification suite"
+fi
+
 # -- 4. matrix gate tests ---------------------------------------------------
 note "matrix gate tests (approval / schedule / critical / subset)"
 if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then
@@ -101,6 +116,7 @@ if docker run --rm \
         bash "$REPO_ROOT/.github/tests/test-signing.sh"
         EXPECTED_PACKAGES="[\"testa\",\"testb\"]" bash "$REPO_ROOT/.github/tests/test-signing-mode.sh"
         RUN_PROD_SCENARIOS=1 bash "$REPO_ROOT/.github/tests/test-http500.sh"
+        bash "$REPO_ROOT/.github/tests/test-verify-remote.sh"
       '; then
   ok "signing + host-prod suite"
 else

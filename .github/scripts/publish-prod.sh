@@ -345,6 +345,42 @@ else
   repo-add "${REPO_DB_NAME}.db.tar.gz" "${merged_assets[@]}"
 fi
 
+# repo-add (pacman >= 7) already creates the plain <db>.db / <db>.files
+# aliases as symlinks to the canonical compressed counterparts; they are
+# uploaded as distinct assets with identical bytes/digests. No extra copy
+# is needed (and `cp` over the symlink would error as "same file").
+
+# Database changed-detection is SEMANTIC: `repo-add` embeds current
+# timestamps (verified: byte-identical re-add yields different sha256), so
+# byte comparison can never be stable. Compare the canonical package set
+# (FILENAME/NAME/BASE/VERSION) instead. When the remote database references
+# exactly the same set, it is UNCHANGED and must not be re-uploaded.
+DB_SEMANTIC_SAME="no"
+if [[ -f "$MERGE_DIR/${REPO_DB_NAME}.db.tar.gz" ]]; then
+  rm -rf "$MERGE_DIR/db-new"
+  mkdir -p "$MERGE_DIR/db-new"
+  if bsdtar -xf "${REPO_DB_NAME}.db.tar.gz" -C "$MERGE_DIR/db-new"; then
+    local_db_keys=""
+    for desc in "$MERGE_DIR/db-new"/*/desc; do
+      [[ -f "$desc" ]] || continue
+      local_db_keys+="$(awk '/^%FILENAME%/{getline; print; next} /^%NAME%/{getline; print; next} /^%BASE%/{getline; print; next} /^%VERSION%/{getline; print; next}' "$desc" | tr '\n' '|')"
+      local_db_keys+=$'\n'
+    done
+    local_db_keys="$(printf '%s' "$local_db_keys" | sort)"
+    remote_db_keys=""
+    for desc in "$MERGE_DIR/db"/*/desc; do
+      [[ -f "$desc" ]] || continue
+      remote_db_keys+="$(awk '/^%FILENAME%/{getline; print; next} /^%NAME%/{getline; print; next} /^%BASE%/{getline; print; next} /^%VERSION%/{getline; print; next}' "$desc" | tr '\n' '|')"
+      remote_db_keys+=$'\n'
+    done
+    remote_db_keys="$(printf '%s' "$remote_db_keys" | sort)"
+    if [[ "$local_db_keys" == "$remote_db_keys" ]]; then
+      DB_SEMANTIC_SAME="yes"
+    fi
+    rm -rf "$MERGE_DIR/db-new"
+  fi
+fi
+
 if [[ "$SIGNING_MODE" == "signed" ]]; then
   echo "== Sign repository database =="
   if ! sign_and_publish_db_signatures; then
@@ -446,24 +482,35 @@ else
     --field body="Auto-built pacman repository." >/dev/null 2>&1
 fi
 
-# Upload each asset individually via DELETE+POST (clobber semantics without
-# PATCH), with bounded retries, backoff, Retry-After and post-mutation
-# reconciliation. Each file is uploaded atomically; a failure aborts before
-# any further mutation.
-upload_assets() {
-  local fail=0
-  local a
-  for a in "$@"; do
-    echo "== Uploading $(basename "$a") =="
-    if ! gh_upload_asset "$TAG" "$REPO" "$a"; then
-      echo "::error::Upload failed for $(basename "$a"); aborting before any further mutation."
-      return 1
-    fi
-  done
-  return 0
-}
-upload_assets "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" "${pub_assets[@]}" \
-  || exit 1
+# Publish content-aware (Objective A): skip identical checksums, upload
+# only new/changed assets, never delete a valid asset because its checksum
+# could not be retrieved. Order matters: packages first, then metadata,
+# then the database (the DB must never be published before the archives it
+# references exist). A single failure aborts all later dependent mutations.
+declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+
+# packages + metadata first
+publish_assets_loop "$TAG" "$REPO" "$PWD" "package" "${pkg_assets[@]}" || exit 1
+publish_assets_loop "$TAG" "$REPO" "$PWD" "metadata" "${meta_assets[@]}" || exit 1
+if (( ${#pub_assets[@]} > 0 )); then
+  publish_assets_loop "$TAG" "$REPO" "$PWD" "public-key" "${pub_assets[@]}" || exit 1
+fi
+
+# database assets: if the regenerated DB is semantically identical to the
+# previously published one, skip ALL database assets (the canonical files
+# and their aliases). repo-add embeds timestamps, so the bytes always
+# differ even for an identical package set; semantic equality is the only
+# stable signal and avoids pointless re-uploads.
+db_files=()
+if [[ "$DB_SEMANTIC_SAME" == "yes" ]]; then
+  echo "[publish] UNCHANGED database set (semantic): ${REPO_DB_NAME}.db/.files ..."
+  PUBLISH_COUNTERS[unchanged]=$(( PUBLISH_COUNTERS[unchanged] + ${#db_assets[@]} ))
+else
+  db_files=( "${db_assets[@]}" )
+  publish_assets_loop "$TAG" "$REPO" "$PWD" "database" "${db_files[@]}" || exit 1
+fi
+
+echo "[publish] SUMMARY unchanged=${PUBLISH_COUNTERS[unchanged]} uploaded=${PUBLISH_COUNTERS[uploaded]} replaced=${PUBLISH_COUNTERS[replaced]} failed=${PUBLISH_COUNTERS[failed]}"
 
 # -- drift cleanup: delete only stale un-protected package assets ---------
 stale_assets=()
@@ -539,3 +586,17 @@ if [[ "$SIGNING_MODE" == "unsigned" ]]; then
 fi
 
 echo "Published production release: $REPO/releases/tag/$TAG"
+
+# -- remote post-publish verification (Objective B) -------------------------
+# Mandatory: the local repository may be consistent while the remote
+# Release is incomplete (the historical failure mode). Verify the actual
+# remote state before declaring success. Never mutates the release.
+echo "== Remote post-publish verification =="
+if ! bash "$GITHUB_WORKSPACE/.github/scripts/verify-remote-release.sh" \
+    "$TAG" "$REPO" "${EXPECTED_PACKAGES:-}" \
+    --manifest-dir "$PWD" \
+    --signing-mode "$SIGNING_MODE" | tee -a "$GITHUB_STEP_SUMMARY"; then
+  echo "::error::Remote verification failed; the Release may be incomplete. Refusing to report success."
+  exit 1
+fi
+echo "== Remote verification passed =="

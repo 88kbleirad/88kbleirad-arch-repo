@@ -59,6 +59,11 @@ on:
           - unsigned
           - signed
         default: unsigned
+      strict-cache:
+        description: 'Require 100% cache hits (fail the run if any package was rebuilt). Use only for a repeat build where source/fingerprint/toolchain are unchanged. Default false: rebuilds are allowed and reported.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -142,10 +147,50 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Deterministic build-cache verification (Objective C). Collects the
+  # per-package build results and checks that every expected package has a
+  # valid archive. In "normal" mode a legitimate rebuild is allowed and
+  # reported; with strict-cache=true an unexpected cache miss fails the
+  # verification.
+  cache-verify:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: output
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Verify build cache (strict when requested)
+        env:
+          EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
+          EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
+          STRICT_CACHE: ${{ inputs.strict-cache }}
+        run: |
+          set -euo pipefail
+          excluded_args=()
+          if [[ -s "$EXCLUDED_BASES_FILE" ]]; then
+            excluded_json=$(jq -R -s -c 'split("\n") | map(select(length > 0))' "$EXCLUDED_BASES_FILE")
+            excluded_args=(--excluded "$excluded_json")
+          fi
+          if [[ "$STRICT_CACHE" == "true" ]]; then
+            excluded_args+=(--strict)
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/verify-build-cache.sh" \
+            --expected "$EXPECTED_PACKAGES" \
+            --results-dir output \
+            "${excluded_args[@]}"
   # Unsigned production publish (default). No GPG, no protected
   # environment; runs with contents:write only.
   publish:
-    needs: [prepare, build]
+    needs: [prepare, build, cache-verify]
     if: ${{ inputs.signing-mode != 'signed' }}
     runs-on: ubuntu-24.04
     permissions:
@@ -177,7 +222,7 @@ jobs:
   # Signed production publish: enters the protected environment, requires
   # the signing secret, and never silently downgrades on signing failure.
   publish-signed:
-    needs: [prepare, build]
+    needs: [prepare, build, cache-verify]
     if: ${{ inputs.signing-mode == 'signed' }}
     runs-on: ubuntu-24.04
     environment: package-signing

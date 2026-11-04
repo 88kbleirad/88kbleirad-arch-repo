@@ -51,6 +51,8 @@ cp "$REPO_ROOT/.github/scripts/sign-helpers.sh" "$REPO_COPY/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/gh-release-lib.sh" "$REPO_COPY/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/publish-prod.sh" "$REPO_COPY/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/validate-release.sh" "$REPO_COPY/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/verify-remote-release.sh" "$REPO_COPY/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/verify-build-cache.sh" "$REPO_COPY/.github/scripts/"
 mkdir -p "$REPO_COPY/bin"
 cp "$REPO_ROOT/.github/tests/mock-gh.sh" "$REPO_COPY/bin/mock-gh.sh"
 cat > "$REPO_COPY/bin/gh" <<'SHIM'

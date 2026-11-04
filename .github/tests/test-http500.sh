@@ -30,7 +30,7 @@ set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:?REPO_ROOT is required}
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+trap '[ "${KEEP_WORKDIR:-0}" = 1 ] || rm -rf "$WORKDIR"' EXIT
 
 PASS=0
 FAIL=0
@@ -119,6 +119,7 @@ run_prod() { # scenario releasedir expected_packages [extra_env...]
   cp "$REPO_ROOT/.github/scripts/gh-release-lib.sh" "$ws/.github/scripts/"
   cp "$REPO_ROOT/.github/scripts/publish-prod.sh" "$ws/.github/scripts/"
   cp "$REPO_ROOT/.github/scripts/validate-release.sh" "$ws/.github/scripts/"
+  cp "$REPO_ROOT/.github/scripts/verify-remote-release.sh" "$ws/.github/scripts/"
   cp "$REPO_ROOT/.github/tests/mock-gh.sh" "$ws/bin/mock-gh.sh"
   cat > "$ws/bin/gh" <<'SHIM'
 #!/usr/bin/env bash
@@ -129,15 +130,20 @@ SHIM
   chmod +x "$ws/bin/gh"
 
   # fixture set for the run's output/: default testa+testb; empty for the
-  # metadata-only scenario (only a failed-status meta file is seeded)
-  local fixtures="testa,testb" a
+  # metadata-only scenario (only a failed-status meta file is seeded); a
+  # directory (WS_FIXTURES_DIR) copies exact prior output bytes instead of
+  # regenerating archives (for idempotency tests).
+  local fixtures="testa,testb" a fixtures_dir=""
   for a in "$@"; do
     case "$a" in
       WS_FIXTURES=*) fixtures="${a#WS_FIXTURES=}" ;;
+      WS_FIXTURES_DIR=*) fixtures_dir="${a#WS_FIXTURES_DIR=}" ;;
     esac
   done
   local name
-  if [[ -n "$fixtures" ]]; then
+  if [[ -n "$fixtures_dir" && -d "$fixtures_dir" ]]; then
+    cp -a "$fixtures_dir/." "$ws/output/"
+  elif [[ -n "$fixtures" ]]; then
     for name in ${fixtures//,/ }; do
       mk_pkgbuild "$name"
       ( cd "$WORKDIR/pkgbuild/$name" && tar --zstd -cf "$ws/output/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
@@ -362,6 +368,34 @@ else
   bad "corrupt DB did not abort (rc=$rc): $(tail -4 "$WORKDIR/corrupt-db.log")"
 fi
 [[ "$before" == "$after" ]] && ok "release unchanged after corrupt-DB abort" || bad "release changed despite corrupt-DB abort"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: content-aware second run is idempotent (no mutations)"
+# The same build artifacts (byte-identical archives/metadata/db) published
+# twice must produce zero mutations on the second run. We therefore reuse
+# the FIRST run's output as the second run's local manifest, so the bytes
+# are identical. The database is rebuilt by repo-add (timestamps change)
+# but is semantically identical -> skipped.
+W8="$WORKDIR/release-merge"
+make_release "$W8"
+rc1=$(run_prod idem1 "$W8" '["testa","testb"]')
+# capture the first run's exact output bytes, then run a second publish
+# with byte-identical local files against the same release
+rm -rf "$WORKDIR/idem-output"
+cp -r "$WORKDIR/ws-idem1/output" "$WORKDIR/idem-output"
+rc2=$(run_prod idem2 "$W8" '["testa","testb"]' WS_FIXTURES_DIR="$WORKDIR/idem-output")
+if [[ "$rc1" -eq 0 && "$rc2" -eq 0 ]]; then
+  ok "repeated publish succeeds idempotently"
+else
+  bad "repeated publish failed (rc1=$rc1 rc2=$rc2)"
+fi
+grep -q "SUMMARY unchanged=" "$WORKDIR/idem2.log" && ok "content-aware summary emitted" || bad "summary missing"
+grep -q 'upload ' "$WORKDIR/idem2.events" \
+  && bad "second run uploaded assets" || ok "second run uploaded nothing"
+grep -q 'delete-asset' "$WORKDIR/idem2.events" \
+  && bad "second run deleted assets" || ok "second run deleted nothing"
+grep -q "Remote verification passed" "$WORKDIR/idem2.log" \
+  && ok "second run remote verification passed" || bad "remote verification missing on second run"
 
 fi # RUN_PROD_SCENARIOS
 

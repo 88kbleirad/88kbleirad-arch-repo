@@ -96,18 +96,31 @@ asset_names() {
 }
 
 # build the release JSON document
+# MOCK_GH_NO_DIGEST=1 omits the digest field (simulates the pre-digest API
+# or an unavailable remote checksum); MOCK_GH_BAD_DIGEST=1 emits a
+# malformed digest (algorithm/size violation) for negative tests.
 release_json() {
   local tag="${1:-repository}" first=1
   printf '{\n  "id": 1,\n  "tag_name": %s,\n  "name": "Arch Package Repository",\n' "$(printf '%s' "$tag" | jq -R .)"
   printf '  "upload_url": "https://uploads.github.com/repos/FAKE/releases/1/assets{?name,label}",\n'
   printf '  "assets": [\n'
-  local name id
+  local name id size digest digest_field
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     id=$(id_for_name "$name")
+    size=$(stat -c %s "$FAKE_RELEASE_DIR/$name" 2>/dev/null || echo 0)
+    digest_field=""
+    if [[ "${MOCK_GH_NO_DIGEST:-0}" != "1" ]]; then
+      if [[ "${MOCK_GH_BAD_DIGEST:-0}" == "1" ]]; then
+        digest="sha1:deadbeef"
+      else
+        digest="sha256:$(sha256sum "$FAKE_RELEASE_DIR/$name" 2>/dev/null | awk '{print $1}')"
+      fi
+      digest_field=$(printf ', "digest": %s' "$(printf '%s' "$digest" | jq -R .)")
+    fi
     [[ $first -eq 0 ]] && printf ',\n'
-    printf '    {"id": %s, "name": %s, "size": 1, "browser_download_url": "https://example.com/%s"}' \
-      "$id" "$(printf '%s' "$name" | jq -R .)" "$(printf '%s' "$name" | jq -R -s . | tr -d '"')"
+    printf '    {"id": %s, "name": %s, "size": %s, "browser_download_url": "https://example.com/%s"%s}' \
+      "$id" "$(printf '%s' "$name" | jq -R .)" "$size" "$(printf '%s' "$name" | jq -R -s . | tr -d '"')" "$digest_field"
     first=0
   done < <(asset_names)
   printf '\n  ]\n}\n'
@@ -226,9 +239,11 @@ if [[ "${1:-}" == "release" && "${2:-}" == "download" ]]; then
     exit 1
   fi
   if [[ "${FAIL_DOWNLOAD_ONCE_ON:-}" == "$pattern" ]]; then
-    unset FAIL_DOWNLOAD_ONCE_ON
-    echo "HTTP 502: bad gateway (simulated transient download failure)" >&2
-    exit 1
+    if [[ ! -f "$FAKE_RELEASE_DIR/.fail_dl_once_$pattern" ]]; then
+      touch "$FAKE_RELEASE_DIR/.fail_dl_once_$pattern"
+      echo "HTTP 502: bad gateway (simulated transient download failure)" >&2
+      exit 1
+    fi
   fi
   for f in "$FAKE_RELEASE_DIR"/$(basename "$pattern"); do
     if [[ -f "$f" ]]; then

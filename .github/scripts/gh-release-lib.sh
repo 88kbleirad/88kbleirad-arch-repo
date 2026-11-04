@@ -30,7 +30,15 @@ set -uo pipefail
 GH_API_MAX_ATTEMPTS="${GH_API_MAX_ATTEMPTS:-5}"
 GH_API_BASE_DELAY="${GH_API_BASE_DELAY:-2}"
 
-gh_log() { printf '[gh] %s\n' "$*"; }
+# counters for content-aware publishing; the publisher may reset them
+if [[ -z "${PUBLISH_COUNTERS+x}" ]]; then
+  declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+fi
+
+# Diagnostic logging goes to stderr: stdout is reserved for function
+# *return values* (checksums, ids, bodies) captured via command
+# substitution. Mixing them silently corrupts every returned value.
+gh_log() { printf '[gh] %s\n' "$*" >&2; }
 gh_err() { printf '::error::[gh] %s\n' "$*" >&2; }
 
 # sleep_for_attempt <attempt> [retry_after]
@@ -203,4 +211,219 @@ gh_upload_asset() {
     sleep_for_attempt "$attempt" "$(parse_retry_after "$GH_LAST_RAW")"
     attempt=$(( attempt + 1 ))
   done
+}
+
+# ---------------------------------------------------------------------------
+# Content-aware asset publishing (Objective A)
+# ---------------------------------------------------------------------------
+# Asset status classification:
+#   UNCHANGED -> remote content identical to local (trustworthy checksum)
+#   NEW       -> remote asset does not exist yet
+#   CHANGED   -> remote asset exists with different content
+#   MISSING   -> remote asset absent (query succeeded, nothing to compare)
+#   UNKNOWN   -> remote checksum could not be obtained/verified
+#   FAILED    -> remote state could not be queried at all
+
+# sha256_hex <file> -> lowercase hex sha256 (or empty on error)
+sha256_hex() {
+  local f="$1"
+  [[ -f "$f" ]] || { echo ""; return 1; }
+  sha256sum "$f" 2>/dev/null | awk '{print $1}'
+}
+
+# valid_sha256_hex <string> -> 0 when it is a 64-char lowercase hex sha256
+valid_sha256_hex() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# gh_asset_digest <tag> <repo> <name> -> prints hex sha256 or empty
+# Uses the GitHub `digest` field when present and plausibly valid; a
+# malformed digest is treated as absent (the caller must fall back).
+gh_asset_digest() {
+  local tag="$1" repo="$2" name="$3" d
+  d="$(gh_api_retry "asset digest (${name})" \
+      "/repos/${repo}/releases/tags/${tag}" \
+      --jq ".assets[] | select(.name == \"${name}\") | .digest // empty" \
+      2>/dev/null | tr -d '"')" || true
+  d="${d#sha256:}"
+  if valid_sha256_hex "$d"; then
+    printf '%s\n' "$d"
+    return 0
+  fi
+  return 1
+}
+
+# gh_asset_sha256 <tag> <repo> <name> <dir>
+# Returns a trustworthy remote checksum:
+#   1. the API `digest` field when present and valid;
+#   2. otherwise a safe download-and-hash fallback (sha256 over the
+#      downloaded asset bytes).
+# Prints the hex on success (0); prints nothing and returns 1 when the
+# checksum cannot be obtained (unknown).
+gh_asset_sha256() {
+  local tag="$1" repo="$2" name="$3" dir="$4" hex
+
+  hex="$(gh_asset_digest "$tag" "$repo" "$name")" || true
+  if [[ -n "$hex" ]]; then
+    printf '%s\n' "$hex"
+    return 0
+  fi
+
+  gh_log "no API digest for '${name}'; falling back to download-and-hash"
+  if gh_download_asset_retry "$tag" "$repo" "$name" "$dir"; then
+    hex="$(sha256_hex "$dir/$name")"
+    if [[ -n "$hex" ]]; then
+      printf '%s\n' "$hex"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# gh_download_asset_retry <tag> <repo> <name> <dir>
+# Download one asset by name with bounded retries. Returns 0 when the
+# file exists and is non-empty.
+gh_download_asset_retry() {
+  local tag="$1" repo="$2" name="$3" dir="$4" attempt rc
+  mkdir -p "$dir"
+  for attempt in 1 2 3; do
+    gh release download "$tag" --repo "$repo" --dir "$dir" --pattern "$name" \
+      2>"$dir/.dl-err" && rc=0 || rc=$?
+    if [[ $rc -eq 0 && -s "$dir/$name" ]]; then
+      return 0
+    fi
+    gh_log "download '${name}' attempt ${attempt}/3 failed (rc=${rc})"
+    sleep 2
+  done
+  return 1
+}
+
+# gh_asset_status <tag> <repo> <file> <workdir>
+# Classify the local file against the remote asset. Sets ASSET_STATUS and
+# ASSET_REMOTE_HEX (remote sha256 when obtainable).
+#
+# Return codes:
+#   0 -> UNCHANGED (skip upload)
+#   1 -> NEW / CHANGED / MISSING (upload required)
+#   2 -> UNKNOWN / FAILED (do NOT mutate; caller decides)
+gh_asset_status() {
+  local tag="$1" repo="$2" file="$3" workdir="$4"
+  local name hex remote_hex status
+  name="$(basename "$file")"
+  ASSET_STATUS="FAILED"
+  ASSET_REMOTE_HEX=""
+
+  hex="$(sha256_hex "$file")"
+  if [[ -z "$hex" ]]; then
+    gh_err "asset status '${name}': cannot hash local file"
+    return 2
+  fi
+
+  if ! gh_api_retry "asset status (${name})" \
+      "/repos/${repo}/releases/tags/${tag}" \
+      --jq ".assets[] | select(.name == \"${name}\") | {id,digest}" \
+      >/dev/null 2>&1; then
+    gh_err "asset status '${name}': failed to query release assets"
+    ASSET_STATUS="FAILED"
+    return 2
+  fi
+
+  local found
+  found="$(gh_api_retry "asset status (${name})" \
+      "/repos/${repo}/releases/tags/${tag}" \
+      --jq ".assets[] | select(.name == \"${name}\") | .id" \
+      2>/dev/null | head -n1 | tr -d '"')" || true
+
+  if [[ -z "$found" ]]; then
+    ASSET_STATUS="MISSING"
+    return 1
+  fi
+
+  remote_hex="$(gh_asset_sha256 "$tag" "$repo" "$name" "$workdir/.remote-assets")" || true
+  if [[ -z "$remote_hex" ]]; then
+    gh_err "asset status '${name}': remote checksum unavailable (no digest, download failed)"
+    ASSET_STATUS="UNKNOWN"
+    return 2
+  fi
+  ASSET_REMOTE_HEX="$remote_hex"
+
+  if [[ "$remote_hex" == "$hex" ]]; then
+    ASSET_STATUS="UNCHANGED"
+    return 0
+  fi
+  ASSET_STATUS="CHANGED"
+  return 1
+}
+
+# gh_publish_asset <tag> <repo> <file> <workdir> [kind]
+# Content-aware upload: skips identical content, replaces changed content,
+# uploads new content. Logs the required classification lines and updates
+# the counters in PUBLISH_COUNTERS (initialized on first use). Returns 0
+# on success/no-op, 1 on failure (no partial mutation is attempted after a
+# failure).
+gh_publish_asset() {
+  local tag="$1" repo="$2" file="$3" workdir="$4" kind="${5:-asset}"
+  local name status
+  name="$(basename "$file")"
+
+  gh_asset_status "$tag" "$repo" "$file" "$workdir" || true
+  status="$ASSET_STATUS"
+
+  case "$status" in
+    UNCHANGED)
+      echo "[publish] UNCHANGED ${kind}: ${name}"
+      PUBLISH_COUNTERS[unchanged]=$(( PUBLISH_COUNTERS[unchanged] + 1 ))
+      return 0
+      ;;
+    MISSING|NEW)
+      echo "[publish] NEW ${kind}: ${name}"
+      if ! gh_upload_asset "$tag" "$repo" "$file"; then
+        echo "[publish] FAILED ${kind}: ${name}"
+        PUBLISH_COUNTERS[failed]=$(( PUBLISH_COUNTERS[failed] + 1 ))
+        return 1
+      fi
+      PUBLISH_COUNTERS[uploaded]=$(( PUBLISH_COUNTERS[uploaded] + 1 ))
+      return 0
+      ;;
+    CHANGED)
+      echo "[publish] CHANGED ${kind}: ${name}"
+      if ! gh_upload_asset "$tag" "$repo" "$file"; then
+        echo "[publish] FAILED ${kind}: ${name}"
+        PUBLISH_COUNTERS[failed]=$(( PUBLISH_COUNTERS[failed] + 1 ))
+        return 1
+      fi
+      PUBLISH_COUNTERS[replaced]=$(( PUBLISH_COUNTERS[replaced] + 1 ))
+      return 0
+      ;;
+    UNKNOWN)
+      # A hard-to-verify remote state must never be treated as a cache
+      # hit, but we must also never delete a valid asset merely because
+      # its checksum could not be retrieved. Fail closed.
+      gh_err "asset status '${name}': remote checksum unknown; refusing to delete/replace an unverifiable asset"
+      echo "[publish] FAILED ${kind}: ${name} (remote checksum unknown)"
+      PUBLISH_COUNTERS[failed]=$(( PUBLISH_COUNTERS[failed] + 1 ))
+      return 1
+      ;;
+    *)
+      gh_err "asset status '${name}': failed to query remote state"
+      echo "[publish] FAILED ${kind}: ${name}"
+      PUBLISH_COUNTERS[failed]=$(( PUBLISH_COUNTERS[failed] + 1 ))
+      return 1
+      ;;
+  esac
+}
+
+# publish_assets_loop <tag> <repo> <workdir> <kind> <files...>
+# Ordered content-aware publish of a list of files; aborts on the first
+# failure (dependent mutations must stop).
+publish_assets_loop() {
+  local tag="$1" repo="$2" workdir="$3" kind="$4"; shift 4
+  local f
+  for f in "$@"; do
+    if ! gh_publish_asset "$tag" "$repo" "$f" "$workdir" "$kind"; then
+      echo "::error::Publish failed for $(basename "$f"); aborting before any further mutation."
+      return 1
+    fi
+  done
+  return 0
 }
