@@ -106,8 +106,8 @@ for f in "${PKG_ASSETS[@]}"; do
   meta="v4-${base}.meta.json"
   if [[ ! -f "$meta" ]]; then
     fail "missing architecture metadata for ${base}: ${meta}"
-  elif ! jq -e '.profile == "x86-64-v4" and (.fingerprint | length > 0) and (.status == "built" or .status == "skipped")' "$meta" >/dev/null 2>&1; then
-    fail "invalid architecture metadata (must be profile=v4, status=built|skipped): ${meta}"
+  elif ! jq -e '.profile == "x86-64-v4" and (.fingerprint | length > 0) and (.status == "built" or .status == "skipped" or .status == "restored")' "$meta" >/dev/null 2>&1; then
+    fail "invalid architecture metadata (must be profile=v4, status=built|skipped|restored): ${meta}"
   else
     ok "metadata ok: ${meta}"
   fi

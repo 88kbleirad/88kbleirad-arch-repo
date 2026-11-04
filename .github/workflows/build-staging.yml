@@ -107,9 +107,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      # Temporary isolation test: sequential builds while the container
-      # lifecycle fix is validated. Restore to 2 once staging is stable.
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         package: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:

@@ -107,6 +107,50 @@ extract_pkginfo() {
   return 1
 }
 
+# Verify every build dependency resolves to an official repository package
+# or to a package built within this repository. AUR-only dependencies
+# would otherwise make `makepkg` fail in opaque ways (or be silently
+# bypassed); fail loudly instead with a precise list.
+check_dependencies_resolvable() {
+  local srcinfo deps
+  srcinfo=$(sudo -u builder bash -lc \
+    "cd '$WORKSPACE/$PKG' && makepkg --printsrcinfo" 2>/dev/null) || {
+      warn "makepkg --printsrcinfo failed; cannot verify dependencies (will attempt build)"
+      return 0
+    }
+  deps=$(printf '%s\n' "$srcinfo" | awk -F' = ' '
+    /^\s*(depends|makedepends|checkdepends) = / { print $2 }' | sed -E 's/[<>=].*$//' | sort -u)
+
+  local -A unresolved=()
+  local dep
+  for dep in $deps; do
+    [[ -n "$dep" ]] || continue
+    if [[ -d "$WORKSPACE/$dep" && -f "$WORKSPACE/$dep/PKGBUILD" ]]; then
+      # dependency built within this repository
+      :
+    elif pacman -S --print-format '%n' --noconfirm --needed "$dep" \
+        >/dev/null 2>&1; then
+      # resolvable from official repos, including virtual providers
+      # (e.g. 'cargo' is provided by 'rust', 'libgcc_s.so' by
+      # 'gcc-libs'): pacman resolves providers here, so a package
+      # name missing from -Si is still installable.
+      :
+    else
+      unresolved["$dep"]=1
+    fi
+  done
+
+  if (( ${#unresolved[@]} > 0 )); then
+    local names
+    names=$(printf '%s\n' "${!unresolved[@]}" | sort)
+    echo "::error::[$PKG] build dependencies not resolvable from official repos or this repository (AUR-only?):"
+    printf '::error::  %s\n' $names
+    echo "::error::[$PKG] refusing to build with unresolved dependencies; add them to packages.txt or use official packages."
+    return 1
+  fi
+  return 0
+}
+
 # Fingerprint = current PKGBUILD + compiler configuration. Any change to
 # either invalidates the cache for this package.
 compute_fingerprint() {
@@ -294,39 +338,54 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
     ASSUME_ARGS="$ASSUME_ARGS --assume-installed $subpkg"
   done
 
-  # Build driver selection. paru is the AUR helper used in the CachyOS
-  # environment; the generic Arch build environment has no paru (it lives
-  # in the AUR / CachyOS repos, whose binaries are v4-tuned and unsafe to
-  # execute on non-AVX-512 hosts). When paru is absent, fall back to
-  # makepkg directly -- all staging dependencies resolve from the official
-  # Arch repositories, so no AUR helper is required.
-  PARU_RC=0
-  if command -v paru >/dev/null 2>&1; then
-    BUILDER_NAME="paru"
-    PARU_FLAGS="--noconfirm --skipreview --useask --removemake --nocheck -B$ASSUME_ARGS"
-    sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && paru $PARU_FLAGS '$WORKSPACE/$PKG'" || PARU_RC=$?
-  else
-    BUILDER_NAME="makepkg"
-    warn "paru not found; using makepkg (dependencies must resolve from official repos)"
-    sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && makepkg --noconfirm --nocheck --syncdeps --needed" || PARU_RC=$?
+  # Loud dependency gate: refuse to attempt a build when any build
+  # dependency cannot resolve from official repositories or from this
+  # repository (AUR-only dependencies would fail inside makepkg, or get
+  # bypassed by the makepkg fallback in older setups). Falling back to the
+  # restore/protect path keeps the last published binaries available until
+  # the dependency is resolved.
+  DEP_GATE_OK=true
+  PARU_RC=1
+  BUILDER_NAME="dependency-gate (unresolved build dependencies)"
+  if ! check_dependencies_resolvable; then
+    DEP_GATE_OK=false
   fi
 
-  # distinct diagnostics for the most common failure modes
-  case "$PARU_RC" in
-    0) ;;
-    137)
-      warn "${BUILDER_NAME} was killed with exit code 137 (OOM / out of memory). Build environment may need more memory."
-      ;;
-    1)
-      warn "${BUILDER_NAME} exited with code 1 (build error) for $PKG; checking whether package files were produced anyway."
-      ;;
-    128)
-      warn "${BUILDER_NAME} exited with code 128 (fatal) for $PKG; checking whether package files were produced anyway."
-      ;;
-    *)
-      warn "${BUILDER_NAME} exited with code $PARU_RC for $PKG; checking whether package files were produced anyway."
-      ;;
-  esac
+  if [[ "$DEP_GATE_OK" == "true" ]]; then
+    # Build driver selection. paru is the AUR helper used in the CachyOS
+    # environment; the generic Arch build environment has no paru (it lives
+    # in the AUR / CachyOS repos, whose binaries are v4-tuned and unsafe to
+    # execute on non-AVX-512 hosts). When paru is absent, fall back to
+    # makepkg directly -- all staging dependencies resolve from the official
+    # Arch repositories, so no AUR helper is required.
+    PARU_RC=0
+    if command -v paru >/dev/null 2>&1; then
+      BUILDER_NAME="paru"
+      PARU_FLAGS="--noconfirm --skipreview --useask --removemake --nocheck -B$ASSUME_ARGS"
+      sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && paru $PARU_FLAGS '$WORKSPACE/$PKG'" || PARU_RC=$?
+    else
+      BUILDER_NAME="makepkg"
+      warn "paru not found; using makepkg (dependencies must resolve from official repos)"
+      sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && makepkg --noconfirm --nocheck --syncdeps --needed" || PARU_RC=$?
+    fi
+
+    # distinct diagnostics for the most common failure modes
+    case "$PARU_RC" in
+      0) ;;
+      137)
+        warn "${BUILDER_NAME} was killed with exit code 137 (OOM / out of memory). Build environment may need more memory."
+        ;;
+      1)
+        warn "${BUILDER_NAME} exited with code 1 (build error) for $PKG; checking whether package files were produced anyway."
+        ;;
+      128)
+        warn "${BUILDER_NAME} exited with code 128 (fatal) for $PKG; checking whether package files were produced anyway."
+        ;;
+      *)
+        warn "${BUILDER_NAME} exited with code $PARU_RC for $PKG; checking whether package files were produced anyway."
+        ;;
+    esac
+  fi
 
   BUILT_FILES=()
   shopt -s nullglob

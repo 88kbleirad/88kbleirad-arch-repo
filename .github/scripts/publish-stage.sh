@@ -13,6 +13,33 @@ GH_TOKEN="${GH_TOKEN:?GH_TOKEN is required}"
 pacman -Syu --noconfirm --needed \
   github-cli pacman-contrib jq libarchive
 
+# usage: gh_download_retry <pattern> <dir>
+# Returns 0 when the file was downloaded and is non-empty. `gh release
+# download` exits 0 even when the pattern matched nothing, so the file is
+# verified explicitly. Returns 2 for a clean miss (no asset matching).
+gh_download_retry() {
+  local pattern="$1" dir="$2" attempt rc f=""
+  for attempt in 1 2 3; do
+    gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+        --dir "$dir" --pattern "$pattern" 2>/dev/null
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      local candidate
+      for candidate in "$dir"/$(basename "$pattern"); do
+        [[ -s "$candidate" ]] && f="$candidate"
+      done
+      if [[ -n "$f" ]]; then
+        return 0
+      fi
+      echo "[publish] download reported success for '$pattern' but no file was produced"
+      return 2
+    fi
+    echo "[publish] download attempt $attempt/3 failed for '$pattern' (rc=$rc)"
+    [[ $attempt -lt 3 ]] && sleep 5
+  done
+  return 1
+}
+
 cd "$GITHUB_WORKSPACE/output"
 
 echo "== Validate package archives and metadata =="
@@ -34,16 +61,113 @@ for pkg in "${pkgs[@]}"; do
   echo "Validated: $pkg"
 done
 
+REPO="$GITHUB_REPOSITORY"
+TAG="$RELEASE_TAG"
+
+# -- non-destructive merge with the previously published staging release ---
+#
+# A staging matrix may cover only a subset of the repository. Without a
+# merge, regenerating the database from this run's archives alone would
+# silently drop every package not in the matrix. To keep previously valid
+# staging packages available:
+#   1. pull the current release database and list its entries
+#   2. keep (and re-upload) every entry that this run did NOT supersede
+#   3. fail loudly if the current release/database cannot be read, instead
+#      of proceeding with a partial database
+# An entry is superseded only when its base package was processed in this
+# run with a non-failed status (built/skipped/restored) and a fresh
+# archive for it is present below.
+MERGE_DIR="$(mktemp -d)"
+shopt -s nullglob
+merged_assets=( *.pkg.tar.zst )
+MERGED=0
+
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  if ! gh_download_retry "${REPO_DB_NAME}.db.tar.gz" "$MERGE_DIR"; then
+    echo "::error::Current staging release exists but its database cannot be read; refusing to publish a partial repository."
+    exit 1
+  fi
+  mkdir -p "$MERGE_DIR/db"
+  if ! bsdtar -xf "$MERGE_DIR/${REPO_DB_NAME}.db.tar.gz" -C "$MERGE_DIR/db"; then
+    echo "::error::Cannot extract current staging database; refusing to publish a partial repository."
+    exit 1
+  fi
+
+  # bases processed this run, with their status
+  declare -A PROCESSED_STATUS=()
+  for meta in v4-*.meta.json; do
+    base=$(jq -r '.package // empty' "$meta")
+    status=$(jq -r '.status // empty' "$meta")
+    [[ -n "$base" ]] && PROCESSED_STATUS["$base"]="$status"
+  done
+
+  # names of packages this run produced fresh
+  declare -A NEW_NAMES=()
+  for pkg in "${pkgs[@]}"; do
+    name=$(bsdtar -xOf "$pkg" .PKGINFO 2>/dev/null | awk -F' = ' '/^pkgname/{print $2; exit}')
+    [[ -n "$name" ]] && NEW_NAMES["$name"]=1
+  done
+
+  for desc in "$MERGE_DIR/db"/*/desc; do
+    [[ -f "$desc" ]] || continue
+    fname=$(awk '/^%FILENAME%/{getline; print}' "$desc")
+    base=$(awk '/^%BASE%/{getline; print}' "$desc")
+    name=$(awk '/^%NAME%/{getline; print}' "$desc")
+    [[ -n "$fname" ]] || continue
+    if [[ -n "${NEW_NAMES[$name]:-}" ]]; then
+      # superseded by a fresh archive in this run
+      continue
+    fi
+    if [[ -n "$base" && -n "${PROCESSED_STATUS[$base]:-}" \
+        && "${PROCESSED_STATUS[$base]}" != "failed" ]]; then
+      # base was processed with a non-failed status but produced no
+      # archive with this name: dropped (split package changed)
+      echo "Not superseded but processed without this subpackage; dropping: $fname"
+      continue
+    fi
+    if [[ ! -f "$fname" ]]; then
+      if gh_download_retry "$fname" "$PWD"; then
+        merged_assets+=("$fname")
+        MERGED=$(( MERGED + 1 ))
+        echo "Kept previously published package: $fname"
+        # also carry its architecture metadata forward (validation requires
+        # a v4-<base>.meta.json for every package in the database). This
+        # overwrites a local meta file from a failed build of the same
+        # base: the restored archive belongs to the previous release, so
+        # its metadata must describe that release, not the failed run.
+        local_meta="v4-${base}.meta.json"
+        if [[ -f "$local_meta" ]]; then
+          rm -f "$local_meta"
+        fi
+        if gh_download_retry "v4-${base}.meta.json" "$PWD"; then
+          echo "Kept architecture metadata: v4-${base}.meta.json"
+        else
+          echo "::warning::No released metadata for kept package ${base}; writing a placeholder that forces a rebuild on the next run."
+          printf '{\n  "package": %s,\n  "profile": "x86-64-v4",\n  "status": "restored",\n  "fingerprint": "placeholder-unavailable",\n  "built_at": %s\n}\n' \
+            "$(printf '%s' "$base" | jq -R .)" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ | jq -R .)" \
+            > "$local_meta"
+        fi
+      else
+        echo "::error::Previously published package $fname cannot be restored; refusing to publish a partial repository."
+        rm -rf "$MERGE_DIR"
+        exit 1
+      fi
+    fi
+  done
+else
+  echo "Staging release $TAG does not exist yet; nothing to merge."
+fi
+rm -rf "$MERGE_DIR"
+
 echo "== Generate fresh pacman database for staging =="
 rm -f status-*.txt protect-*.txt
-repo-add "${REPO_DB_NAME}.db.tar.gz" "${pkgs[@]}"
+repo-add "${REPO_DB_NAME}.db.tar.gz" "${merged_assets[@]}"
 
 echo "== Validate repository consistency =="
 bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD" "$REPO_DB_NAME" | tee "$GITHUB_STEP_SUMMARY"
 
 echo "== Publish to staging release =="
-REPO="$GITHUB_REPOSITORY"
-TAG="$RELEASE_TAG"
 
 pkg_assets=( *.pkg.tar.zst )
 if (( ${#pkg_assets[@]} == 0 )); then
@@ -62,13 +186,13 @@ if (( ${#meta_assets[@]} == 0 )); then
 fi
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-  echo "Staging release $TAG exists; replacing it."
-  gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+  echo "Staging release $TAG exists; merging this run into it."
+else
+  echo "Creating staging release $TAG."
+  gh release create "$TAG" --repo "$REPO" \
+    --title "Staging repository (v4 test)" \
+    --notes "Staging buildup: $(date -u '+%Y-%m-%d %H:%M UTC') — x86-64-v4"
 fi
-echo "Creating staging release $TAG."
-gh release create "$TAG" --repo "$REPO" \
-  --title "Staging repository (v4 test)" \
-  --notes "Staging buildup: $(date -u '+%Y-%m-%d %H:%M UTC') — x86-64-v4"
 gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" \
   --repo "$REPO" --clobber
 echo "Published staging release: $REPO/releases/tag/$TAG"

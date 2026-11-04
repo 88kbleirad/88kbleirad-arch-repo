@@ -111,6 +111,7 @@ create_container() {
   while IFS= read -r a; do PID1_ARGS+=("$a"); done < <(pid1_cmd)
   docker create \
     -e GITHUB_WORKSPACE="$WS" \
+    -e EXTRA_REPO="${EXTRA_REPO:-}" \
     -v "$WS":"$WS" \
     --workdir "$WS" \
     --entrypoint "${PID1_ARGS[0]}" \
@@ -171,6 +172,20 @@ if grep -q '^\[options\]$' /etc/pacman.conf; then
   ' /etc/pacman.conf > "$tmp"
   cat "$tmp" > /etc/pacman.conf
   rm -f "$tmp"
+fi
+
+# Optional additional pacman repository (e.g. the repository itself, so
+# inter-package dependencies resolve during syncdeps). Format:
+#   name|url
+# Example: EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"
+if [[ -n "${EXTRA_REPO:-}" ]]; then
+  repo_name="${EXTRA_REPO%%|*}"
+  repo_url="${EXTRA_REPO#*|}"
+  if [[ -z "$repo_name" || -z "$repo_url" || "$repo_name" == "$EXTRA_REPO" ]]; then
+    echo "::error::EXTRA_REPO must be 'name|url'"
+    exit 1
+  fi
+  printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' "$repo_name" "$repo_url" >> /etc/pacman.conf
 fi
 
 pacman -Syu --noconfirm --needed \
