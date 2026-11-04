@@ -161,6 +161,19 @@ jobs:
         with:
           fetch-depth: 1
 
+      # The validation tool used by build jobs (and by local tests) is
+      # bsdtar/libarchive. The default Ubuntu runner does not ship it;
+      # install it so verification semantics are identical to the build
+      # container. verify-build-cache.sh also falls back to GNU tar with
+      # zstd when bsdtar is unavailable, so a failed install cannot
+      # silently corrupt results — it is reported as an infrastructure
+      # error.
+      - name: Install archive validation tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libarchive-tools zstd jq
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:

@@ -10,10 +10,15 @@
 #   MISS   - status-built (legitimate rebuild) — allowed in normal mode
 #   MISS_FINGERPRINT - cached metadata exists but fingerprint changed
 #   MISS_ARCHIVE - matching metadata but no package archive
-#   INVALID - cached archive failed structural/metadata validation
+#   INVALID - cached archive failed structural/metadata validation (with a
+#              precise reason)
 #   FAILED - build status-failed
 #   EXCLUDED - intentionally excluded (in excluded set)
 #   MISSING - no result recorded for an expected package
+#
+# Archive validation distinguishes INFRASTRUCTURE errors (missing tools)
+# from corrupted content. Without a working archive reader the verification
+# fails closed and reports TOOL_UNAVAILABLE — never "CORRUPT".
 #
 # Modes:
 #   --strict   any unexpected cache miss (rebuild, fingerprint change,
@@ -26,6 +31,7 @@
 # Usage:
 #   verify-build-cache.sh --expected '<[pkg,...]>' \
 #       --results-dir <dir> [--strict|--all] [--excluded '<json>']
+#       [--hashes '<{pkg: sha256hex,...}>']
 #
 # results-dir layout (from build jobs / publish artifacts):
 #   status-<state>-<pkg>.txt      (state: built|skipped|restored|failed)
@@ -39,12 +45,14 @@ MODE="normal"
 EXPECTED_JSON=""
 RESULTS_DIR=""
 EXCLUDED_JSON=""
+EXPECTED_HASHES_JSON=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --expected) shift; EXPECTED_JSON="$1" ;;
     --results-dir) shift; RESULTS_DIR="$1" ;;
     --excluded) shift; EXCLUDED_JSON="$1" ;;
+    --hashes) shift; EXPECTED_HASHES_JSON="$1" ;;
     --strict) MODE="strict" ;;
     --all) MODE="all" ;;
   esac
@@ -64,6 +72,16 @@ if [[ -n "$EXCLUDED_JSON" ]]; then
   while IFS= read -r name; do
     [[ -n "$name" ]] && excluded_names+=("$name")
   done < <(printf '%s\n' "$EXCLUDED_JSON" | jq -r '.[]')
+fi
+
+declare -A EXPECTED_HASHES=()
+if [[ -n "$EXPECTED_HASHES_JSON" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    pkg="${line%%|*}"
+    hex="${line#*|}"
+    EXPECTED_HASHES["$pkg"]="$hex"
+  done < <(printf '%s\n' "$EXPECTED_HASHES_JSON" | jq -r 'to_entries[] | "\(.key)|\(.value)"')
 fi
 
 # build a lookup of status by package
@@ -91,20 +109,88 @@ for f in "$RESULTS_DIR"/v4-*.meta.json; do
   META_PROFILE["$pkg"]="$prof"
 done
 
-# archive validation
-validate_archive() { # file -> 0 valid, 1 invalid
+# ---------------------------------------------------------------------------
+# Archive validation with precise diagnostics.
+#
+# Tool selection: prefer bsdtar (libarchive), fall back to GNU tar with
+# zstd. If neither is usable, VALIDATION_TOOL_ERROR is set and every
+# artifact is classified TOOL_UNAVAILABLE (infrastructure error), never
+# CORRUPT.
+# ---------------------------------------------------------------------------
+ARCHIVE_TOOL=""
+VALIDATION_TOOL_ERROR=""
+
+detect_archive_tool() {
+  if command -v bsdtar >/dev/null 2>&1; then
+    # probe: bsdtar must actually run (a broken shim must not pass)
+    if bsdtar --version >/dev/null 2>&1; then
+      ARCHIVE_TOOL="bsdtar"
+      return 0
+    fi
+  fi
+  if command -v tar >/dev/null 2>&1; then
+    if tar --version >/dev/null 2>&1 && tar --zstd --version >/dev/null 2>&1; then
+      ARCHIVE_TOOL="tar-zstd"
+      return 0
+    fi
+  fi
+  VALIDATION_TOOL_ERROR="required archive validation tool unavailable (bsdtar/libarchive or tar with zstd)"
+  return 1
+}
+
+# archive_list <file> -> list members (or empty)
+archive_list() {
   local f="$1"
-  [[ -s "$f" ]] || return 1
-  bsdtar -tf "$f" >/dev/null 2>&1 || return 1
-  bsdtar -xOf "$f" .PKGINFO 2>/dev/null | grep -q '^pkgname = ' || return 1
+  if [[ "$ARCHIVE_TOOL" == "bsdtar" ]]; then
+    bsdtar -tf "$f" 2>/dev/null
+  else
+    tar --zstd -tf "$f" 2>/dev/null
+  fi
+}
+
+# archive_pkginfo <file> -> prints .PKGINFO content (or empty)
+archive_pkginfo() {
+  local f="$1"
+  if [[ "$ARCHIVE_TOOL" == "bsdtar" ]]; then
+    bsdtar -xOf "$f" .PKGINFO 2>/dev/null
+  else
+    tar --zstd -xOf "$f" .PKGINFO 2>/dev/null
+  fi
+}
+
+# validate_archive <file> -> 0 valid, 1 invalid
+# Sets VALIDATION_REASON on failure.
+validate_archive() {
+  local f="$1"
+  VALIDATION_REASON=""
+  [[ -s "$f" ]] || { VALIDATION_REASON="missing archive"; return 1; }
+  if ! archive_list "$f" | grep -q '^\.PKGINFO$'; then
+    VALIDATION_REASON="archive decompression failed or missing .PKGINFO"
+    return 1
+  fi
+  if ! archive_pkginfo "$f" | grep -q '^pkgname = '; then
+    VALIDATION_REASON="missing .PKGINFO (no pkgname)"
+    return 1
+  fi
   return 0
 }
+
+if ! detect_archive_tool; then
+  echo "ERROR: $VALIDATION_TOOL_ERROR"
+  echo "::error::$VALIDATION_TOOL_ERROR"
+fi
 
 declare -A RESULTS=()
 declare -A ARTIFACT=()
 
 for name in "${expected_names[@]}"; do
   status="${STATUS_BY_PKG[$name]:-}"
+
+  if [[ -n "$VALIDATION_TOOL_ERROR" ]]; then
+    RESULTS["$name"]="TOOL_UNAVAILABLE"
+    ARTIFACT["$name"]="ERROR"
+    continue
+  fi
 
   # duplicate detection: more than one status file or more than one archive
   # for the same package is an invalid result
@@ -129,32 +215,48 @@ for name in "${expected_names[@]}"; do
     continue
   fi
 
+  art=""
+  for a in "$RESULTS_DIR"/"$name"-*.pkg.tar.zst; do
+    [[ -f "$a" ]] && { art="$a"; break; }
+  done
+
   case "$status" in
     skipped)
       # cache hit: must have a valid archive
-      art=""
-      for a in "$RESULTS_DIR"/"$name"-*.pkg.tar.zst; do
-        [[ -f "$a" ]] && { art="$a"; break; }
-      done
       if [[ -n "$art" ]] && validate_archive "$art"; then
+        if [[ -n "${EXPECTED_HASHES[$name]:-}" ]]; then
+          actual=$(sha256sum "$art" | awk '{print $1}')
+          if [[ "$actual" != "${EXPECTED_HASHES[$name]}" ]]; then
+            RESULTS["$name"]="INVALID"
+            ARTIFACT["$name"]="checksum mismatch"
+            continue
+          fi
+        fi
         RESULTS["$name"]="HIT"
         ARTIFACT["$name"]="VALID"
       elif [[ -n "$art" ]]; then
         RESULTS["$name"]="INVALID"
-        ARTIFACT["$name"]="CORRUPT"
+        ARTIFACT["$name"]="$VALIDATION_REASON"
       else
         RESULTS["$name"]="MISS_ARCHIVE"
         ARTIFACT["$name"]="MISSING"
       fi
       ;;
     built)
-      art=""
-      for a in "$RESULTS_DIR"/"$name"-*.pkg.tar.zst; do
-        [[ -f "$a" ]] && { art="$a"; break; }
-      done
       if [[ -n "$art" ]] && validate_archive "$art"; then
+        if [[ -n "${EXPECTED_HASHES[$name]:-}" ]]; then
+          actual=$(sha256sum "$art" | awk '{print $1}')
+          if [[ "$actual" != "${EXPECTED_HASHES[$name]}" ]]; then
+            RESULTS["$name"]="INVALID"
+            ARTIFACT["$name"]="checksum mismatch"
+            continue
+          fi
+        fi
         RESULTS["$name"]="MISS"
         ARTIFACT["$name"]="VALID"
+      elif [[ -n "$art" ]]; then
+        RESULTS["$name"]="INVALID"
+        ARTIFACT["$name"]="$VALIDATION_REASON"
       else
         RESULTS["$name"]="MISS_ARCHIVE"
         ARTIFACT["$name"]="MISSING"
@@ -190,13 +292,13 @@ for name in "${excluded_names[@]}"; do
 done
 
 # ---- machine-readable summary --------------------------------------------
-hits=0; misses=0; invalid=0; failed=0; excluded=0; missing=0; duplicates=0
+hits=0; misses=0; invalid=0; failed=0; excluded=0; missing=0; duplicates=0; tool_missing=0
 for name in "${expected_names[@]}"; do
   case "${RESULTS[$name]:-MISSING}" in
     HIT) hits=$(( hits + 1 )) ;;
     MISS) misses=$(( misses + 1 )) ;;
-    MISS_FINGERPRINT|MISS_ARCHIVE) invalid=$(( invalid + 1 )) ;;
-    INVALID|WRONG_PROFILE|DUPLICATE) invalid=$(( invalid + 1 )) ;;
+    TOOL_UNAVAILABLE) tool_missing=$(( tool_missing + 1 )) ;;
+    MISS_FINGERPRINT|MISS_ARCHIVE|INVALID|WRONG_PROFILE|DUPLICATE) invalid=$(( invalid + 1 )) ;;
     FAILED) failed=$(( failed + 1 )) ;;
     EXCLUDED) excluded=$(( excluded + 1 )) ;;
     MISSING) missing=$(( missing + 1 )) ;;
@@ -213,6 +315,7 @@ cat <<JSON
   "failed": $failed,
   "excluded": $excluded,
   "missing": $missing,
+  "tool_unavailable": $tool_missing,
   "mode": "$MODE"
 }
 JSON
@@ -235,8 +338,12 @@ for name in "${expected_names[@]}"; do
         verdict=1
       fi
       ;;
+    TOOL_UNAVAILABLE)
+      echo "::error::cache verification: validation tool unavailable; cannot verify $name"
+      verdict=1
+      ;;
     MISS_FINGERPRINT|MISS_ARCHIVE|INVALID|FAILED|WRONG_PROFILE|DUPLICATE)
-      echo "::error::cache verification: ${RESULTS[$name]} for $name"
+      echo "::error::cache verification: ${RESULTS[$name]} for $name (${ARTIFACT[$name]:-})"
       verdict=1
       ;;
     MISSING)

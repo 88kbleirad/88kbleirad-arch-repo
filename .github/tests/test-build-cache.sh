@@ -216,6 +216,99 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "cache: precisely invalid archive reports reason"
+D="$WORKDIR/precise"
+mkdir -p "$D"
+echo "a" > "$D/status-skipped-a.txt"
+printf 'garbage-not-a-tar' > "$D/a-1.0-1-x86_64.pkg.tar.zst"
+mk_meta "$D" a skipped
+if verify "$D" '["a"]' > "$WORKDIR/precise.out" 2>&1; then
+  bad "invalid archive accepted"
+else
+  grep -qE "INVALID for a \(archive decompression failed or missing .PKGINFO\)|archive decompression failed" "$WORKDIR/precise.out" \
+    && ok "invalid archive reports precise reason" || bad "precise reason missing: $(tail -3 "$WORKDIR/precise.out")"
+fi
+
+# ---------------------------------------------------------------------------
+note "cache: missing .PKGINFO detected"
+D="$WORKDIR/nopkginfo"
+mkdir -p "$D"
+echo "b" > "$D/status-skipped-b.txt"
+d="$WORKDIR/pkgbuild2/b"; mkdir -p "$d/usr/share"; echo x > "$d/usr/share/b"
+( cd "$d" && tar --zstd -cf "$D/b-1.0-1-x86_64.pkg.tar.zst" usr )  # no .PKGINFO
+mk_meta "$D" b skipped
+if verify "$D" '["b"]' > "$WORKDIR/nopkginfo.out" 2>&1; then
+  bad "archive without .PKGINFO accepted"
+else
+  grep -q "missing .PKGINFO" "$WORKDIR/nopkginfo.out" \
+    && ok "missing .PKGINFO detected" || bad "missing PKGINFO not detected: $(tail -3 "$WORKDIR/nopkginfo.out")"
+fi
+
+# ---------------------------------------------------------------------------
+note "cache: checksum mismatch detection (--hashes)"
+D="$WORKDIR/hash"
+mkdir -p "$D"
+echo "c" > "$D/status-skipped-c.txt"
+mk_archive "$D" c
+mk_meta "$D" c skipped
+good=$(sha256sum "$D/c-1.0-1-x86_64.pkg.tar.zst" | awk '{print $1}')
+if verify "$D" '["c"]' --hashes "{\"c\":\"$good\"}" > "$WORKDIR/hash-ok.out" 2>&1; then
+  ok "matching expected checksum passes"
+else
+  bad "matching checksum failed: $(tail -3 "$WORKDIR/hash-ok.out")"
+fi
+badhex=$(printf '0%.0s' $(seq 1 64))
+if verify "$D" '["c"]' --hashes "{\"c\":\"${badhex}\"}" > "$WORKDIR/hash-bad.out" 2>&1; then
+  bad "checksum mismatch accepted"
+else
+  grep -q "checksum mismatch" "$WORKDIR/hash-bad.out" \
+    && ok "checksum mismatch detected" || bad "checksum mismatch not detected: $(tail -3 "$WORKDIR/hash-bad.out")"
+fi
+
+# ---------------------------------------------------------------------------
+note "cache: missing validation tools -> TOOL_UNAVAILABLE (not CORRUPT)"
+D="$WORKDIR/tool"
+mkdir -p "$D"
+for name in d e f g h; do
+  echo "$name" > "$D/status-skipped-$name.txt"
+  mk_archive "$D" "$name"
+  mk_meta "$D" "$name" skipped
+done
+NOBIN="$WORKDIR/nobin"
+mkdir -p "$NOBIN"
+# shims that exist on PATH but are not usable -> tool detection must fail
+for tool in bsdtar tar; do
+  printf '#!/usr/bin/env bash\necho "%s: command not found" >&2\nexit 127\n' "$tool" > "$NOBIN/$tool"
+  chmod +x "$NOBIN/$tool"
+done
+if env PATH="$NOBIN:/usr/bin:/bin" bash "$REPO_ROOT/.github/scripts/verify-build-cache.sh" \
+    --expected '["d","e","f","g","h"]' --results-dir "$D" > "$WORKDIR/tool.out" 2>&1; then
+  bad "missing tools did not fail closed"
+else
+  grep -q '"tool_unavailable": 5' "$WORKDIR/tool.out" \
+    && ok "tool-unavailable counted for all" || bad "tool_unavailable count wrong: $(grep tool_unavailable "$WORKDIR/tool.out")"
+  ! grep -q "CORRUPT" "$WORKDIR/tool.out" \
+    && ok "no false CORRUPT when tools missing" || bad "false CORRUPT reported"
+  grep -q "required archive validation tool unavailable" "$WORKDIR/tool.out" \
+    && ok "tool error classified as infrastructure error" || bad "tool error message missing"
+fi
+
+# ---------------------------------------------------------------------------
+note "cache: GitHub Actions artifact merge layout (flat dir) validates"
+D="$WORKDIR/layout"
+mkdir -p "$D"
+for name in i j k; do
+  echo "$name" > "$D/status-skipped-$name.txt"
+  mk_archive "$D" "$name"
+  mk_meta "$D" "$name" skipped
+done
+if verify "$D" '["i","j","k"]' > "$WORKDIR/layout.out" 2>&1; then
+  ok "flat merged artifact layout validates"
+else
+  bad "flat layout failed: $(tail -3 "$WORKDIR/layout.out")"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
