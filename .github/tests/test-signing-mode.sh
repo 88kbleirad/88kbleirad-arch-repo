@@ -48,6 +48,7 @@ export GPG_PRIVATE_KEY=$(gpg --armor --export-secret-keys "$KEYID")
 REPO_COPY="$WORKDIR/repo"
 mkdir -p "$REPO_COPY/.github/scripts"
 cp "$REPO_ROOT/.github/scripts/sign-helpers.sh" "$REPO_COPY/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/gh-release-lib.sh" "$REPO_COPY/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/publish-prod.sh" "$REPO_COPY/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/validate-release.sh" "$REPO_COPY/.github/scripts/"
 mkdir -p "$REPO_COPY/bin"
@@ -111,6 +112,7 @@ run_prod() { # scenario mode keymode [releasedir]
       REPO_DB_NAME=88kbleirad \
       GITHUB_STEP_SUMMARY="$ws/summary.md" \
       SIGNING_MODE="$mode" \
+      EXPECTED_PACKAGES="${EXPECTED_PACKAGES:-}" \
       FAKE_RELEASE_DIR="$rel" \
       FAKE_EVENTS_LOG="$ws/events.log" \
       "${key_env[@]}" \

@@ -116,7 +116,7 @@ create_container() {
   docker create \
     -e GITHUB_WORKSPACE="$WS" \
     -e EXTRA_REPO="${EXTRA_REPO:-}" \
-    -v "$WS":"$WS" \
+    --mount type=bind,source="$WS",target="$WS" \
     --workdir "$WS" \
     --entrypoint "${PID1_ARGS[0]}" \
     "$IMAGE" "${PID1_ARGS[@]:1}" \
@@ -242,6 +242,23 @@ fi
 rustup default stable
 sudo -u builder rustup default stable
 
+# RUSTC_WRAPPER: keep `-C target-cpu=x86-64-v4` (the v4 Rust profile) on
+# the FINAL artifacts only. Cargo compiles and executes build scripts and
+# proc-macros on the HOST; GitHub-hosted ubuntu-24.04 runners have no
+# AVX-512, so a v4-compiled build script SIGILLs (observed: magika's
+# openssl-sys build script -> signal 4). The wrapper strips target-cpu
+# only for host-executed crates, so published binaries stay v4 while the
+# build runs safely on any baseline x86-64 host.
+#
+# The wrapper must reach cargo even when the build runs under
+# `sudo -u builder bash -lc ...` (sudo strips the docker-exec environment).
+# Exporting from /etc/profile.d makes every login shell — including the
+# builder's — pick it up; the docker-exec env below is a belt-and-braces
+# for non-login invocations.
+install -Dm755 "$GITHUB_WORKSPACE/.github/scripts/rustc-v4-safe.sh" /usr/local/bin/rustc-v4-safe
+printf 'export RUSTC_WRAPPER=/usr/local/bin/rustc-v4-safe\n' > /etc/profile.d/rustc-wrapper.sh
+echo "RUSTC_WRAPPER is set to: /usr/local/bin/rustc-v4-safe (profile.d + exec env)"
+
 # Verify the toolchain can target v4 (this is a compile-target check, not
 # a runtime requirement). Use files, never stdin: this script's stdin is
 # the bootstrap heredoc.
@@ -323,6 +340,7 @@ docker exec \
   -e BUILD_PROFILE="$BUILD_PROFILE" \
   -e PKG="$PKG" \
   -e GITHUB_STEP_SUMMARY="$SUMMARY_FILE" \
+  -e RUSTC_WRAPPER=/usr/local/bin/rustc-v4-safe \
   "$CID" bash "$WS/.github/scripts/build-package.sh"
 build_rc=$?
 

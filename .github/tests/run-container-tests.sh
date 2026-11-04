@@ -22,6 +22,9 @@ WORKDIR="${TEST_WORKDIR:-$(mktemp -d)}"; mkdir -p "$WORKDIR"
 trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 
 IMAGE="ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981"
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  docker pull "$IMAGE" >/dev/null
+fi
 CID=""
 WS="$WORKDIR/ws"
 mkdir -p "$WS/.github/scripts" "$WS/hello-v4test" "$WS/output" "$WS/fake-release"
@@ -65,7 +68,7 @@ chmod +x "$WS/.github/scripts/gh-shim-wrapper"
 # -- container --------------------------------------------------------------
 CID=$(docker create \
   -e GITHUB_WORKSPACE="$WS" \
-  -v "$WS":"$WS" \
+  --mount type=bind,source="$WS",target="$WS" \
   --workdir "$WS" \
   --entrypoint tail \
   "$IMAGE" -f /dev/null)

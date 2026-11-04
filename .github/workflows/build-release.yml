@@ -170,6 +170,7 @@ jobs:
           PUBLISH_SCRIPT: publish-prod.sh
           EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
           SIGNING_MODE: unsigned
+          EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
 
@@ -223,5 +224,6 @@ jobs:
           PUBLISH_SCRIPT: publish-prod.sh
           EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
           SIGNING_MODE: signed
+          EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"

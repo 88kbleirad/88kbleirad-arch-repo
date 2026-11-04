@@ -20,6 +20,9 @@ set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:?REPO_ROOT is required}
 IMAGE="ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981"
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  docker pull "$IMAGE" >/dev/null
+fi
 
 PASS=0
 FAIL=0
@@ -69,7 +72,15 @@ else
   echo "  (actionlint not installed; skipped)"
 fi
 
-# -- 3. matrix gate tests ---------------------------------------------------
+# -- 3. standalone host suite (lib + matrix) -------------------------------
+note "standalone host suite (gh-release-lib + matrix gates)"
+if bash "$REPO_ROOT/.github/tests/test-http500.sh"; then
+  ok "host suite (lib retries + inventory logic)"
+else
+  bad "host suite"
+fi
+
+# -- 4. matrix gate tests ---------------------------------------------------
 note "matrix gate tests (approval / schedule / critical / subset)"
 if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then
   ok "matrix gate suite"
@@ -77,10 +88,10 @@ else
   bad "matrix gate suite"
 fi
 
-# -- 4. signing + publish E2E in the pinned container -----------------------
+# -- 5. signing + publish E2E in the pinned container -----------------------
 note "signing + publish E2E (container, mock gh)"
 if docker run --rm \
-    -v "$REPO_ROOT":"$REPO_ROOT" \
+    --mount type=bind,source="$REPO_ROOT",target="$REPO_ROOT" \
     -e REPO_ROOT="$REPO_ROOT" \
     --workdir "$REPO_ROOT" \
     "$IMAGE" bash -c '
@@ -88,14 +99,15 @@ if docker run --rm \
         pacman -Syu --noconfirm --needed \
           gnupg jq libarchive pacman-contrib base-devel git
         bash "$REPO_ROOT/.github/tests/test-signing.sh"
-        bash "$REPO_ROOT/.github/tests/test-signing-mode.sh"
+        EXPECTED_PACKAGES="[\"testa\",\"testb\"]" bash "$REPO_ROOT/.github/tests/test-signing-mode.sh"
+        RUN_PROD_SCENARIOS=1 bash "$REPO_ROOT/.github/tests/test-http500.sh"
       '; then
-  ok "signing suite"
+  ok "signing + host-prod suite"
 else
-  bad "signing suite"
+  bad "signing + host-prod suite"
 fi
 
-# -- 5. container build/cache/packager tests --------------------------------
+# -- 6. container build/cache/packager tests --------------------------------
 note "container build tests (packager metadata, gate, cache hit)"
 if bash "$REPO_ROOT/.github/tests/run-container-tests.sh"; then
   ok "container build suite"

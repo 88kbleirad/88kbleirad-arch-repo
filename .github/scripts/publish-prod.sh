@@ -28,6 +28,10 @@ esac
 pacman -Syu --noconfirm --needed \
   github-cli pacman-contrib jq libarchive gnupg
 
+# robust GitHub Release asset operations (retries, backoff, Retry-After,
+# mutation reconciliation, sanitized logging)
+. "$GITHUB_WORKSPACE/.github/scripts/gh-release-lib.sh"
+
 if [[ "$SIGNING_MODE" == "signed" ]]; then
   # GPG signing: import the dedicated signing key into a scratch keyring
   # inside this publish job only. Build jobs never receive the key. All
@@ -243,6 +247,45 @@ if ! bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD" "$REPO_
   exit 1
 fi
 
+# -- expected package inventory enforcement --------------------------------
+# Every package the prepare matrix selected MUST be present as a validated
+# archive in the new database. A silent miss (failed/restored/no-archive
+# metadata) must fail here BEFORE any Release mutation — never accept
+# VALIDATION_PASSED=true when a requested package is missing.
+if [[ -n "${EXPECTED_PACKAGES:-}" ]]; then
+  echo "== Verify expected package inventory =="
+  # EXPECTED_PACKAGES arrives as JSON array from the prepare matrix
+  expected_names=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && expected_names+=("$name")
+  done < <(printf '%s\n' "$EXPECTED_PACKAGES" | jq -r '.[]')
+  (( ${#expected_names[@]} > 0 )) || { echo "::error::Expected package list parsed empty; refusing to publish."; rm -rf "$MERGE_DIR"; exit 1; }
+
+  # package filenames in the freshly generated database
+  rm -rf .inv-db; mkdir -p .inv-db
+  bsdtar -xf "${REPO_DB_NAME}.db.tar.gz" -C .inv-db
+  db_pkg_names=()
+  for desc in .inv-db/*/desc; do
+    [[ -f "$desc" ]] || continue
+    db_pkg_names+=("$(awk '/^%NAME%/{getline; print}' "$desc")")
+  done
+  rm -rf .inv-db
+
+  missing_count=0
+  for name in "${expected_names[@]}"; do
+    if ! printf '%s\n' "${db_pkg_names[@]}" | grep -qx "$name"; then
+      echo "::error::Expected package '${name}' is missing from the regenerated production database (silent-miss check)."
+      missing_count=$(( missing_count + 1 ))
+    fi
+  done
+  if (( missing_count > 0 )); then
+    echo "::error::Inventory check failed (${missing_count} missing). Refusing to publish; the Release was not modified."
+    rm -rf "$MERGE_DIR"
+    exit 1
+  fi
+  echo "Inventory OK: all ${#expected_names[@]} requested packages are present and validated."
+fi
+
 echo "== Publish to production release (non-destructive) =="
 if [[ "$SIGNING_MODE" == "signed" ]]; then
   pkg_assets=( *.pkg.tar.zst *.pkg.tar.zst.sig )
@@ -276,16 +319,37 @@ if [[ "$SIGNING_MODE" == "signed" ]]; then
   pub_assets=( ${REPO_DB_NAME}.pub.asc )
 fi
 
-if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+# Ensure the release exists (with retries via the lib)
+if gh_api_retry "view release (${TAG})" \
+    "/repos/${REPO}/releases/tags/${TAG}" >/dev/null 2>&1; then
   echo "Release $TAG exists; merging this run into it."
 else
   echo "Creating release $TAG."
-  gh release create "$TAG" --repo "$REPO" \
-    --title "Arch Package Repository" \
-    --notes "Auto-built pacman repository."
+  gh_api_retry "create release (${TAG})" \
+    --method POST "/repos/${REPO}/releases" \
+    --field tag_name="$TAG" \
+    --field name="Arch Package Repository" \
+    --field body="Auto-built pacman repository." >/dev/null 2>&1
 fi
-gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" "${pub_assets[@]}" \
-  --repo "$REPO" --clobber
+
+# Upload each asset individually via DELETE+POST (clobber semantics without
+# PATCH), with bounded retries, backoff, Retry-After and post-mutation
+# reconciliation. Each file is uploaded atomically; a failure aborts before
+# any further mutation.
+upload_assets() {
+  local fail=0
+  local a
+  for a in "$@"; do
+    echo "== Uploading $(basename "$a") =="
+    if ! gh_upload_asset "$TAG" "$REPO" "$a"; then
+      echo "::error::Upload failed for $(basename "$a"); aborting before any further mutation."
+      return 1
+    fi
+  done
+  return 0
+}
+upload_assets "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" "${pub_assets[@]}" \
+  || exit 1
 
 # -- drift cleanup: delete only stale un-protected package assets ---------
 stale_assets=()
@@ -320,7 +384,7 @@ if [[ -f "$MERGE_DIR/${REPO_DB_NAME}.db.tar.gz" ]]; then
       continue
     fi
     stale_assets+=("$asset")
-  done < <(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name')
+  done < <(gh_list_assets "$TAG" "$REPO")
 fi
 rm -rf "$MERGE_DIR"
 
@@ -328,14 +392,14 @@ if (( ${#stale_assets[@]} > 0 )); then
   echo "Deleting stale assets that are no longer part of the repository:"
   for stale in "${stale_assets[@]}"; do
     echo "  - $stale"
-    if ! gh release delete-asset "$TAG" "$stale" --repo "$REPO" -y; then
+    if ! gh_delete_asset "$TAG" "$REPO" "$stale"; then
       echo "::error::Cannot delete stale asset $stale; the next run will retry."
       exit 1
     fi
     # its detached signature is stale with it (the archive is gone, so
     # a leftover .sig would be an orphan asset)
-    if [[ " $(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' | tr '\n' ' ') " == *" ${stale}.sig "* ]]; then
-      gh release delete-asset "$TAG" "${stale}.sig" --repo "$REPO" -y \
+    if gh_list_assets "$TAG" "$REPO" | grep -qx "${stale}.sig"; then
+      gh_delete_asset "$TAG" "$REPO" "${stale}.sig" \
         || echo "::warning::Cannot delete orphaned signature ${stale}.sig; the next run will retry."
     fi
   done
@@ -353,11 +417,11 @@ if [[ "$SIGNING_MODE" == "unsigned" ]]; then
     case "$asset" in
       *.pkg.tar.zst.sig|"${REPO_DB_NAME}.db.sig"|"${REPO_DB_NAME}.db.tar.gz.sig"|"${REPO_DB_NAME}.files.sig"|"${REPO_DB_NAME}.files.tar.gz.sig")
         echo "Deleting superseded signature asset: $asset"
-        gh release delete-asset "$TAG" "$asset" --repo "$REPO" -y \
+        gh_delete_asset "$TAG" "$REPO" "$asset" \
           || echo "::warning::Cannot delete stale signature $asset; the next run will retry."
         ;;
     esac
-  done < <(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name')
+  done < <(gh_list_assets "$TAG" "$REPO")
 fi
 
 echo "Published production release: $REPO/releases/tag/$TAG"
