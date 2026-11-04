@@ -28,6 +28,9 @@
 #   IMAGE                - container image (default ghcr.io/archlinux/archlinux:latest)
 #   MAX_BOOT_ATTEMPTS    - boot retries (default 3)
 #   PID1_MODE            - PID 1 command: "tail" (default) or "sleep"
+#   MAKEPKG_PACKAGER_EMAIL - public contact email for PACKAGER metadata
+#                       (default: 88kbleirad@users.noreply.github.com);
+#                       the packager name is "88kbleirad"
 
 set -uo pipefail
 
@@ -38,6 +41,7 @@ IMAGE="${IMAGE:-ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b351
 MAX_BOOT_ATTEMPTS="${MAX_BOOT_ATTEMPTS:-3}"
 PID1_MODE="${PID1_MODE:-tail}"
 BUILD_PROFILE="${BUILD_PROFILE:-x86-64-v4}"
+MAKEPKG_PACKAGER_EMAIL="${MAKEPKG_PACKAGER_EMAIL:-88kbleirad@users.noreply.github.com}"
 
 CID=""
 SUMMARY_FILE="$WS/.step-summary-$PKG.md"
@@ -157,7 +161,7 @@ bootstrap_container() {
   # create the builder user, then apply the CachyOS v4 *compiler profile*
   # (text config; the compiler itself remains a generic-x86_64 binary).
   local rc
-  docker exec -i "$CID" bash -s <<'EOS'
+  docker exec -i -e MAKEPKG_PACKAGER_EMAIL="$MAKEPKG_PACKAGER_EMAIL" "$CID" bash -s <<'EOS'
 set -euo pipefail
 
 # pacman network sandbox isolation may be unsupported in some container
@@ -215,6 +219,15 @@ echo "Confirmed x86-64-v4 target flags."
 
 sed -i 's/^PKGDEST=/#PKGDEST=/g' /etc/makepkg.conf
 sed -i 's/^LOGDEST=/#LOGDEST=/g' /etc/makepkg.conf
+# Packager metadata: set a deterministic, public-only identity. The name
+# and email land in every .PKGINFO as `packager = ...`. The email is a
+# public noreply address — never a personal one — and is configurable via
+# MAKEPKG_PACKAGER_EMAIL for forks.
+sed -i "s|^#PACKAGER=\"\"|PACKAGER=\"88kbleirad <$MAKEPKG_PACKAGER_EMAIL>\"|" /etc/makepkg.conf
+if ! grep -q "^PACKAGER=\"88kbleirad <" /etc/makepkg.conf; then
+  printf 'PACKAGER="88kbleirad <%s>"\n' "$MAKEPKG_PACKAGER_EMAIL" >> /etc/makepkg.conf
+fi
+echo "PACKAGER is set to: $(grep '^PACKAGER=' /etc/makepkg.conf)"
 # PACKAGECARCH is a CachyOS makepkg fork extension; upstream makepkg
 # (7.1) ignores it and emits standard CARCH (x86_64/any) package metadata.
 # Neutralize it so a custom arch is never relied upon: v4 targeting comes

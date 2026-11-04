@@ -14,7 +14,9 @@ If you just want to install packages that have already been built in this reposi
 
 ### 1. Check CPU compatibility
 
-This repository currently builds packages inside the `cachyos/cachyos-v4` Docker container.
+This repository builds packages inside a generic Arch Linux container with the
+CachyOS `x86-64-v4` compiler profile (`-march=x86-64-v4` /
+`-C target-cpu=x86-64-v4`).
 
 That means the published binaries are intended for systems that support the `x86-64-v4` instruction set (AVX-512).
 
@@ -29,6 +31,13 @@ Append the following configuration to the bottom of your `/etc/pacman.conf`:
 SigLevel = Optional TrustAll
 Server = https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository
 ```
+
+**Signing status:** once the repository publishes GPG signatures (packages
+and database), switch this section to `SigLevel = Required TrustedOnly` and
+trust the repository key. The full verified-client procedure (export/verify
+the key, pacman-key import, local trust, testing signatures) is documented
+in [`docs/pacman-signing.md`](docs/pacman-signing.md). Do not switch to
+`Required` before signatures are actually published.
 
 ### 3. Sync and Install
 
@@ -49,13 +58,18 @@ Want to build your own automated AUR farm? Follow these steps to fork and config
 
 ### Step 2: Choose the correct Docker container
 
-This repository currently uses the `cachyos/cachyos-v4` Docker container in `build-release.yml`, and the workflow verifies the compiler flags actually target `x86-64-v4`.
+This repository runs builds on GitHub-hosted runners inside a **generic Arch
+Linux container** (`ghcr.io/archlinux/archlinux`), which only needs the
+baseline x86-64 ISA; the toolchain inside it targets `x86-64-v4` via the
+CachyOS compiler profile (`-march=x86-64-v4` / `-C target-cpu=x86-64-v4`).
+The workflow verifies the compiler flags actually target `x86-64-v4`.
 
 If you fork this repository, choose the container that matches your target machines:
 
+- `ghcr.io/archlinux/archlinux` (generic, as used here) for v4 targeting via compiler flags.
 - `cachyos/cachyos` for generic builds.
 - `cachyos/cachyos-v3` for `x86-64-v3` builds.
-- `cachyos/cachyos-v4` for `x86-64-v4` builds.
+- `cachyos/cachyos-v4` for `x86-64-v4` builds (note: the v4 image itself requires AVX-512 and will not start on hosts without it).
 
 If you need a different target level, edit the workflow file `build-release.yml` and replace the container image accordingly.
 
@@ -114,11 +128,11 @@ The entire repository is controlled by a single file: `packages.txt`.
 ### Step 7: Relax and Let it Run
 
 - The Sync Workflow runs on a schedule and when `packages.txt` changes. It reads `packages.txt`, pulls the latest PKGBUILDs from the AUR, skips `local:` entries, deletes removed packages, and creates a clean Pull Request.
-- The Publish Workflow runs on schedule, on push to `main`, or manually. It checks existing assets, reuses cached packages when possible, falls back to previous release files if needed, generates a fresh pacman database, and uploads everything to the repository Release tag.
+- The Publish Workflow is manual-only until separately approved (`confirm-production=YES`), later optionally via a weekly schedule path gated by a dedicated repository variable. It checks existing assets, reuses cached packages when possible, falls back to previous release files if needed, GPG-signs every package and the repository database, generates a fresh pacman database, validates all signatures, and uploads everything to the repository Release tag.
 - Matrix builds are limited to **2 concurrent jobs** (`max-parallel: 2`).
-- Caching is architecture-aware: each package carries a `v4-<pkg>.meta.json` metadata file (profile + fingerprint of the `PKGBUILD` and compiler config). A cached package is reused only when the profile matches the current build target and the fingerprint matches; `x86-64-v3`-era binaries are never reused for `x86-64-v4` builds.
+- Caching is architecture-aware: each package carries a `v4-<pkg>.meta.json` metadata file (profile + fingerprint of the `PKGBUILD` and compiler config). A cached package is reused only when the profile matches the current build target and the fingerprint matches; `x86-64-v3`-era binaries are never reused for `x86-64-v4` builds. All published packages and the database carry valid detached signatures; publication aborts if signing or verification fails.
 
-**Disclaimer:** `SigLevel = Optional TrustAll` is used for convenience in this personal setup, meaning packages are not GPG-signed. Only use this configuration for repositories you fully control or trust.
+**Disclaimer:** `SigLevel = Optional TrustAll` shown above is for convenience until signatures are published. Once signatures exist, switch to `SigLevel = Required TrustedOnly` and trust the repository key (see `docs/pacman-signing.md`). Only use this repository if you trust the operator and verify the key fingerprint out-of-band.
 
 ---
 
@@ -134,7 +148,7 @@ Nếu bạn chỉ muốn cài các gói đã được build sẵn từ repositor
 
 #### 1. Kiểm tra khả năng tương thích CPU
 
-Repository này hiện build package trực tiếp bên trong Docker container `cachyos/cachyos-v4`.
+Repository này build package bên trong container Arch Linux generic với compiler profile `x86-64-v4` của CachyOS (`-march=x86-64-v4` / `-C target-cpu=x86-64-v4`).
 
 Điều đó có nghĩa là các gói nhị phân được phát hành được nhắm tới các máy hỗ trợ tập lệnh `x86-64-v4` (AVX-512).
 
@@ -169,13 +183,14 @@ Nếu bạn muốn tự dựng một hệ thống build AUR tự động cho tà
 
 #### Bước 2: Chọn Docker container phù hợp
 
-Repository này hiện đang dùng Docker container `cachyos/cachyos-v4` trong workflow `build-release.yml`, và workflow sẽ xác minh rằng cờ compiler thực sự nhắm `x86-64-v4`.
+Repository này chạy build trên GitHub-hosted runner bên trong **container Arch Linux generic** (`ghcr.io/archlinux/archlinux`) chỉ cần baseline x86-64 ISA; toolchain bên trong nhắm `x86-64-v4` qua compiler profile CachyOS, và workflow xác minh cờ compiler thực sự nhắm `x86-64-v4`.
 
 Nếu bạn fork repository này, hãy chọn container phù hợp với máy đích của bạn:
 
+- `ghcr.io/archlinux/archlinux` (generic, như repo này) để nhắm v4 qua cờ compiler.
 - `cachyos/cachyos` cho build generic.
 - `cachyos/cachyos-v3` cho build `x86-64-v3`.
-- `cachyos/cachyos-v4` cho build `x86-64-v4`.
+- `cachyos/cachyos-v4` cho build `x86-64-v4` (lưu ý: image v4 tự nó yêu cầu AVX-512 và sẽ không khởi động được trên máy thiếu nó).
 
 Nếu bạn muốn đổi target, hãy sửa file workflow `build-release.yml`, rồi thay container image tương ứng.
 
@@ -234,6 +249,6 @@ Toàn bộ repository này được điều khiển bởi một file duy nhất 
 #### Bước 7: Để hệ thống tự chạy
 
 - **Sync Workflow** chạy theo lịch và khi `packages.txt` thay đổi. Workflow này đọc `packages.txt`, kéo PKGBUILD mới nhất từ AUR, bỏ qua các dòng `local:`, xóa các gói đã bị loại bỏ, rồi tạo một Pull Request sạch.
-- **Publish Workflow** chạy theo lịch, khi push vào `main`, hoặc chạy tay. Workflow này kiểm tra asset hiện có, tận dụng cache nếu có thể, fallback về file từ release trước nếu cần, tạo lại pacman database mới, rồi upload toàn bộ lên Release tag của repository.
+- **Publish Workflow** chỉ chạy tay cho tới khi được phê duyệt riêng (`confirm-production=YES`), sau đó có thể qua đường lịch tuần được kiểm soát bởi biến repository riêng. Workflow này kiểm tra asset hiện có, tận dụng cache nếu có thể, fallback về file từ release trước nếu cần, ký GPG mọi package và database, tạo lại pacman database mới, xác thực mọi chữ ký, rồi upload toàn bộ lên Release tag của repository.
 
-**Lưu ý:** `SigLevel = Optional TrustAll` được dùng để tiện cho mô hình repository cá nhân này, nghĩa là gói không được ký GPG. Chỉ nên dùng cấu hình này cho repository do chính bạn kiểm soát hoặc bạn thực sự tin tưởng.
+**Lưu ý:** `SigLevel = Optional TrustAll` chỉ để tiện cho tới khi repository thực sự phát hành chữ ký GPG. Khi đó hãy chuyển sang `SigLevel = Required TrustedOnly` và tin tưởng key của repository (xem `docs/pacman-signing.md`). Chỉ dùng repository này khi bạn tin tưởng người vận hành và xác minh fingerprint key kênh ngoài.

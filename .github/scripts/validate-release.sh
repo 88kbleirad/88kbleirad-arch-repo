@@ -6,9 +6,21 @@
 #   - every archive on disk is present in <db>.db.tar.gz (no drift)
 #   - per-package v4-<pkg>.meta.json metadata exists
 #   - repository database name matches the expected identity
+#   - every archive and both database files carry a valid detached .sig
+#     signature (when signature validation is enabled — the publish
+#     pipeline always enables it via REQUIRE_SIGNATURES=1)
 #
 # Usage: validate-release.sh <dir> <repo-db-name>
 # Exit 1 on any consistency failure.
+#
+# Signature validation is controlled by REQUIRE_SIGNATURES:
+#   - "1" (publish flow): every package + database signature must exist
+#     and verify with the current GNUPGHOME keyring.
+#   - "0": signature checks are skipped (legacy standalone runs).
+#   - unset: auto — verify when $GNUPGHOME is set (gpg available).
+# The publishing scripts source sign-helpers.sh, which exports GNUPGHOME
+# and imports the signing key, so signature verification there always
+# runs against the repository's own key.
 
 set -euo pipefail
 
@@ -18,6 +30,15 @@ DB="${2:?usage: validate-release.sh <dir> <repo-db-name>}"
 FAIL=0
 fail() { echo "::error::$*"; FAIL=1; }
 ok()  { echo "OK: $*"; }
+
+REQUIRE_SIGNATURES="${REQUIRE_SIGNATURES:-auto}"
+if [[ "$REQUIRE_SIGNATURES" == "auto" ]]; then
+  if [[ -n "${GNUPGHOME:-}" && -d "$GNUPGHOME" ]]; then
+    REQUIRE_SIGNATURES=1
+  else
+    REQUIRE_SIGNATURES=0
+  fi
+fi
 
 # helper: extract .PKGINFO (GNU tar zstd first, bsdtar fallback).
 # MUST be defined before use: bash executes top-down.
@@ -44,7 +65,7 @@ if (( ${#PKG_ASSETS[@]} == 0 )); then
   exit 2
 fi
 
-# 1. validate every archive
+# 1. validate every archive (+ detached signature when required)
 for f in "${PKG_ASSETS[@]}"; do
   if ! tar --zstd -tf "$f" >/dev/null 2>&1 && ! bsdtar -tf "$f" >/dev/null 2>&1; then
     fail "corrupt archive: $f"
@@ -55,12 +76,32 @@ for f in "${PKG_ASSETS[@]}"; do
   else
     ok "archive valid: $f"
   fi
+  if [[ "$REQUIRE_SIGNATURES" == "1" ]]; then
+    if [[ ! -s "$f.sig" ]]; then
+      fail "missing package signature: $f.sig"
+    elif ! gpg --verify "$f.sig" "$f" >/dev/null 2>&1; then
+      fail "package signature verification failed: $f.sig"
+    else
+      ok "signature valid: $f.sig"
+    fi
+  fi
 done
 
-# 2. repository database identity
+# 2. repository database identity (+ detached signatures when required)
 [[ -f "$DB.db.tar.gz" ]] || { echo "::error::$DB.db.tar.gz not found in $DIR"; exit 2; }
 [[ -f "$DB.files.tar.gz" ]] || { echo "::error::$DB.files.tar.gz not found in $DIR"; exit 2; }
 ok "database files present: $DB.db.tar.gz + $DB.files.tar.gz"
+if [[ "$REQUIRE_SIGNATURES" == "1" ]]; then
+  for db in "$DB.db.tar.gz" "$DB.files.tar.gz"; do
+    if [[ ! -s "$db.sig" ]]; then
+      fail "missing database signature: $db.sig"
+    elif ! gpg --verify "$db.sig" "$db" >/dev/null 2>&1; then
+      fail "database signature verification failed: $db.sig"
+    else
+      ok "database signature valid: $db.sig"
+    fi
+  done
+fi
 
 # 3. decode db -> expected package filenames
 rm -rf .validate-db

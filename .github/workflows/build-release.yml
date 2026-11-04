@@ -3,13 +3,17 @@ name: Build and Publish Arch Repository
 # PRODUCTION WORKFLOW — migration to GitHub-hosted runners + generic Arch
 # container (see build-in-docker.sh for the ISA rationale).
 #
-# RUN MODE (manual-only until explicitly approved):
-#   - The cron schedule is DISABLED. The workflow can only be started by
-#     `workflow_dispatch` (UI button or `gh workflow run`), with an extra
-#     confirmation input `confirm-production`).
-#   - Enable the schedule only after a successful manual production
-#     verification run (change `schedule:` back to `- cron: '15 * * * *'`
-#     in a PR approved by the repository owner).
+# RUN MODE:
+#   - Manual runs require `confirm-production=YES` (workflow_dispatch).
+#   - Scheduled runs use a SEPARATE, explicitly authorized path:
+#     `schedule:weekly` below. The cron entry remains commented out and is
+#     enabled only in a separately approved PR (owner-approved). The
+#     prepare job rejects scheduled runs unless a dedicated repository
+#     variable `ALLOW_SCHEDULED_PRODUCTION=yes` is set; scheduled builds
+#     never include system-critical packages and never accept inputs.
+#   - Signing and signature verification are mandatory before any
+#     publication (publish-prod.sh aborts when the GPG key is missing or
+#     a signature fails verification).
 #
 # The publish job is non-destructive: it uploads refreshed assets with
 # `--clobber` into the existing release, deletes only assets that are
@@ -19,10 +23,11 @@ name: Build and Publish Arch Repository
 # integrity and DB↔asset consistency.
 
 on:
-  # DISABLED during migration: re-enable only after manual production
-  # verification passes.
+  # Weekly production build. DISABLED until separately approved: enable
+  # by uncommenting and keeping the `ALLOW_SCHEDULED_PRODUCTION=yes`
+  # repository variable gate in the prepare job.
   # schedule:
-  #   - cron: '15 * * * *'
+  #   - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       confirm-production:
@@ -77,6 +82,21 @@ jobs:
             echo "::error::Production runs require the 'confirm-production' input set to YES (manual verification mode)."
             exit 1
           fi
+
+      - name: Schedule authorization gate (weekly path)
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          set -euo pipefail
+          # The cron entry is disabled in the repository. A scheduled run
+          # can only exist after an explicit owner-approved PR enables the
+          # schedule AND sets the ALLOW_SCHEDULED_PRODUCTION repository
+          # variable to 'yes'. Without both, scheduled runs refuse to
+          # build or publish anything.
+          if [[ "${{ vars.ALLOW_SCHEDULED_PRODUCTION }}" != "yes" ]]; then
+            echo "::error::Scheduled production runs are not authorized (set repository variable ALLOW_SCHEDULED_PRODUCTION=yes in the separately approved enable-PR)."
+            exit 1
+          fi
+          echo "::notice::Scheduled production run authorized (ALLOW_SCHEDULED_PRODUCTION=yes)."
 
       - name: Generate matrix from packages.txt (single source of truth)
         id: set-matrix
@@ -271,6 +291,10 @@ jobs:
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
+    # The signing key lives in the protected 'package-signing'
+    # environment; only this job is granted access to it. PKGBUILD build
+    # jobs (build) never see it.
+    environment: package-signing
     permissions:
       contents: write
     steps:
@@ -285,6 +309,27 @@ jobs:
           path: output
           pattern: pkg-*
           merge-multiple: true
+
+      - name: Prepare GPG signing key (secret file, never logged)
+        env:
+          GPG_KEY_CONTENT: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE_CONTENT: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "$GPG_KEY_CONTENT" ]]; then
+            echo "::error::GPG_PRIVATE_KEY is not configured in the 'package-signing' environment; production publication requires signatures."
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY_CONTENT" > /tmp/gpg-key.asc
+          chmod 600 /tmp/gpg-key.asc
+          echo "GPG_KEY_FILE=/tmp/gpg-key.asc" >> "$GITHUB_ENV"
+          if [[ -n "$GPG_PASSPHRASE_CONTENT" ]]; then
+            printf '%s\n' "$GPG_PASSPHRASE_CONTENT" > /tmp/gpg-passphrase
+            chmod 600 /tmp/gpg-passphrase
+            echo "GPG_PASSPHRASE_FILE=/tmp/gpg-passphrase" >> "$GITHUB_ENV"
+          fi
+          echo "::notice::GPG signing key materialized for this publish job only (value never echoed)."
 
       - name: Validate, build database and publish in managed container
         env:

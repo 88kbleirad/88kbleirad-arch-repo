@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# Full validation harness for the 88kbleirad publish pipeline.
+#
+# Runs:
+#   1. bash syntax check on every script in the repository
+#   2. YAML validation of all GitHub workflow files
+#   3. matrix gate tests (approval/schedule/critical-exclusion/subset)
+#      — runs on the host (bash + python + jq only)
+#   4. signing + publish E2E against the mock gh release — runs inside
+#      the pinned generic Arch container (root, pacman available)
+#   5. container build tests — real build in the pinned image with the
+#      v4 compiler profile: packager metadata, packager gate, cache hit
+#
+# Usage: REPO_ROOT=<path> bash .github/tests/run-tests.sh
+#
+# Nothing here pushes, triggers workflows, or touches real releases.
+
+set -euo pipefail
+
+REPO_ROOT=${REPO_ROOT:?REPO_ROOT is required}
+IMAGE="ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981"
+
+PASS=0
+FAIL=0
+note() { printf '\033[1;34m== %s ==\033[0m\n' "$*"; }
+ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
+
+# -- 1. bash syntax --------------------------------------------------------
+note "bash syntax: all scripts"
+for f in "$REPO_ROOT"/.github/scripts/*.sh "$REPO_ROOT"/.github/tests/*.sh; do
+  if bash -n "$f" 2>/dev/null; then
+    ok "syntax: $(basename "$f")"
+  else
+    bad "syntax: $(basename "$f")"
+  fi
+done
+
+# -- 2. YAML validation ----------------------------------------------------
+note "YAML validation: workflows"
+python3 - "$REPO_ROOT" <<'PY'
+import sys, yaml
+root = sys.argv[1]
+import glob
+files = sorted(glob.glob(root + "/.github/workflows/*.yml"))
+if not files:
+    raise SystemExit("no workflow files found")
+for f in files:
+    raw = open(f).read().splitlines()
+    for i, ln in enumerate(raw):
+        if ln == "on:":
+            raw[i] = "on_github:"
+            break
+    data = yaml.safe_load("\n".join(raw))
+    assert isinstance(data, dict) and "jobs" in data, f
+    print("OK:", f)
+PY
+
+# -- 3. matrix gate tests ---------------------------------------------------
+note "matrix gate tests (approval / schedule / critical / subset)"
+if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then
+  ok "matrix gate suite"
+else
+  bad "matrix gate suite"
+fi
+
+# -- 4. signing + publish E2E in the pinned container -----------------------
+note "signing + publish E2E (container, mock gh)"
+if docker run --rm \
+    -v "$REPO_ROOT":"$REPO_ROOT" \
+    -e REPO_ROOT="$REPO_ROOT" \
+    --workdir "$REPO_ROOT" \
+    "$IMAGE" bash -c '
+        set -euo pipefail
+        pacman -Syu --noconfirm --needed \
+          gnupg jq libarchive pacman-contrib base-devel git
+        bash "$REPO_ROOT/.github/tests/test-signing.sh"
+      '; then
+  ok "signing suite"
+else
+  bad "signing suite"
+fi
+
+# -- 5. container build/cache/packager tests --------------------------------
+note "container build tests (packager metadata, gate, cache hit)"
+if bash "$REPO_ROOT/.github/tests/run-container-tests.sh"; then
+  ok "container build suite"
+else
+  bad "container build suite"
+fi
+
+# ---------------------------------------------------------------------------
+echo
+echo "overall: PASS=$PASS FAIL=$FAIL"
+[[ $FAIL -eq 0 ]]

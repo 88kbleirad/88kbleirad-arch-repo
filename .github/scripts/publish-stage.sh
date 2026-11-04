@@ -11,7 +11,19 @@ REPO_DB_NAME="${REPO_DB_NAME:?REPO_DB_NAME is required}"
 GH_TOKEN="${GH_TOKEN:?GH_TOKEN is required}"
 
 pacman -Syu --noconfirm --needed \
-  github-cli pacman-contrib jq libarchive
+  github-cli pacman-contrib jq libarchive gnupg
+
+# GPG signing: import the dedicated signing key into a scratch keyring
+# inside this publish job only. Build jobs never receive the key. All
+# signatures are created and verified below; any failure aborts the run
+# before anything is uploaded.
+. "$GITHUB_WORKSPACE/.github/scripts/sign-helpers.sh"
+gpg_init_homedir
+if ! gpg_import_signing_key; then
+  echo "::error::No signing key available; aborting publication."
+  exit 1
+fi
+export REQUIRE_SIGNATURES=1
 
 # usage: gh_download_retry <pattern> <dir>
 # Returns 0 when the file was downloaded and is non-empty. `gh release
@@ -130,6 +142,16 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
         merged_assets+=("$fname")
         MERGED=$(( MERGED + 1 ))
         echo "Kept previously published package: $fname"
+        # Carry the previously published signature forward when it exists
+        # and verifies against the current signing key.
+        if gh_download_retry "$fname.sig" "$PWD"; then
+          if ! verify_detached "$fname" "$fname.sig"; then
+            echo "::error::Previously published signature for $fname failed verification; refusing to publish."
+            rm -rf "$MERGE_DIR"
+            exit 1
+          fi
+          echo "Kept previously published signature: $fname.sig"
+        fi
         # also carry its architecture metadata forward (validation requires
         # a v4-<base>.meta.json for every package in the database). This
         # overwrites a local meta file from a failed build of the same
@@ -160,16 +182,28 @@ else
 fi
 rm -rf "$MERGE_DIR"
 
+echo "== Sign package archives =="
+if ! ensure_all_packages_signed; then
+  echo "::error::Package signing/verification failed; refusing to publish."
+  exit 1
+fi
+
 echo "== Generate fresh pacman database for staging =="
 rm -f status-*.txt protect-*.txt
-repo-add "${REPO_DB_NAME}.db.tar.gz" "${merged_assets[@]}"
+repo-add --include-sigs "${REPO_DB_NAME}.db.tar.gz" "${merged_assets[@]}"
+
+echo "== Sign repository database =="
+if ! sign_and_publish_db_signatures; then
+  echo "::error::Database signing/verification failed; refusing to publish."
+  exit 1
+fi
 
 echo "== Validate repository consistency =="
 bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD" "$REPO_DB_NAME" | tee "$GITHUB_STEP_SUMMARY"
 
 echo "== Publish to staging release =="
 
-pkg_assets=( *.pkg.tar.zst )
+pkg_assets=( *.pkg.tar.zst *.pkg.tar.zst.sig )
 if (( ${#pkg_assets[@]} == 0 )); then
   echo "::error::No package files in output/; refusing to publish."
   exit 1
@@ -184,6 +218,11 @@ if (( ${#meta_assets[@]} == 0 )); then
   echo "::error::No architecture metadata files; refusing to publish."
   exit 1
 fi
+if ! export_public_key; then
+  echo "::error::Failed to export the public signing key; refusing to publish."
+  exit 1
+fi
+pub_assets=( ${REPO_DB_NAME}.pub.asc )
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "Staging release $TAG exists; merging this run into it."
@@ -193,6 +232,6 @@ else
     --title "Staging repository (v4 test)" \
     --notes "Staging buildup: $(date -u '+%Y-%m-%d %H:%M UTC') — x86-64-v4"
 fi
-gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" \
+gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" "${pub_assets[@]}" \
   --repo "$REPO" --clobber
 echo "Published staging release: $REPO/releases/tag/$TAG"

@@ -391,8 +391,16 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
   shopt -s nullglob
   for f in "$WORKSPACE/$PKG"/*.pkg.tar.zst; do
     if validate_pkg_file "$f"; then
-      mv "$f" "$WORKSPACE/output/"
-      BUILT_FILES+=("$(basename "$f")")
+      # Packager metadata gate: every freshly built archive must carry the
+      # repository identity in .PKGINFO (PACKAGER configured in
+      # build-in-docker.sh). A missing/unknown packager means the build
+      # environment did not apply the profile — refuse to publish it.
+      if ! extract_pkginfo "$f" | grep -Eq '^packager = 88kbleirad <'; then
+        warn "produced package has no 88kbleirad packager metadata; will not be published: $(basename "$f")"
+      else
+        mv "$f" "$WORKSPACE/output/"
+        BUILT_FILES+=("$(basename "$f")")
+      fi
     else
       warn "produced package failed validation and will not be published: $(basename "$f")"
     fi

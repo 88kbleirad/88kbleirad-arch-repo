@@ -20,6 +20,13 @@
 #   IMAGE                - container image (default ghcr.io/archlinux/archlinux:latest)
 #   MAX_BOOT_ATTEMPTS    - boot retries (default 6)
 #   PID1_MODE            - PID 1 command: "tail" (default) or "sleep"
+#
+# GPG signing material (optional but required for a signed publish):
+#   GPG_KEY_FILE         - host path to the armored private signing key
+#   GPG_PASSPHRASE_FILE  - host path to the key passphrase (may be absent)
+# Both are bind-mounted read-only into the container. The secret values
+# are never passed as environment values or argv, so they never appear in
+# `docker inspect` or the host process list.
 
 set -uo pipefail
 
@@ -30,6 +37,8 @@ IMAGE="${IMAGE:-ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b351
 PUBLISH_SCRIPT="${PUBLISH_SCRIPT:-publish-stage.sh}"
 MAX_BOOT_ATTEMPTS="${MAX_BOOT_ATTEMPTS:-6}"
 PID1_MODE="${PID1_MODE:-tail}"
+GPG_KEY_FILE="${GPG_KEY_FILE:-}"
+GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:-}"
 
 CID=""
 SUMMARY_FILE="$WS/.step-summary-publish.md"
@@ -68,10 +77,22 @@ pid1_cmd() {
 create_container() {
   local rc
   local -a PID1_ARGS=()
+  local -a MOUNTS=(-v "$WS":"$WS")
   while IFS= read -r a; do PID1_ARGS+=("$a"); done < <(pid1_cmd)
+  # GPG signing material: bind-mount the secret files read-only instead of
+  # passing them as environment values or argv. Container secrets are not
+  # exposed by `docker inspect`.
+  if [[ -n "$GPG_KEY_FILE" ]]; then
+    [[ -f "$GPG_KEY_FILE" ]] || die "GPG_KEY_FILE does not exist: $GPG_KEY_FILE"
+    MOUNTS+=(-v "$GPG_KEY_FILE":/run/secrets/gpg-key:ro)
+  fi
+  if [[ -n "$GPG_PASSPHRASE_FILE" ]]; then
+    [[ -f "$GPG_PASSPHRASE_FILE" ]] || die "GPG_PASSPHRASE_FILE does not exist: $GPG_PASSPHRASE_FILE"
+    MOUNTS+=(-v "$GPG_PASSPHRASE_FILE":/run/secrets/gpg-passphrase:ro)
+  fi
   docker create \
     -e GITHUB_WORKSPACE="$WS" \
-    -v "$WS":"$WS" \
+    "${MOUNTS[@]}" \
     --workdir "$WS" \
     --entrypoint "${PID1_ARGS[0]}" \
     "$IMAGE" "${PID1_ARGS[@]:1}" \
@@ -143,6 +164,8 @@ docker exec \
   -e REPO_DB_NAME="$REPO_DB_NAME" \
   -e GITHUB_STEP_SUMMARY="$SUMMARY_FILE" \
   -e EXCLUDED_BASES_FILE="${EXCLUDED_BASES_FILE:-}" \
+  -e GPG_KEY_FILE="/run/secrets/gpg-key" \
+  -e GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:+/run/secrets/gpg-passphrase}" \
   "$CID" bash "$WS/.github/scripts/$PUBLISH_SCRIPT"
 rc=$?
 

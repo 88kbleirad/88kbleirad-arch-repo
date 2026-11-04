@@ -136,6 +136,7 @@ jobs:
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
+    environment: package-signing
     permissions:
       contents: write
     steps:
@@ -150,6 +151,27 @@ jobs:
           path: output
           pattern: pkg-*
           merge-multiple: true
+
+      - name: Prepare GPG signing key (secret file, never logged)
+        env:
+          GPG_KEY_CONTENT: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE_CONTENT: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "$GPG_KEY_CONTENT" ]]; then
+            echo "::error::GPG_PRIVATE_KEY is not configured in the 'package-signing' environment; staging publication requires signatures."
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY_CONTENT" > /tmp/gpg-key.asc
+          chmod 600 /tmp/gpg-key.asc
+          echo "GPG_KEY_FILE=/tmp/gpg-key.asc" >> "$GITHUB_ENV"
+          if [[ -n "$GPG_PASSPHRASE_CONTENT" ]]; then
+            printf '%s\n' "$GPG_PASSPHRASE_CONTENT" > /tmp/gpg-passphrase
+            chmod 600 /tmp/gpg-passphrase
+            echo "GPG_PASSPHRASE_FILE=/tmp/gpg-passphrase" >> "$GITHUB_ENV"
+          fi
+          echo "::notice::GPG signing key materialized for this publish job only (value never echoed)."
 
       - name: Validate, build database and publish in managed container
         env:

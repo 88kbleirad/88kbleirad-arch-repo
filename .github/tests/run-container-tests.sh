@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+#
+# Container-based end-to-end tests for build-package.sh inside the pinned
+# generic Arch Linux image (same image as production):
+#
+#   1. BUILD: trivial local package builds; .PKGINFO carries
+#      `packager = 88kbleirad <88kbleirad@users.noreply.github.com>`;
+#      v4 target flags stay intact in /etc/makepkg.conf.
+#   2. PACKAGER GATE: with PACKAGER neutralized, the produced archive must
+#      be refused for publication (status-failed, no archive in output/).
+#   3. CACHE HIT: when the release has a matching db + meta fingerprint,
+#      the package is skipped and the cached binary is reused.
+#
+# The fake `gh` shim serves a local release dir; nothing touches the
+# network or real GitHub releases. Requires docker and the pinned arch
+# image. Run from anywhere with REPO_ROOT set.
+
+set -euo pipefail
+
+REPO_ROOT=${REPO_ROOT:?REPO_ROOT is required}
+WORKDIR="${TEST_WORKDIR:-$(mktemp -d)}"; mkdir -p "$WORKDIR"
+trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+IMAGE="ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df2ab6b3517ecd045418195c1946c2c11d1c0564a7981"
+CID=""
+WS="$WORKDIR/ws"
+mkdir -p "$WS/.github/scripts" "$WS/hello-v4test" "$WS/output" "$WS/fake-release"
+
+cp "$REPO_ROOT/.github/scripts/build-package.sh" "$WS/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/audit-package-isa.sh" "$WS/.github/scripts/"
+cp "$REPO_ROOT/.github/tests/mock-gh.sh" "$WS/.github/scripts/mock-gh.sh"
+
+PASS=0
+FAIL=0
+note() { printf '\033[1;34m== %s ==\033[0m\n' "$*"; }
+ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
+
+# -- trivial package --------------------------------------------------------
+cat > "$WS/hello-v4test/PKGBUILD" <<'PB'
+pkgname=hello-v4test
+pkgver=1.0
+pkgrel=1
+pkgdesc="v4 test package"
+arch=('any')
+url="https://example.com"
+license=('MIT')
+depends=()
+source=()
+sha256sums=()
+package() {
+  install -Dm644 /dev/null "$pkgdir/usr/share/hello-v4test"
+}
+PB
+
+# -- fake gh shim -----------------------------------------------------------
+cat > "$WS/.github/scripts/gh-shim-wrapper" <<'GW'
+#!/usr/bin/env bash
+export FAKE_RELEASE_DIR="${FAKE_RELEASE_DIR:?}"
+export FAKE_EVENTS_LOG="${FAKE_EVENTS_LOG:-/dev/null}"
+exec bash "$(dirname "$(readlink -f "$0")")/mock-gh.sh" "$@"
+GW
+chmod +x "$WS/.github/scripts/gh-shim-wrapper"
+
+# -- container --------------------------------------------------------------
+CID=$(docker create \
+  -e GITHUB_WORKSPACE="$WS" \
+  -v "$WS":"$WS" \
+  --workdir "$WS" \
+  --entrypoint tail \
+  "$IMAGE" -f /dev/null)
+docker start "$CID" >/dev/null
+for i in 1 2 3; do
+  docker exec "$CID" sh -c 'test -x /usr/bin/pacman' || sleep 1
+done
+
+docker exec -i "$CID" bash -s <<EOS
+set -euo pipefail
+if grep -q '^\[options\]$' /etc/pacman.conf; then
+  tmp=\$(mktemp)
+  awk '
+    BEGIN { inserted=0 }
+    /^\[options\]$/ && !inserted { print; print "DisableSandboxNetwork"; inserted=1; next }
+    { print }
+  ' /etc/pacman.conf > "\$tmp"
+  cat "\$tmp" > /etc/pacman.conf
+  rm -f "\$tmp"
+fi
+pacman -Syu --noconfirm --needed \
+  base-devel git sudo rsync fakeroot binutils pacman-contrib curl awk tar jq rustup
+id builder >/dev/null 2>&1 || useradd -m builder
+grep -q '^builder ALL=(ALL) NOPASSWD: ALL\$' /etc/sudoers \
+  || echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+curl -fSL --retry 3 -o /etc/makepkg.conf \
+  https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/makepkg.conf
+mkdir -p /etc/makepkg.conf.d
+curl -fSL --retry 3 -o /etc/makepkg.conf.d/rust.conf \
+  https://raw.githubusercontent.com/CachyOS/docker-makepkg/refs/heads/master/docker-makepkg-v4/rust.conf
+grep -q -- '-march=x86-64-v4' /etc/makepkg.conf
+grep -q -- 'target-cpu=x86-64-v4' /etc/makepkg.conf.d/rust.conf
+sed -i 's/^PKGDEST=/#PKGDEST=/g' /etc/makepkg.conf
+sed -i 's/^LOGDEST=/#LOGDEST=/g' /etc/makepkg.conf
+sed -i "s|^#PACKAGER=\"\"|PACKAGER=\"88kbleirad <88kbleirad@users.noreply.github.com>\"|" /etc/makepkg.conf
+if ! grep -q '^PACKAGER="88kbleirad <' /etc/makepkg.conf; then
+  printf 'PACKAGER="88kbleirad <88kbleirad@users.noreply.github.com>"\n' >> /etc/makepkg.conf
+fi
+sed -i 's/^PACKAGECARCH=/#PACKAGECARCH=/g' /etc/makepkg.conf
+rustup default stable
+sudo -u builder rustup default stable
+ln -sf "$WS/.github/scripts/gh-shim-wrapper" /usr/local/bin/gh
+chown -R builder:builder "$WS"
+EOS
+
+run_build() {
+  # usage: run_build <stage>
+  # each stage runs in the shared workspace with a fresh output/ dir;
+  # the result is snapshotted to $WORKDIR/snap-<stage> for assertions
+  local stage="$1"
+  docker exec "$CID" bash -c "rm -rf '$WS/output'; mkdir -p '$WS/output'; rm -f '$WS/hello-v4test'/*.pkg.tar.zst"
+  docker exec \
+    -e GH_TOKEN=dummy \
+    -e GITHUB_REPOSITORY=owner/repo \
+    -e RELEASE_TAG=repository-v4-test \
+    -e REPO_DB_NAME=88kbleirad \
+    -e BUILD_PROFILE=x86-64-v4 \
+    -e PKG=hello-v4test \
+    -e GITHUB_WORKSPACE="$WS" \
+    -e GITHUB_STEP_SUMMARY="$WS/summary-$stage.md" \
+    -e FAKE_RELEASE_DIR="$WS/fake-release" \
+    -e FAKE_EVENTS_LOG="$WS/events-$stage.log" \
+    "$CID" bash "$WS/.github/scripts/build-package.sh" > "$WORKDIR/$stage.log" 2>&1
+  local rc=$?
+  rm -rf "$WORKDIR/snap-$stage"; mkdir -p "$WORKDIR/snap-$stage"
+  cp -a "$WS/output/." "$WORKDIR/snap-$stage/" 2>/dev/null || true
+  # mirror into the works (bind-mounted) tree so docker exec can read it
+  docker exec "$CID" bash -c "rm -rf '$WS/.snap/$stage'; mkdir -p '$WS/.snap/$stage'"
+  docker exec "$CID" bash -c "cp -a '$WS/output/.' '$WS/.snap/$stage/' 2>/dev/null || true"
+  echo $rc
+}
+
+# ---------------------------------------------------------------------------
+note "container build with PACKAGER configured"
+rc=$(run_build build)
+if [[ "$rc" -eq 0 ]]; then
+  ok "build exit 0"
+else
+  bad "build failed (rc=$rc): $(tail -5 "$WORKDIR/build.log")"
+fi
+if [[ -f "$WORKDIR/snap-build/status-built-hello-v4test.txt" ]]; then
+  ok "status-built written"
+else
+  bad "status-built missing"
+fi
+PKGINFO=$(tar --zstd -xOf "$WS/output"/hello-v4test-1.0-1-any.pkg.tar.zst .PKGINFO 2>/dev/null || true)
+if echo "$PKGINFO" | grep -q '^packager = 88kbleirad <88kbleirad@users.noreply.github.com>$'; then
+  ok "Packager metadata in .PKGINFO"
+else
+  bad "Packager metadata missing: $(echo "$PKGINFO" | grep '^packager' || echo none)"
+fi
+FINGERPRINT=$(jq -r '.fingerprint' "$WS/output/v4-hello-v4test.meta.json")
+if [[ -n "$FINGERPRINT" && "$FINGERPRINT" != "null" ]]; then
+  ok "meta fingerprint written"
+else
+  bad "meta fingerprint missing"
+fi
+
+# ---------------------------------------------------------------------------
+note "PACKAGER gate: neutralized packager must refuse to publish"
+# neutralise by COMMENTING the line (identical bytes to bootstrap's
+# un-comment, so the fingerprint round-trips below)
+docker exec "$CID" bash -c "sed -i 's/^PACKAGER=/#PACKAGER=/' /etc/makepkg.conf"
+rc=$(run_build nogate)
+if [[ "$rc" -eq 0 ]]; then
+  ok "build exit 0 (gate path)"
+else
+  bad "build failed unexpectedly (rc=$rc): $(tail -5 "$WORKDIR/nogate.log")"
+fi
+if [[ -f "$WORKDIR/snap-nogate/status-failed-hello-v4test.txt" ]]; then
+  ok "status-failed written (gate blocked publication)"
+else
+  bad "status-failed missing"
+fi
+if ls "$WORKDIR/snap-nogate/"*.pkg.tar.zst >/dev/null 2>&1; then
+  bad "unpackaged archive leaked into output/"
+else
+  ok "no archive published without packager metadata"
+fi
+
+# ---------------------------------------------------------------------------
+note "cache hit: matching release db + fingerprint must skip the build"
+# restore the exact PACKAGER line the gate commented out
+docker exec "$CID" bash -c "sed -i 's/^#PACKAGER=/PACKAGER=/' /etc/makepkg.conf"
+docker exec "$CID" bash -c "grep -q '^PACKAGER=\"88kbleirad <' /etc/makepkg.conf || printf 'PACKAGER=\"88kbleirad <88kbleirad@users.noreply.github.com>\"\n' >> /etc/makepkg.conf"
+
+# build the fake release from the first successful run (snapshot path)
+rm -rf "$WS/fake-release"; mkdir -p "$WS/fake-release"
+cp "$WORKDIR/snap-build"/hello-v4test-1.0-1-any.pkg.tar.zst "$WS/fake-release/"
+docker exec -e WS="$WS" "$CID" bash -c "
+  set -euo pipefail
+  cd /tmp && rm -rf dbbuild && mkdir dbbuild && cd dbbuild
+  cp \"\$WS/.snap/build\"/hello-v4test-1.0-1-any.pkg.tar.zst .
+  repo-add 88kbleirad.db.tar.gz hello-v4test-1.0-1-any.pkg.tar.zst >/dev/null 2>&1
+  cp 88kbleirad.db.tar.gz 88kbleirad.files.tar.gz \"\$WS/fake-release/\"
+"
+cp "$WORKDIR/snap-build/v4-hello-v4test.meta.json" "$WS/fake-release/"
+
+
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+rc=$(run_build cache)
+if [[ "$rc" -eq 0 ]]; then
+  ok "cache run exit 0"
+else
+  bad "cache run failed (rc=$rc): $(tail -5 "$WORKDIR/cache.log")"
+fi
+if grep -q "package is up to date" "$WORKDIR/cache.log"; then
+  ok "cache hit detected"
+else
+  bad "cache hit not detected: $(grep -E 'cache|reuse|built' "$WORKDIR/cache.log" | head -3)"
+fi
+if [[ -f "$WORKDIR/snap-cache/status-skipped-hello-v4test.txt" ]]; then
+  ok "status-skipped written"
+else
+  bad "status-skipped missing"
+fi
+if [[ -f "$WORKDIR/snap-cache/hello-v4test-1.0-1-any.pkg.tar.zst" ]]; then
+  ok "cached binary reused"
+else
+  bad "cached binary not present"
+fi
+
+# ---------------------------------------------------------------------------
+echo
+echo "summary: PASS=$PASS FAIL=$FAIL"
+[[ $FAIL -eq 0 ]]
