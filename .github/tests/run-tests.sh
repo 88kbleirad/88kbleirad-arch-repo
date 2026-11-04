@@ -88,6 +88,7 @@ if docker run --rm \
         pacman -Syu --noconfirm --needed \
           gnupg jq libarchive pacman-contrib base-devel git
         bash "$REPO_ROOT/.github/tests/test-signing.sh"
+        bash "$REPO_ROOT/.github/tests/test-signing-mode.sh"
       '; then
   ok "signing suite"
 else

@@ -41,7 +41,8 @@ if [[ "${1:-}" == "release" && "${2:-}" == "view" ]]; then
     esac
     shift
   done
-  if [[ ! -d "$FAKE_RELEASE_DIR" ]]; then
+  # a release exists only once `gh release create` ran (mock marker)
+  if [[ ! -f "$FAKE_RELEASE_DIR/.created" ]]; then
     echo "error: release not found" >&2
     exit 1
   fi

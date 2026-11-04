@@ -5,15 +5,21 @@ name: Build and Publish Arch Repository
 #
 # RUN MODE:
 #   - Manual runs require `confirm-production=YES` (workflow_dispatch).
+#   - `signing-mode` selects the publication mode:
+#       unsigned (default) — no GPG key, no protected environment; the
+#         repository is published unsigned and any leftover detached
+#         signatures are purged so nothing mismatched stays online.
+#       signed — strict GPG signing + verification of every package and
+#         the database; requires the protected `package-signing`
+#         environment. A signed request NEVER silently downgrades to
+#         unsigned if signing fails.
 #   - Scheduled runs use a SEPARATE, explicitly authorized path:
 #     `schedule:weekly` below. The cron entry remains commented out and is
 #     enabled only in a separately approved PR (owner-approved). The
 #     prepare job rejects scheduled runs unless a dedicated repository
 #     variable `ALLOW_SCHEDULED_PRODUCTION=yes` is set; scheduled builds
-#     never include system-critical packages and never accept inputs.
-#   - Signing and signature verification are mandatory before any
-#     publication (publish-prod.sh aborts when the GPG key is missing or
-#     a signature fails verification).
+#     never include system-critical packages, never accept inputs and
+#     always publish unsigned (no protected environment).
 #
 # The publish job is non-destructive: it uploads refreshed assets with
 # `--clobber` into the existing release, deletes only assets that are
@@ -45,6 +51,14 @@ on:
         required: false
         type: string
         default: ''
+      signing-mode:
+        description: 'Publishing mode. unsigned (default): no GPG required, no signing environment. signed: strict GPG signing + signature verification (requires the package-signing environment).'
+        required: false
+        type: choice
+        options:
+          - unsigned
+          - signed
+        default: unsigned
 
 permissions:
   contents: read
@@ -72,6 +86,18 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+
+      - name: Validate signing mode input (manual runs only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_SIGNING_MODE: ${{ inputs.signing-mode }}
+        run: |
+          set -euo pipefail
+          case "$INPUT_SIGNING_MODE" in
+            unsigned|signed) ;;
+            *) echo "::error::Invalid signing-mode '$INPUT_SIGNING_MODE' (expected unsigned|signed)."; exit 1 ;;
+          esac
+          echo "::notice::Production publication mode: $INPUT_SIGNING_MODE"
 
       - name: Generate matrix (shared validation, env-bindings only)
         id: set-matrix
@@ -116,12 +142,43 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Unsigned production publish (default). No GPG, no protected
+  # environment; runs with contents:write only.
   publish:
     needs: [prepare, build]
+    if: ${{ inputs.signing-mode != 'signed' }}
     runs-on: ubuntu-24.04
-    # The signing key lives in the protected 'package-signing'
-    # environment; only this job is granted access to it. PKGBUILD build
-    # jobs (build) never see it.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository (for validation scripts)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: output
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Validate, build database and publish in managed container (unsigned)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ env.BUILD_IMAGE }}
+          PUBLISH_SCRIPT: publish-prod.sh
+          EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
+          SIGNING_MODE: unsigned
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
+
+  # Signed production publish: enters the protected environment, requires
+  # the signing secret, and never silently downgrades on signing failure.
+  publish-signed:
+    needs: [prepare, build]
+    if: ${{ inputs.signing-mode == 'signed' }}
+    runs-on: ubuntu-24.04
     environment: package-signing
     permissions:
       contents: write
@@ -146,7 +203,7 @@ jobs:
           set -euo pipefail
           umask 077
           if [[ -z "$GPG_KEY_CONTENT" ]]; then
-            echo "::error::GPG_PRIVATE_KEY is not configured in the 'package-signing' environment; production publication requires signatures."
+            echo "::error::GPG_PRIVATE_KEY is not configured in the 'package-signing' environment; signed publication requires signatures."
             exit 1
           fi
           printf '%s\n' "$GPG_KEY_CONTENT" > /tmp/gpg-key.asc
@@ -157,13 +214,14 @@ jobs:
             chmod 600 /tmp/gpg-passphrase
             echo "GPG_PASSPHRASE_FILE=/tmp/gpg-passphrase" >> "$GITHUB_ENV"
           fi
-          echo "::notice::GPG signing key materialized for this publish job only (value never echoed)."
+          echo "::notice::GPG signing key materialized for this signed publish job only (value never echoed)."
 
-      - name: Validate, build database and publish in managed container
+      - name: Validate, build database and publish in managed container (signed)
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ env.BUILD_IMAGE }}
           PUBLISH_SCRIPT: publish-prod.sh
           EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
+          SIGNING_MODE: signed
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"

@@ -164,6 +164,7 @@ docker exec \
   -e REPO_DB_NAME="$REPO_DB_NAME" \
   -e GITHUB_STEP_SUMMARY="$SUMMARY_FILE" \
   -e EXCLUDED_BASES_FILE="${EXCLUDED_BASES_FILE:-}" \
+  -e SIGNING_MODE="${SIGNING_MODE:-unsigned}" \
   -e GPG_KEY_FILE="/run/secrets/gpg-key" \
   -e GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:+/run/secrets/gpg-passphrase}" \
   "$CID" bash "$WS/.github/scripts/$PUBLISH_SCRIPT"

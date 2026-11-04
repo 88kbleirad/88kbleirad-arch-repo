@@ -128,11 +128,60 @@ The entire repository is controlled by a single file: `packages.txt`.
 ### Step 7: Relax and Let it Run
 
 - The Sync Workflow runs on a schedule and when `packages.txt` changes. It reads `packages.txt`, pulls the latest PKGBUILDs from the AUR, skips `local:` entries, deletes removed packages, and creates a clean Pull Request.
-- The Publish Workflow is manual-only until separately approved (`confirm-production=YES`), later optionally via a weekly schedule path gated by a dedicated repository variable. It checks existing assets, reuses cached packages when possible, falls back to previous release files if needed, GPG-signs every package and the repository database, generates a fresh pacman database, validates all signatures, and uploads everything to the repository Release tag.
+- The Publish Workflow is manual-only until separately approved (`confirm-production=YES`), later optionally via a weekly schedule path gated by a dedicated repository variable. It checks existing assets, reuses cached packages when possible, falls back to previous release files if needed, generates a fresh pacman database, validates archive/database consistency, and uploads everything to the repository Release tag.
+- **Signing is optional.** The publish workflow has a `signing-mode` input:
+  - `unsigned` (**default**) — no GPG key and no protected environment are required. The repository is published unsigned; any leftover detached signatures from an earlier signed run are purged so nothing mismatched stays online.
+  - `signed` — strict GPG signing + verification of every package and the database; requires the protected `package-signing` environment. A signed run never silently downgrades to unsigned if signing fails.
 - Matrix builds are limited to **2 concurrent jobs** (`max-parallel: 2`).
-- Caching is architecture-aware: each package carries a `v4-<pkg>.meta.json` metadata file (profile + fingerprint of the `PKGBUILD` and compiler config). A cached package is reused only when the profile matches the current build target and the fingerprint matches; `x86-64-v3`-era binaries are never reused for `x86-64-v4` builds. All published packages and the database carry valid detached signatures; publication aborts if signing or verification fails.
+- Caching is architecture-aware: each package carries a `v4-<pkg>.meta.json` metadata file (profile + fingerprint of the `PKGBUILD` and compiler config). A cached package is reused only when the profile matches the current build target and the fingerprint matches; `x86-64-v3`-era binaries are never reused for `x86-64-v4` builds.
 
-**Disclaimer:** `SigLevel = Optional TrustAll` shown above is for convenience until signatures are published. Once signatures exist, switch to `SigLevel = Required TrustedOnly` and trust the repository key (see `docs/pacman-signing.md`). Only use this repository if you trust the operator and verify the key fingerprint out-of-band.
+**Disclaimer:** The production repository runs in **unsigned mode by default**, so `SigLevel = Optional TrustAll` is used for personal testing convenience and does **not** provide mandatory package authentication. When you later enable `signing-mode=signed`, switch clients to `SigLevel = Required TrustedOnly` and trust the repository key (see `docs/pacman-signing.md`). Only use this repository if you trust the operator; verify the key fingerprint out-of-band before trusting it.
+
+### Step 8: Publish packages manually
+
+The exact dispatch command (replace the package list as needed):
+
+```bash
+gh workflow run build-release.yml \
+  --repo 88kbleirad/88kbleirad-arch-repo \
+  -f confirm-production=YES \
+  -f packages="nmtui-go,osu-mime,ksuperkey" \
+  -f signing-mode=unsigned
+```
+
+Leave `packages` empty to build the **full** `packages.txt` matrix (minus system-critical packages). Add `-f allow-critical=<name>` to include an individual system-critical package by exact name.
+
+### Step 9: Verify the published database
+
+```bash
+curl -fLO https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository/88kbleirad.db.tar.gz
+tar -tzf 88kbleirad.db.tar.gz | sed 's|^|  |'
+# each directory is a package present in the repository database
+```
+
+Or, with the repository configured in `pacman.conf`:
+
+```bash
+sudo pacman -Sy
+pacman -Sl 88kbleirad   # list every package the database provides
+```
+
+### Step 10: Enable signed publishing later (optional)
+
+1. Create a dedicated ed25519 sign-only key and add it to the protected
+   `package-signing` environment as `GPG_PRIVATE_KEY` (+ optional
+   `GPG_PASSPHRASE`) — see `docs/operator-signing.md`.
+2. Run the publish workflow with `-f signing-mode=signed`.
+3. Once the release carries `.sig` files and `88kbleirad.pub.asc`, switch
+   clients to `SigLevel = Required TrustedOnly` (`docs/pacman-signing.md`).
+
+### Step 11: Prepare weekly scheduled builds (disabled)
+
+The cron entry in `build-release.yml` stays commented out. To enable it,
+in a separately approved PR: uncomment the `schedule:` block **and** set
+the repository variable `ALLOW_SCHEDULED_PRODUCTION=yes`. Scheduled runs
+have no inputs, always publish unsigned, never include system-critical
+packages, and keep publication non-destructive.
 
 ---
 
@@ -249,6 +298,6 @@ Toàn bộ repository này được điều khiển bởi một file duy nhất 
 #### Bước 7: Để hệ thống tự chạy
 
 - **Sync Workflow** chạy theo lịch và khi `packages.txt` thay đổi. Workflow này đọc `packages.txt`, kéo PKGBUILD mới nhất từ AUR, bỏ qua các dòng `local:`, xóa các gói đã bị loại bỏ, rồi tạo một Pull Request sạch.
-- **Publish Workflow** chỉ chạy tay cho tới khi được phê duyệt riêng (`confirm-production=YES`), sau đó có thể qua đường lịch tuần được kiểm soát bởi biến repository riêng. Workflow này kiểm tra asset hiện có, tận dụng cache nếu có thể, fallback về file từ release trước nếu cần, ký GPG mọi package và database, tạo lại pacman database mới, xác thực mọi chữ ký, rồi upload toàn bộ lên Release tag của repository.
+- **Publish Workflow** chỉ chạy tay cho tới khi được phê duyệt riêng (`confirm-production=YES`), sau đó có thể qua đường lịch tuần được kiểm soát bởi biến repository riêng. Workflow này kiểm tra asset hiện có, tận dụng cache nếu có thể, fallback về file từ release trước nếu cần, tạo lại pacman database mới, xác thực tính toàn vẹn của archive/database, rồi upload toàn bộ lên Release tag của repository. **Ký GPG là tùy chọn**: chế độ `signing-mode=unsigned` (mặc định) không cần key hay môi trường bảo vệ; chế độ `signing-mode=signed` bắt buộc ký và xác thực mọi chữ ký, và không bao giờ tự hạ cấp xuống unsigned nếu việc ký thất bại.
 
-**Lưu ý:** `SigLevel = Optional TrustAll` chỉ để tiện cho tới khi repository thực sự phát hành chữ ký GPG. Khi đó hãy chuyển sang `SigLevel = Required TrustedOnly` và tin tưởng key của repository (xem `docs/pacman-signing.md`). Chỉ dùng repository này khi bạn tin tưởng người vận hành và xác minh fingerprint key kênh ngoài.
+**Lưu ý:** Repository production mặc định chạy **chế độ unsigned**, nên `SigLevel = Optional TrustAll` chỉ để tiện cho thử nghiệm cá nhân và **không** cung cấp xác thực gói bắt buộc. Khi bạn bật `signing-mode=signed` và repository thực sự phát hành chữ ký GPG, hãy chuyển sang `SigLevel = Required TrustedOnly` và tin tưởng key của repository (xem `docs/pacman-signing.md`). Chỉ dùng repository này khi bạn tin tưởng người vận hành và xác minh fingerprint key qua kênh ngoài.

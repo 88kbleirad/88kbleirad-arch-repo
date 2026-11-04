@@ -18,21 +18,32 @@ set -euo pipefail
 RELEASE_TAG="${RELEASE_TAG:?RELEASE_TAG is required}"
 REPO_DB_NAME="${REPO_DB_NAME:?REPO_DB_NAME is required}"
 GH_TOKEN="${GH_TOKEN:?GH_TOKEN is required}"
+SIGNING_MODE="${SIGNING_MODE:-unsigned}"
+
+case "$SIGNING_MODE" in
+  unsigned|signed) ;;
+  *) echo "::error::Invalid SIGNING_MODE '$SIGNING_MODE' (expected unsigned|signed)."; exit 1 ;;
+esac
 
 pacman -Syu --noconfirm --needed \
   github-cli pacman-contrib jq libarchive gnupg
 
-# GPG signing: import the dedicated signing key into a scratch keyring
-# inside this publish job only. Build jobs never receive the key. All
-# signatures are created and verified below; any failure aborts the run
-# before anything is uploaded.
-. "$GITHUB_WORKSPACE/.github/scripts/sign-helpers.sh"
-gpg_init_homedir
-if ! gpg_import_signing_key; then
-  echo "::error::No signing key available; aborting publication."
-  exit 1
+if [[ "$SIGNING_MODE" == "signed" ]]; then
+  # GPG signing: import the dedicated signing key into a scratch keyring
+  # inside this publish job only. Build jobs never receive the key. All
+  # signatures are created and verified below; any failure aborts the run
+  # before anything is uploaded.
+  . "$GITHUB_WORKSPACE/.github/scripts/sign-helpers.sh"
+  gpg_init_homedir
+  if ! gpg_import_signing_key; then
+    echo "::error::No signing key available; aborting publication."
+    exit 1
+  fi
+  export REQUIRE_SIGNATURES=1
+else
+  echo "== Unsigned publish mode (no GPG, per optional-signing configuration) =="
+  export REQUIRE_SIGNATURES=0
 fi
-export REQUIRE_SIGNATURES=1
 
 # usage: gh_download_retry <pattern> <dir>
 # Returns 0 when the file was downloaded and is non-empty. Returns 2 for
@@ -138,17 +149,19 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
         merged_assets+=("$fname")
         MERGED=$(( MERGED + 1 ))
         echo "Kept previously published package: $fname"
-        # Carry the previously published signature forward when it exists
-        # and verifies against the current signing key. A signature that
-        # fails verification means the asset was tampered with or signed
-        # by a different key — refuse to publish it.
-        if gh_download_retry "$fname.sig" "$PWD"; then
-          if ! verify_detached "$fname" "$fname.sig"; then
-            echo "::error::Previously published signature for $fname failed verification; refusing to publish."
-            rm -rf "$MERGE_DIR"
-            exit 1
+        # Signed mode: carry the previously published signature forward when
+        # it exists and verifies against the current signing key. A
+        # signature that fails verification means the asset was tampered
+        # with or signed by a different key — refuse to publish it.
+        if [[ "$SIGNING_MODE" == "signed" ]]; then
+          if gh_download_retry "$fname.sig" "$PWD"; then
+            if ! verify_detached "$fname" "$fname.sig"; then
+              echo "::error::Previously published signature for $fname failed verification; refusing to publish."
+              rm -rf "$MERGE_DIR"
+              exit 1
+            fi
+            echo "Kept previously published signature: $fname.sig"
           fi
-          echo "Kept previously published signature: $fname.sig"
         fi
         local_meta="v4-${base}.meta.json"
         if [[ -f "$local_meta" ]]; then
@@ -197,22 +210,30 @@ else
   echo "Production release $TAG does not exist yet; nothing to merge."
 fi
 
-echo "== Sign package archives =="
-if ! ensure_all_packages_signed; then
-  echo "::error::Package signing/verification failed; refusing to publish."
-  rm -rf "$MERGE_DIR"
-  exit 1
+if [[ "$SIGNING_MODE" == "signed" ]]; then
+  echo "== Sign package archives =="
+  if ! ensure_all_packages_signed; then
+    echo "::error::Package signing/verification failed; refusing to publish."
+    rm -rf "$MERGE_DIR"
+    exit 1
+  fi
 fi
 
 echo "== Generate fresh pacman database =="
 rm -f status-*.txt protect-*.txt
-repo-add --include-sigs "${REPO_DB_NAME}.db.tar.gz" "${merged_assets[@]}"
+if [[ "$SIGNING_MODE" == "signed" ]]; then
+  repo-add --include-sigs "${REPO_DB_NAME}.db.tar.gz" "${merged_assets[@]}"
+else
+  repo-add "${REPO_DB_NAME}.db.tar.gz" "${merged_assets[@]}"
+fi
 
-echo "== Sign repository database =="
-if ! sign_and_publish_db_signatures; then
-  echo "::error::Database signing/verification failed; refusing to publish."
-  rm -rf "$MERGE_DIR"
-  exit 1
+if [[ "$SIGNING_MODE" == "signed" ]]; then
+  echo "== Sign repository database =="
+  if ! sign_and_publish_db_signatures; then
+    echo "::error::Database signing/verification failed; refusing to publish."
+    rm -rf "$MERGE_DIR"
+    exit 1
+  fi
 fi
 
 echo "== Validate repository consistency =="
@@ -223,7 +244,11 @@ if ! bash "$GITHUB_WORKSPACE/.github/scripts/validate-release.sh" "$PWD" "$REPO_
 fi
 
 echo "== Publish to production release (non-destructive) =="
-pkg_assets=( *.pkg.tar.zst *.pkg.tar.zst.sig )
+if [[ "$SIGNING_MODE" == "signed" ]]; then
+  pkg_assets=( *.pkg.tar.zst *.pkg.tar.zst.sig )
+else
+  pkg_assets=( *.pkg.tar.zst )
+fi
 db_assets=( "${REPO_DB_NAME}".db* "${REPO_DB_NAME}".files* )
 meta_assets=( v4-*.meta.json )
 if (( ${#pkg_assets[@]} == 0 )); then
@@ -241,12 +266,15 @@ if (( ${#meta_assets[@]} == 0 )); then
   rm -rf "$MERGE_DIR"
   exit 1
 fi
-if ! export_public_key; then
-  echo "::error::Failed to export the public signing key; refusing to publish."
-  rm -rf "$MERGE_DIR"
-  exit 1
+pub_assets=()
+if [[ "$SIGNING_MODE" == "signed" ]]; then
+  if ! export_public_key; then
+    echo "::error::Failed to export the public signing key; refusing to publish."
+    rm -rf "$MERGE_DIR"
+    exit 1
+  fi
+  pub_assets=( ${REPO_DB_NAME}.pub.asc )
 fi
-pub_assets=( ${REPO_DB_NAME}.pub.asc )
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "Release $TAG exists; merging this run into it."
@@ -313,6 +341,23 @@ if (( ${#stale_assets[@]} > 0 )); then
   done
 else
   echo "No stale assets to delete."
+fi
+
+# Unsigned mode: the released repository is unsigned by design; remove any
+# leftover detached signatures so no mismatched/invalid .sig remains
+# published (e.g. from an earlier signed run that is now superseded).
+if [[ "$SIGNING_MODE" == "unsigned" ]]; then
+  echo "== Purging detached signatures (unsigned mode) =="
+  while IFS= read -r asset; do
+    [[ -n "$asset" ]] || continue
+    case "$asset" in
+      *.pkg.tar.zst.sig|"${REPO_DB_NAME}.db.sig"|"${REPO_DB_NAME}.db.tar.gz.sig"|"${REPO_DB_NAME}.files.sig"|"${REPO_DB_NAME}.files.tar.gz.sig")
+        echo "Deleting superseded signature asset: $asset"
+        gh release delete-asset "$TAG" "$asset" --repo "$REPO" -y \
+          || echo "::warning::Cannot delete stale signature $asset; the next run will retry."
+        ;;
+    esac
+  done < <(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name')
 fi
 
 echo "Published production release: $REPO/releases/tag/$TAG"

@@ -193,13 +193,25 @@ gpg --batch --yes --detach-sign --no-armor -u "$SIGNING_KEYID" \
   -o testpkg-1.0-1-x86_64.pkg.tar.zst.sig testpkg-1.0-1-x86_64.pkg.tar.zst
 
 # ---------------------------------------------------------------------------
-note "negative: missing key must abort"
-echo "--- publish-prod without key ---"
+note "negative: missing key must abort (signed mode)"
+echo "--- publish-prod (signed) without key ---"
 env -u GPG_PRIVATE_KEY -u GPG_KEY_FILE \
   GPG_PASSPHRASE= \
+  SIGNING_MODE=signed \
   bash "$REPO_ROOT/.github/scripts/publish-prod.sh" >/dev/null 2>&1 \
-  && bad "publish-prod succeeded without key" \
-  || ok "publish-prod aborts without key"
+  && bad "publish-prod (signed) succeeded without key" \
+  || ok "publish-prod (signed) aborts without key"
+
+# signed mode with a bogus key must abort too (never silently downgrade)
+echo "--- publish-prod (signed) with invalid key ---"
+printf 'not a key\n' > "$WORKDIR/bogus.asc"
+env -u GPG_PRIVATE_KEY \
+  GPG_KEY_FILE="$WORKDIR/bogus.asc" \
+  GPG_PASSPHRASE= \
+  SIGNING_MODE=signed \
+  bash "$REPO_ROOT/.github/scripts/publish-prod.sh" >/dev/null 2>&1 \
+  && bad "publish-prod (signed) succeeded with invalid key" \
+  || ok "publish-prod (signed) aborts with invalid key (no silent downgrade)"
 
 # ---------------------------------------------------------------------------
 note "publish-stage.sh end-to-end against mock gh"
@@ -280,6 +292,7 @@ REQUIRE_SIGNATURES=1 bash "$REPO_ROOT/.github/scripts/validate-release.sh" "$FRE
 echo "--- subset republish with merge ---"
 FAB_DIR="$WORKDIR/fabricate"
 rm -rf "$FAB_DIR"; mkdir -p "$FAB_DIR"
+touch "$FAB_DIR/.created"
 cp "$FRESH_DIR"/88kbleirad.db.tar.gz "$FAB_DIR/"
 cp "$FRESH_DIR"/88kbleirad.files.tar.gz "$FAB_DIR/"
 cp "$FRESH_DIR"/testpkg-1.0-1-x86_64.pkg.tar.zst "$FAB_DIR/"
@@ -303,6 +316,7 @@ REQUIRE_SIGNATURES=1 bash "$REPO_ROOT/.github/scripts/validate-release.sh" "$FAB
 echo "--- retained unsigned package migration ---"
 UNS_DIR="$WORKDIR/unsigned-release"
 rm -rf "$UNS_DIR"; mkdir -p "$UNS_DIR"
+touch "$UNS_DIR/.created"
 cp "$FRESH_DIR"/88kbleirad.db.tar.gz "$UNS_DIR/"
 cp "$FRESH_DIR"/88kbleirad.files.tar.gz "$UNS_DIR/"
 cp "$FRESH_DIR"/testpkg-1.0-1-x86_64.pkg.tar.zst "$UNS_DIR/"
@@ -331,6 +345,7 @@ fi
 echo "--- tampered previous signature abort ---"
 BAD_DIR="$WORKDIR/bad-release"
 rm -rf "$BAD_DIR"; mkdir -p "$BAD_DIR"
+touch "$BAD_DIR/.created"
 cp "$FRESH_DIR"/88kbleirad.db.tar.gz "$BAD_DIR/"
 cp "$FRESH_DIR"/88kbleirad.files.tar.gz "$BAD_DIR/"
 cp "$FRESH_DIR"/testpkg-1.0-1-x86_64.pkg.tar.zst "$BAD_DIR/"
