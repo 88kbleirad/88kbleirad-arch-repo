@@ -229,6 +229,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "tampered cached package: must be rejected and rebuilt, never published"
+# corrupt the cached archive in the fake release; the cache-hit path must
+# detect it (validate_pkg_file) and fall back to a real rebuild.
+docker exec "$CID" bash -c "
+  printf 'x' | dd of='$WS/fake-release/hello-v4test-1.0-1-any.pkg.tar.zst' bs=1 seek=700 count=1 conv=notrunc 2>/dev/null
+"
+rc=$(run_build tampered)
+if [[ "$rc" -eq 0 ]]; then
+  ok "tampered-cache run exit 0 (fallback rebuild)"
+else
+  bad "tampered-cache run failed (rc=$rc): $(tail -5 "$WORKDIR/tampered.log")"
+fi
+if grep -q "failed validation" "$WORKDIR/tampered.log"; then
+  ok "tampered cached binary detected via validation"
+else
+  bad "tampered cached binary not detected: $(grep -E 'validation|cache|rebuild' "$WORKDIR/tampered.log" | head -3)"
+fi
+if [[ -f "$WORKDIR/snap-tampered/status-built-hello-v4test.txt" ]]; then
+  ok "tampered cache triggered a rebuild (status-built)"
+else
+  bad "tampered cache did not rebuild"
+fi
+# the rebuilt archive must carry a valid signature and be publishable
+if ls "$WORKDIR/snap-tampered"/hello-v4test-1.0-1-any.pkg.tar.zst >/dev/null 2>&1; then
+  ok "fresh archive produced after tamper rejection"
+else
+  bad "no fresh archive after tamper rejection"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

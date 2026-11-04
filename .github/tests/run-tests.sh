@@ -57,6 +57,18 @@ for f in files:
     print("OK:", f)
 PY
 
+# -- 2b. actionlint (when available) ----------------------------------------
+if command -v actionlint >/dev/null 2>&1; then
+  note "actionlint: workflows"
+  if actionlint "$REPO_ROOT"/.github/workflows/*.yml; then
+    ok "actionlint clean"
+  else
+    bad "actionlint reported issues"
+  fi
+else
+  echo "  (actionlint not installed; skipped)"
+fi
+
 # -- 3. matrix gate tests ---------------------------------------------------
 note "matrix gate tests (approval / schedule / critical / subset)"
 if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then

@@ -256,6 +256,34 @@ fi
 REQUIRE_SIGNATURES=1 bash "$REPO_ROOT/.github/scripts/validate-release.sh" "$FAB_DIR" "88kbleirad" >/dev/null 2>&1 \
   && ok "merged release validates" || bad "merged release validation failed"
 
+# stage 2b: previous release with an UNSIGNED kept package (pre-signing
+# era) — merge must retain it and sign it fresh on this run
+echo "--- retained unsigned package migration ---"
+UNS_DIR="$WORKDIR/unsigned-release"
+rm -rf "$UNS_DIR"; mkdir -p "$UNS_DIR"
+cp "$FRESH_DIR"/88kbleirad.db.tar.gz "$UNS_DIR/"
+cp "$FRESH_DIR"/88kbleirad.files.tar.gz "$UNS_DIR/"
+cp "$FRESH_DIR"/testpkg-1.0-1-x86_64.pkg.tar.zst "$UNS_DIR/"
+cp "$FRESH_DIR"/staypkg-1.0-1-x86_64.pkg.tar.zst "$UNS_DIR/"
+# NOTE: staypkg has NO .sig in this "old" release (pre-signing state)
+cp "$FRESH_DIR"/v4-testpkg.meta.json "$UNS_DIR/"
+cp "$FRESH_DIR"/v4-staypkg.meta.json "$UNS_DIR/"
+rm -f "$WORKDIR/events-uns.log"; touch "$WORKDIR/events-uns.log"
+rc=$(run_stage "$UNS_DIR" "$WORKDIR/events-uns.log" "$WORKDIR/uns.log" \
+  testpkg-1.0-1-x86_64.pkg.tar.zst v4-testpkg.meta.json)
+if [[ $rc -eq 0 ]] && [[ -f "$UNS_DIR/staypkg-1.0-1-x86_64.pkg.tar.zst.sig" ]]; then
+  ok "retained unsigned package was signed on this run"
+else
+  bad "unsigned retained package not signed (rc=$rc): $(tail -3 "$WORKDIR/uns.log")"
+fi
+REQUIRE_SIGNATURES=1 bash "$REPO_ROOT/.github/scripts/validate-release.sh" "$UNS_DIR" "88kbleirad" >/dev/null 2>&1 \
+  && ok "migrated unsigned release validates" || bad "migrated unsigned release failed validation"
+if grep -q "Kept previously published package: staypkg-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/uns.log"; then
+  ok "previously published package retained"
+else
+  bad "previously published package not retained"
+fi
+
 # stage 3: tampered previously-published signature (staypkg) must abort the
 # publish before upload
 echo "--- tampered previous signature abort ---"

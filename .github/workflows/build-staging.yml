@@ -51,53 +51,15 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Build staging matrix
+      - name: Build staging matrix (shared validation, env-bindings only)
         id: set-matrix
+        env:
+          MODE: staging
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PACKAGES: ${{ inputs.packages }}
+          INPUT_INCLUDE_KSUPERKEY: ${{ inputs.include-ksuperkey }}
         run: |
-          set -euo pipefail
-          # default set from input, or the two canonical smoke packages
-          IN="${{ inputs.packages }}"
-          if [[ -z "$IN" ]]; then
-            IN="nmtui-go,osu-mime"
-          fi
-          if [[ "${{ inputs.include-ksuperkey }}" == "true" ]]; then
-            IN="${IN},ksuperkey"
-          fi
-
-          pkgs=()
-          IFS=',' read -r -a requested <<< "$IN"
-          for pkg in "${requested[@]}"; do
-            pkg="$(echo "$pkg" | xargs)"
-            [[ -n "$pkg" ]] || continue
-            if [[ ! -f "$pkg/PKGBUILD" ]]; then
-              echo "::error::requested package '$pkg' has no PKGBUILD directory; aborting"
-              exit 1
-            fi
-            # staging safety: never allow system-critical packages
-            case "$pkg" in
-              pacman|nvidia-utils|lib32-nvidia-utils|xlibre-xserver|networkmanager-iwd|linux-nanoka)
-                echo "::error::system-critical package '$pkg' is forbidden in staging"
-                exit 1
-                ;;
-            esac
-            pkgs+=("$pkg")
-          done
-
-          if (( ${#pkgs[@]} == 0 )); then
-            echo "::error::no valid packages requested"
-            exit 1
-          fi
-
-          MATRIX_JSON=$(printf '%s\n' "${pkgs[@]}" | jq -R . | jq -s -c .)
-          echo "staging matrix: $MATRIX_JSON"
-          echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "## Staging build ($RELEASE_TAG)"
-            echo ""
-            echo "- Packages: ${pkgs[*]}"
-            echo "- Target: x86-64-v4 (CachyOS)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash "$GITHUB_WORKSPACE/.github/scripts/generate-matrix.sh"
 
   build:
     needs: prepare
