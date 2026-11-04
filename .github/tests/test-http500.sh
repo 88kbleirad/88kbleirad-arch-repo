@@ -73,15 +73,12 @@ chmod +x "$WORKDIR/mockbin/gh"
 export MOCK_GH="$REPO_ROOT/.github/tests/mock-gh.sh"
 export PATH="$WORKDIR/mockbin:$PATH"
 
-# -- minimal release fixture -------------------------------------------------
-make_release() { # dir
-  local dir="$1"
-  rm -rf "$dir"; mkdir -p "$dir"; touch "$dir/.created"
-  # testa + testb packages (valid archives)
-  for name in testa testb; do
-    local d="$WORKDIR/pkgbuild/$name"
-    mkdir -p "$d/usr/share"; printf 'x\n' > "$d/usr/share/$name"
-    cat > "$d/.PKGINFO" <<PKG
+# -- minimal package fixture (pkgbuild tree) --------------------------------
+mk_pkgbuild() { # name
+  local name="$1"
+  local d="$WORKDIR/pkgbuild/$name"
+  mkdir -p "$d/usr/share"; printf 'x\n' > "$d/usr/share/$name"
+  cat > "$d/.PKGINFO" <<PKG
 pkgname = $name
 pkgbase = $name
 pkgver = 1.0-1
@@ -93,7 +90,16 @@ size = 8
 arch = x86_64
 license = MIT
 PKG
-    ( cd "$d" && tar --zstd -cf "$dir/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+}
+
+# -- minimal release fixture -------------------------------------------------
+make_release() { # dir
+  local dir="$1"
+  rm -rf "$dir"; mkdir -p "$dir"; touch "$dir/.created"
+  # testa + testb packages (valid archives)
+  for name in testa testb; do
+    mk_pkgbuild "$name"
+    ( cd "$WORKDIR/pkgbuild/$name" && tar --zstd -cf "$dir/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
     printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$name" \
       > "$dir/v4-$name.meta.json"
   done
@@ -133,8 +139,8 @@ SHIM
   local name
   if [[ -n "$fixtures" ]]; then
     for name in ${fixtures//,/ }; do
-      local d="$WORKDIR/pkgbuild/$name"
-      ( cd "$d" && tar --zstd -cf "$ws/output/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+      mk_pkgbuild "$name"
+      ( cd "$WORKDIR/pkgbuild/$name" && tar --zstd -cf "$ws/output/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
       printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$name" \
         > "$ws/output/v4-$name.meta.json"
     done
@@ -263,6 +269,99 @@ rc=$(run_prod noval "$W4" '["testa","testb","missing-pkg"]')
 after=$(ls "$W4" | sort | md5sum | awk '{print $1}')
 [[ "$rc" -ne 0 ]] && ok "publish aborts on inventory failure" || bad "publish did not abort"
 [[ "$before" == "$after" ]] && ok "release asset set unchanged after failed publish" || bad "release assets changed despite failure"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: missing database asset is recovered from package archives"
+# Release has package archives + metas but NO .db.tar.gz (the live failure
+# shape). Local run builds testa+testb; the release additionally carries
+# staypkg which must be recovered (downloaded + validated) into the
+# reconstructed database. Expected inventory = all three.
+seed_rel_archive() { # name rel
+  local name="$1" rel="$2"
+  mk_pkgbuild "$name"
+  ( cd "$WORKDIR/pkgbuild/$name" && tar --zstd -cf "$rel/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+  printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$name" \
+    > "$rel/v4-$name.meta.json"
+}
+W5="$WORKDIR/release-missing-db"
+rm -rf "$W5"; mkdir -p "$W5"; touch "$W5/.created"; : > "$W5/.ids"
+seed_rel_archive testa "$W5"
+seed_rel_archive testb "$W5"
+seed_rel_archive staypkg "$W5"
+rc=$(run_prod recover-missing-db "$W5" '["testa","testb","staypkg"]')
+if [[ "$rc" -eq 0 ]]; then
+  ok "publish succeeds by reconstructing the database from release archives"
+else
+  bad "recovery publish failed (rc=$rc): $(tail -4 "$WORKDIR/recover-missing-db.log")"
+fi
+grep -q "reconstructing the repository database" "$WORKDIR/recover-missing-db.log" \
+  && ok "recovery path logged" || bad "recovery log missing"
+grep -q "Recovered previously published package: staypkg" "$WORKDIR/recover-missing-db.log" \
+  && ok "remote staypkg recovered into database" || bad "staypkg not recovered"
+[[ -f "$W5/88kbleirad.db.tar.gz" ]] && ok "reconstructed .db.tar.gz uploaded" || bad "reconstructed db missing"
+[[ -f "$W5/88kbleirad.files.tar.gz" ]] && ok "reconstructed .files.tar.gz uploaded" || bad "files index missing"
+[[ -f "$W5/testa-1.0-1-x86_64.pkg.tar.zst" ]] && ok "existing testa preserved" || bad "testa lost"
+[[ -f "$W5/staypkg-1.0-1-x86_64.pkg.tar.zst" ]] && ok "existing staypkg preserved" || bad "staypkg lost"
+# preservation invariant: every package archive that existed in the release
+# before recovery must still exist afterwards (clobber delete+upload is
+# fine; losing an archive is not)
+have_all=$(for a in "$W5"/*.pkg.tar.zst; do printf '%s\n' "$(basename "$a")"; done | sort)
+want_all=$(for a in testa testb staypkg; do printf '%s\n' "${a}-1.0-1-x86_64.pkg.tar.zst"; done | sort)
+[[ "$have_all" == "$want_all" ]] \
+  && ok "all package archives preserved after recovery" \
+  || bad "package archives lost during recovery: $(printf '%s ' $have_all)"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: missing database + incomplete expected inventory refuses to publish"
+# Release archives cover only testa; expected inventory also requires
+# staypkg which exists nowhere (neither built nor released). Recovery must
+# reconstruct what it can, then the inventory gate must fail BEFORE any
+# mutation.
+W5b="$WORKDIR/release-missing-db-partial"
+rm -rf "$W5b"; mkdir -p "$W5b"; touch "$W5b/.created"; : > "$W5b/.ids"
+seed_rel_archive testa "$W5b"
+rc=$(run_prod recover-missing-db-partial "$W5b" '["testa","testb","staypkg"]')
+if [[ "$rc" -ne 0 ]] && grep -q "Expected package 'staypkg'" "$WORKDIR/recover-missing-db-partial.log"; then
+  ok "incomplete recovery refused (expected staypkg missing)"
+else
+  bad "incomplete recovery not refused (rc=$rc): $(tail -4 "$WORKDIR/recover-missing-db-partial.log")"
+fi
+grep -q 'upload ' "$WORKDIR/recover-missing-db-partial.events" \
+  && bad "assets uploaded despite incomplete recovery" || ok "no uploads on incomplete recovery"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: transient DB download failure aborts (never 'recover')"
+# The release HAS .db.tar.gz but the download keeps failing transiently:
+# the pipeline must abort, not treat it as a clean-miss recovery.
+W6="$WORKDIR/release-transient-db"
+make_release "$W6"
+rc=$(run_prod transient-db "$W6" '["testa","testb"]' FAIL_DOWNLOAD_ON="88kbleirad.db.tar.gz")
+if [[ "$rc" -ne 0 ]] && grep -q "could not be downloaded" "$WORKDIR/transient-db.log"; then
+  ok "transient DB download failure aborts publish"
+else
+  bad "transient DB download did not abort (rc=$rc): $(tail -4 "$WORKDIR/transient-db.log")"
+fi
+grep -q 'upload ' "$WORKDIR/transient-db.events" && bad "assets uploaded after transient DB failure" || ok "no uploads after transient DB failure"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: corrupt downloaded DB aborts (never publish partial)"
+# The DB asset downloads but fails to extract: must abort and leave the
+# release unchanged.
+W7="$WORKDIR/release-corrupt-db"
+rm -rf "$W7"; mkdir -p "$W7"; touch "$W7/.created"; : > "$W7/.ids"
+seed_rel_archive testa "$W7"
+seed_rel_archive testb "$W7"
+printf 'this is not a valid pacman database\n' > "$W7/88kbleirad.db.tar.gz"
+printf 'this is not a valid pacman database\n' > "$W7/88kbleirad.files.tar.gz"
+before=$(ls "$W7" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod corrupt-db "$W7" '["testa","testb"]')
+after=$(ls "$W7" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -ne 0 ]] && grep -q "Cannot extract production database" "$WORKDIR/corrupt-db.log"; then
+  ok "corrupt DB aborts publish"
+else
+  bad "corrupt DB did not abort (rc=$rc): $(tail -4 "$WORKDIR/corrupt-db.log")"
+fi
+[[ "$before" == "$after" ]] && ok "release unchanged after corrupt-DB abort" || bad "release changed despite corrupt-DB abort"
 
 fi # RUN_PROD_SCENARIOS
 

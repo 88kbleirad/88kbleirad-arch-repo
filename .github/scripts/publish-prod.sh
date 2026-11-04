@@ -51,14 +51,20 @@ fi
 
 # usage: gh_download_retry <pattern> <dir>
 # Returns 0 when the file was downloaded and is non-empty. Returns 2 for
-# a clean miss (no matching asset).
+# a clean miss (the release has no matching asset — distinct from a
+# transient API/transport failure). Returns 1 after exhausted retries on
+# genuine failures. stderr is surfaced (sanitized) instead of dropped so
+# the exact failure (HTTP/transport) is visible in the job log.
 gh_download_retry() {
   local pattern="$1" dir="$2" attempt rc f=""
   for attempt in 1 2 3; do
+    local err
+    err="$(mktemp)"
     gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-        --dir "$dir" --pattern "$pattern" 2>/dev/null
+        --dir "$dir" --pattern "$pattern" 2>"$err"
     rc=$?
     if [[ $rc -eq 0 ]]; then
+      rm -f "$err"
       local candidate
       for candidate in "$dir"/$(basename "$pattern"); do
         [[ -s "$candidate" ]] && f="$candidate"
@@ -69,10 +75,29 @@ gh_download_retry() {
       echo "[publish] download reported success for '$pattern' but no file was produced"
       return 2
     fi
-    echo "[publish] download attempt $attempt/3 failed for '$pattern' (rc=$rc)"
+    local msg
+    msg="$(cat "$err")"
+    rm -f "$err"
+    if grep -q 'no assets match the file pattern' <<<"$msg"; then
+      echo "[publish] asset '$pattern' does not exist in the release (clean miss)"
+      return 2
+    fi
+    echo "[publish] download attempt $attempt/3 failed for '$pattern' (rc=$rc): $msg"
     [[ $attempt -lt 3 ]] && sleep 5
   done
   return 1
+}
+
+# usage: validate_pkg_archive <file>
+# True when the file is a readable package archive carrying a pkgname in
+# .PKGINFO. Used by the database-recovery path before trusting an existing
+# release asset.
+validate_pkg_archive() {
+  local f="$1" name
+  [[ -s "$f" ]] || return 1
+  bsdtar -tf "$f" >/dev/null 2>&1 || return 1
+  name=$(bsdtar -xOf "$f" .PKGINFO 2>/dev/null | awk -F' = ' '/^pkgname/{print $2; exit}')
+  [[ -n "$name" ]]
 }
 
 cd "$GITHUB_WORKSPACE/output"
@@ -104,17 +129,32 @@ MERGE_DIR="$(mktemp -d)"
 merged_assets=( *.pkg.tar.zst )
 MERGED=0
 declare -A PROCESSED_STATUS
+PREV_DB_MODE="none"
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-  if ! gh_download_retry "${REPO_DB_NAME}.db.tar.gz" "$MERGE_DIR"; then
-    echo "::error::Production release exists but its database cannot be read; refusing to publish a partial repository."
-    exit 1
-  fi
   mkdir -p "$MERGE_DIR/db"
-  if ! bsdtar -xf "$MERGE_DIR/${REPO_DB_NAME}.db.tar.gz" -C "$MERGE_DIR/db"; then
-    echo "::error::Cannot extract production database; refusing to publish a partial repository."
-    exit 1
-  fi
+  # Distinguish three outcomes for the canonical database asset:
+  #   0 -> downloaded
+  #   2 -> clean miss (asset absent) — the packages may still be present;
+  #        this is NOT a reason to abort, but it IS a reason to recover.
+  #   1 -> genuine transient failure after retries -> abort (never risk a
+  #        partial publish because of a flaky API).
+  db_dl_rc=0
+  gh_download_retry "${REPO_DB_NAME}.db.tar.gz" "$MERGE_DIR" || db_dl_rc=$?
+  case "$db_dl_rc" in
+    0)
+      PREV_DB_MODE="db"
+      ;;
+    2)
+      PREV_DB_MODE="missing"
+      echo "::warning::Release $TAG has no ${REPO_DB_NAME}.db.tar.gz asset (asset absent — not a transient failure)."
+      ;;
+    *)
+      echo "::error::Release $TAG exists but its ${REPO_DB_NAME}.db.tar.gz could not be downloaded (transient API/transport failure after retries); refusing to publish."
+      rm -rf "$MERGE_DIR"
+      exit 1
+      ;;
+  esac
 
   # bases processed this run with their status (from metadata written by
   # build-package.sh: built | skipped | restored | failed)
@@ -130,6 +170,13 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
     name=$(bsdtar -xOf "$pkg" .PKGINFO 2>/dev/null | awk -F' = ' '/^pkgname/{print $2; exit}')
     [[ -n "$name" ]] && NEW_NAMES["$name"]=1
   done
+
+  if [[ "$PREV_DB_MODE" == "db" ]]; then
+  if ! bsdtar -xf "$MERGE_DIR/${REPO_DB_NAME}.db.tar.gz" -C "$MERGE_DIR/db"; then
+    echo "::error::Cannot extract production database; refusing to publish a partial repository."
+    rm -rf "$MERGE_DIR"
+    exit 1
+  fi
 
   for desc in "$MERGE_DIR/db"/*/desc; do
     [[ -f "$desc" ]] || continue
@@ -209,6 +256,73 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
         fi
       done
     done < "$EXCLUDED_BASES_FILE"
+  fi
+  fi # PREV_DB_MODE == db
+
+  # -- controlled recovery: the canonical database asset is absent from
+  # the release (it was never uploaded or was lost), but the package
+  # archives may still be intact. Reconstruct the database from the
+  # release's EXISTING, validated package archives, then reconcile with
+  # the expected inventory below. This is fail-closed:
+  #   - every candidate archive is downloaded and fully validated
+  #     (readable, .PKGINFO present) before it is trusted;
+  #   - if a package in the complete expected inventory is neither built
+  #     this run nor present as a validated release asset, publication is
+  #     refused BEFORE any mutation;
+  #   - the release assets themselves are never deleted here (drift
+  #     cleanup below runs only against the regenerated database).
+  if [[ "$PREV_DB_MODE" == "missing" ]]; then
+    echo "::warning::Release $TAG has no ${REPO_DB_NAME}.db.tar.gz; reconstructing the repository database from existing validated release package archives."
+    local_assets=()
+    while IFS= read -r asset; do
+      [[ -n "$asset" && "$asset" == *.pkg.tar.zst ]] || continue
+      if [[ -f "$asset" ]]; then
+        # already fresh in output/ this run (superseded copy)
+        continue
+      fi
+      if gh_download_retry "$asset" "$PWD"; then
+        local_assets+=("$asset")
+      else
+        echo "::error::Recovery: cannot download release archive $asset; refusing to publish a reconstructed partial repository."
+        rm -rf "$MERGE_DIR"
+        exit 1
+      fi
+    done < <(gh_list_assets "$TAG" "$REPO")
+
+    recovered=0
+    for f in "${local_assets[@]}"; do
+      if validate_pkg_archive "$f"; then
+        merged_assets+=("$f")
+        recovered=$(( recovered + 1 ))
+        echo "Recovered previously published package: $f"
+        # preserve architecture-aware metadata: reuse the released meta when
+        # it exists, else write a placeholder that forces a rebuild next run
+        base=""
+        base=$(bsdtar -xOf "$f" .PKGINFO 2>/dev/null | awk -F' = ' '/^pkgbase/{print $2; exit}')
+        [[ -n "$base" ]] || base=$(bsdtar -xOf "$f" .PKGINFO 2>/dev/null | awk -F' = ' '/^pkgname/{print $2; exit}')
+        if [[ -n "$base" ]]; then
+          local_meta="v4-${base}.meta.json"
+          if [[ ! -f "$local_meta" ]]; then
+            if gh_download_retry "$local_meta" "$PWD"; then
+              echo "Kept architecture metadata: $local_meta"
+            else
+              echo "::warning::No released metadata for recovered package ${base}; writing a placeholder that forces a rebuild on the next run."
+              printf '{\n  "package": %s,\n  "profile": "x86-64-v4",\n  "status": "restored",\n  "fingerprint": "placeholder-unavailable",\n  "built_at": %s\n}\n' \
+                "$(printf '%s' "$base" | jq -R .)" \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ | jq -R .)" \
+                > "$local_meta"
+            fi
+          fi
+        fi
+      else
+        echo "::error::Recovery: release archive $f failed validation; refusing to publish a reconstructed partial repository."
+        rm -rf "$MERGE_DIR"
+        exit 1
+      fi
+    done
+    if (( recovered > 0 )); then
+      echo "Recovery complete: ${recovered} previously published package(s) merged back into the database."
+    fi
   fi
 else
   echo "Production release $TAG does not exist yet; nothing to merge."

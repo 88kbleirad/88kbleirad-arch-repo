@@ -217,13 +217,28 @@ if [[ "${1:-}" == "release" && "${2:-}" == "download" ]]; then
   done
   mkdir -p "$dir"
   found=0
+  # transient download fault injection: FAIL_DOWNLOAD_ON=<pattern> makes
+  # every download of that pattern fail (transport-style); one-shot
+  # variant fails exactly once. Both let tests verify the pipeline
+  # distinguishes transient failures from a clean miss.
+  if [[ "${FAIL_DOWNLOAD_ON:-}" == "$pattern" ]]; then
+    echo "HTTP 502: bad gateway (simulated transient download failure)" >&2
+    exit 1
+  fi
+  if [[ "${FAIL_DOWNLOAD_ONCE_ON:-}" == "$pattern" ]]; then
+    unset FAIL_DOWNLOAD_ONCE_ON
+    echo "HTTP 502: bad gateway (simulated transient download failure)" >&2
+    exit 1
+  fi
   for f in "$FAKE_RELEASE_DIR"/$(basename "$pattern"); do
     if [[ -f "$f" ]]; then
       cp "$f" "$dir/$(basename "$f")"
       found=1
     fi
   done
-  [[ $found -eq 1 ]] || { echo "warning: no asset matched pattern $pattern" >&2; exit 0; }
+  # real `gh release download` exits 1 with this exact stderr on a clean
+  # miss (no matching asset); the pipeline classifies it as a clean miss
+  [[ $found -eq 1 ]] || { echo "no assets match the file pattern" >&2; exit 1; }
   exit 0
 fi
 
