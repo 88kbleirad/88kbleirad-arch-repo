@@ -52,6 +52,48 @@ gpg_init_homedir
 gpg_import_signing_key && ok "key import"
 [[ -n "$SIGNING_KEYID" ]] && ok "keyid resolved ($SIGNING_KEYID)" || bad "keyid empty"
 
+# ---------------------------------------------------------------------------
+note "sign-helpers: import failure diagnostics (sanitized, fail-closed)"
+# generate all key variants from the ORIGINAL keyring first
+gpg --armor --export-secret-keys "$KEYID" > "$WORKDIR/clean.asc"
+gpg --armor --export "$KEYID" > "$WORKDIR/pubonly.asc"
+sed 's/^/    /' "$WORKDIR/clean.asc" > "$WORKDIR/indented.asc"
+: > "$WORKDIR/empty.asc"
+sed '/^-----END PGP PRIVATE KEY BLOCK-----$/d' "$WORKDIR/clean.asc" > "$WORKDIR/trunc.asc"
+printf 'hello world not a key\n' > "$WORKDIR/garbage.asc"
+
+run_import_case() {
+  # usage: run_import_case <label> <keyfile>
+  local label="$1" kf="$2"
+  local ghome="$WORKDIR/gnupg-case"; rm -rf "$ghome"; mkdir -p "$ghome"; chmod 700 "$ghome"
+  export GNUPGHOME="$ghome"
+  unset GPG_PRIVATE_KEY
+  export GPG_KEY_FILE="$kf"
+  if gpg_import_signing_key > "$WORKDIR/$label.import.out" 2>&1; then
+    echo "0"
+  else
+    echo "1"
+  fi
+  export GNUPGHOME="$WORKDIR/gnupg"
+}
+# indented armor (paste artifact) must import successfully after fix
+rc=$(run_import_case indented "$WORKDIR/indented.asc")
+[[ "$rc" == "0" ]] && ok "indented armor imports (normalized)" || bad "indented armor import failed"
+# empty file must fail closed
+rc=$(run_import_case empty "$WORKDIR/empty.asc")
+[[ "$rc" == "1" ]] && grep -q "is empty" "$WORKDIR/empty.import.out" && ok "empty key fails closed" || bad "empty key not rejected"
+# public-only key must fail closed with clear message
+rc=$(run_import_case pubonly "$WORKDIR/pubonly.asc")
+[[ "$rc" == "1" ]] && grep -q "not a private key" "$WORKDIR/pubonly.import.out" && ok "public-only key fails closed" || bad "public-only key not rejected"
+# truncated armor: gpg itself accepts footer-less secret armor; this must
+# still import (matching gpg behaviour) — the footer diagnostic is
+# informational, not a gate
+rc=$(run_import_case truncated "$WORKDIR/trunc.asc")
+[[ "$rc" == "0" ]] && ok "footer-less armor imports (gpg accepts; footer diagnostic informational)" || bad "footer-less armor unexpectedly rejected"
+# malformed (non-armor garbage) must fail closed
+rc=$(run_import_case garbage "$WORKDIR/garbage.asc")
+[[ "$rc" == "1" ]] && grep -q "armor header: MISSING" "$WORKDIR/garbage.import.out" && ok "garbage fails with header diagnostic" || bad "garbage not detected"
+
 # fabricate a valid package archive
 mkdir -p pkg/usr/share/test
 echo hi > pkg/usr/share/test/a.txt

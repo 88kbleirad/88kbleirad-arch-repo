@@ -55,8 +55,17 @@ gpg_init_homedir() {
 #   - $GPG_KEY_FILE (host-configured secret file, bind-mounted read-only
 #     into the container — the publish flow)
 #   - $GPG_PRIVATE_KEY (environment variable fallback for local testing)
+#
+# The armored input is normalized before import (UTF-8 BOM removal, any
+# leading whitespace indentation stripped line-by-line, trailing newline
+# ensured) so common paste artifacts (e.g. indented text from a code block)
+# cannot cause a spurious import failure. Normalization is strictly
+# whitespace — it never alters key material.
+#
+# Diagnostics are sanitized: gpg's exit status and a scrubbed stderr are
+# reported, never any key content or passphrase.
 gpg_import_signing_key() {
-  local keyfile
+  local keyfile tmpfile rc gpg_err
   if [[ -n "${GPG_KEY_FILE:-}" && -f "$GPG_KEY_FILE" ]]; then
     keyfile="$GPG_KEY_FILE"
   elif [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then
@@ -67,15 +76,59 @@ gpg_import_signing_key() {
     echo "::error::GPG signing key secret is not available (GPG_KEY_FILE / GPG_PRIVATE_KEY); refusing to publish unsigned repository assets."
     return 1
   fi
-  if ! gpg --batch --import "$keyfile" >/dev/null 2>&1; then
-    echo "::error::Failed to import the GPG signing key."
+
+  if [[ ! -s "$keyfile" ]]; then
+    echo "::error::GPG signing key file is empty; aborting publication."
     if [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then rm -f "$keyfile"; fi
     return 1
   fi
+
+  # Normalize armor: strip BOM, strip leading/trailing whitespace per
+  # line, ensure a trailing newline. (Armor ignores surrounding
+  # whitespace, but indentation breaks gpg's parser — normalize it.)
+  tmpfile="$(mktemp)"
+  if ! sed '1s/^\xEF\xBB\xBF//; s/^[[:space:]]*//; s/[[:space:]]*$//' "$keyfile" > "$tmpfile"; then
+    echo "::error::Failed to normalize the GPG signing key file."
+    rm -f "$tmpfile"
+    if [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then rm -f "$keyfile"; fi
+    return 1
+  fi
+  printf '\n' >> "$tmpfile"
+
+  gpg_err="$(mktemp)"
+  if ! gpg --batch --import "$tmpfile" >/dev/null 2>"$gpg_err"; then
+    rc=$?
+    echo "::error::Failed to import the GPG signing key (gpg exit $rc)."
+    # Sanitized diagnostic: only gpg's own stderr (never key bytes) and
+    # structural facts about the provided file.
+    if [[ -s "$gpg_err" ]]; then
+      sed 's/^/::error::  gpg: /' "$gpg_err" >&2 || true
+    fi
+    {
+      echo "::error::  import source: ${GPG_KEY_FILE:+\"GPG_KEY_FILE\" mount}${GPG_PRIVATE_KEY:+environment variable} (size $(wc -c < "$tmpfile" | tr -d ' ') bytes after normalization)"
+      head -1 "$tmpfile" | grep -q '^-----BEGIN PGP PRIVATE KEY BLOCK-----$' \
+        && echo "::error::  armor header: present" \
+        || echo "::error::  armor header: MISSING (not an armored private key?)"
+      tail -1 "$tmpfile" | grep -q '^-----END PGP PRIVATE KEY BLOCK-----$' \
+        && echo "::error::  armor footer: present" \
+        || echo "::error::  armor footer: MISSING (truncated armor?)"
+    } >&2
+    rm -f "$tmpfile" "$gpg_err"
+    if [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then rm -f "$keyfile"; fi
+    return 1
+  fi
+  rm -f "$tmpfile" "$gpg_err"
+
   if [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then rm -f "$keyfile"; fi
   SIGNING_KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
   if [[ -z "$SIGNING_KEYID" ]]; then
-    echo "::error::No secret signing key found after import."
+    # import succeeded but no secret key is present, e.g. a public-only
+    # key was supplied instead of a private one
+    if gpg --list-keys --with-colons | grep -q '^pub:'; then
+      echo "::error::No secret signing key found after import (a public key was imported, not a private key)."
+    else
+      echo "::error::No signing key found after import; aborting publication."
+    fi
     return 1
   fi
   echo "[sign] imported signing key ${SIGNING_KEYID}"
