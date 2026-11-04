@@ -201,12 +201,15 @@ expect_rc "unknown subset name" "$rc" 1 "not listed in packages.txt"
 
 # ---------------------------------------------------------------------------
 note "production: critical requests and approvals"
-rc=$(run_matrix production workflow_dispatch INPUT_CONFIRM_PRODUCTION=YES INPUT_PACKAGES="linux-nanoka" INPUT_ALLOW_CRITICAL=)
+# linux-nanoka was removed from packages.txt (still critical); use
+# networkmanager-iwd, an inventory-resident critical package, for approval
+# semantics tests.
+rc=$(run_matrix production workflow_dispatch INPUT_CONFIRM_PRODUCTION=YES INPUT_PACKAGES="networkmanager-iwd" INPUT_ALLOW_CRITICAL=)
 expect_rc "requested critical w/o approval" "$rc" 1 "requires explicit approval"
 
-rc=$(run_matrix production workflow_dispatch INPUT_CONFIRM_PRODUCTION=YES INPUT_PACKAGES="linux-nanoka,osu-mime" INPUT_ALLOW_CRITICAL="linux-nanoka")
+rc=$(run_matrix production workflow_dispatch INPUT_CONFIRM_PRODUCTION=YES INPUT_PACKAGES="networkmanager-iwd,osu-mime" INPUT_ALLOW_CRITICAL="networkmanager-iwd")
 expect_rc "critical with approval" "$rc" 0
-printf '%s' "$(matrix)" | jq -e 'any(. == "linux-nanoka")' >/dev/null 2>&1 && ok "approved critical included" || bad "approved critical missing: $(matrix)"
+printf '%s' "$(matrix)" | jq -e 'any(. == "networkmanager-iwd")' >/dev/null 2>&1 && ok "approved critical included" || bad "approved critical missing: $(matrix)"
 
 rc=$(run_matrix production workflow_dispatch INPUT_CONFIRM_PRODUCTION=YES INPUT_PACKAGES= INPUT_ALLOW_CRITICAL="not-a-critical-pkg")
 expect_rc "invalid allow-critical" "$rc" 1 "not a known system-critical package"
@@ -218,7 +221,7 @@ for trick in '*' 'lib32-*' 'xlibre' 'linux-nanok' 'networkmanager'; do
 done
 
 # malformed allow-critical is rejected by name validation (fail-closed)
-rc=$(run_matrix production workflow_dispatch INPUT_CONFIRM_PRODUCTION=YES INPUT_PACKAGES= INPUT_ALLOW_CRITICAL='linux-nanoka;$(id)')
+rc=$(run_matrix production workflow_dispatch INPUT_CONFIRM_PRODUCTION=YES INPUT_PACKAGES= INPUT_ALLOW_CRITICAL='networkmanager-iwd;$(id)')
 expect_rc "allow-critical injection" "$rc" 1 "Invalid package name"
 
 # ---------------------------------------------------------------------------

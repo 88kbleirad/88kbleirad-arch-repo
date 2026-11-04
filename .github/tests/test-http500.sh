@@ -397,6 +397,65 @@ grep -q 'delete-asset' "$WORKDIR/idem2.events" \
 grep -q "Remote verification passed" "$WORKDIR/idem2.log" \
   && ok "second run remote verification passed" || bad "remote verification missing on second run"
 
+# ---------------------------------------------------------------------------
+note "publish-prod: expansion to 12 packages succeeds (mixed new + unchanged)"
+# Simulate expansion: release already contains testa,testb; the run adds 10
+# more packages locally; expected inventory has all 12. Existing assets must
+# be preserved and the database regenerated with the full 12-package set.
+W9="$WORKDIR/release-expand12"
+rm -rf "$W9"; mkdir -p "$W9"; touch "$W9/.created"; : > "$W9/.ids"
+seed_rel_archive testa "$W9"
+seed_rel_archive testb "$W9"
+EXP12='["testa","testb","c1","c2","c3","c4","c5","c6","c7","c8","c9","c10"]'
+rm -rf "$WORKDIR/expand12-out"; mkdir -p "$WORKDIR/expand12-out"
+for n in testa testb c1 c2 c3 c4 c5 c6 c7 c8 c9 c10; do
+  mk_pkgbuild "$n"
+  ( cd "$WORKDIR/pkgbuild/$n" && tar --zstd -cf "$WORKDIR/expand12-out/$n-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+  printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$n" \
+    > "$WORKDIR/expand12-out/v4-$n.meta.json"
+done
+rc=$(run_prod expand12 "$W9" "$EXP12" WS_FIXTURES_DIR="$WORKDIR/expand12-out")
+if [[ "$rc" -eq 0 ]]; then
+  ok "expansion to 12 packages publishes"
+else
+  bad "expansion to 12 failed (rc=$rc): $(tail -4 "$WORKDIR/expand12.log")"
+fi
+grep -q "Inventory OK: all 12 requested packages" "$WORKDIR/expand12.log" \
+  && ok "12-package inventory enforced" || bad "12-inventory not confirmed"
+[[ -f "$W9/testa-1.0-1-x86_64.pkg.tar.zst" ]] && ok "existing testa preserved" || bad "testa lost"
+[[ -f "$W9/c1-1.0-1-x86_64.pkg.tar.zst" ]] && ok "new c1 uploaded" || bad "c1 missing"
+[[ -f "$W9/88kbleirad.db.tar.gz" ]] && ok "database regenerated with expansion" || bad "db missing"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: a failed new package blocks expansion before mutation"
+# Expected inventory includes a package whose local dir has no archive (but
+# metadata only). The pipeline's inventory gate must refuse publication and
+# must not modify the release.
+W10="$WORKDIR/release-expand-fail"
+rm -rf "$W10"; mkdir -p "$W10"; touch "$W10/.created"; : > "$W10/.ids"
+seed_rel_archive testa "$W10"
+seed_rel_archive testb "$W10"
+EXPFAIL='["testa","testb","newfail"]'
+rm -rf "$WORKDIR/expandfail-out"; mkdir -p "$WORKDIR/expandfail-out"
+for n in testa testb; do
+  mk_pkgbuild "$n"
+  ( cd "$WORKDIR/pkgbuild/$n" && tar --zstd -cf "$WORKDIR/expandfail-out/$n-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+  printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$n" \
+    > "$WORKDIR/expandfail-out/v4-$n.meta.json"
+done
+# metadata-only artifact for newfail (no archive)
+printf '{"package": "newfail", "profile": "x86-64-v4", "status": "failed", "fingerprint": "x"}\n' \
+  > "$WORKDIR/expandfail-out/v4-newfail.meta.json"
+before=$(ls "$W10" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod expandfail "$W10" "$EXPFAIL" WS_FIXTURES_DIR="$WORKDIR/expandfail-out")
+after=$(ls "$W10" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -ne 0 ]] && grep -q "Expected package 'newfail'" "$WORKDIR/expandfail.log"; then
+  ok "failed new package blocks publication"
+else
+  bad "failed new package did not block (rc=$rc): $(tail -4 "$WORKDIR/expandfail.log")"
+fi
+[[ "$before" == "$after" ]] && ok "release unchanged after blocked expansion" || bad "release changed despite blocked expansion"
+
 fi # RUN_PROD_SCENARIOS
 
 # ---------------------------------------------------------------------------
