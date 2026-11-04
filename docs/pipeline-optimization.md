@@ -118,7 +118,16 @@ A metadata-only artifact never qualifies as a hit. `--strict`/`--all` modes
 turn any unexpected miss into a failure; normal mode reports but allows
 rebuilds.
 
-### Archive validation and tool dependencies
+### Deterministic cache metadata
+
+On a cache hit, `build-package.sh` now reuses the previously published
+`built_at` timestamp instead of stamping a fresh one when the prior meta has
+the same `status=skipped` and `fingerprint` (identical content). This makes
+a repeated identical run produce byte-identical `v4-<pkg>.meta.json`
+assets — so a second publish performs **zero** metadata mutations. The
+`built_at` field is informational (no functional consumers); fingerprints,
+profile, status, and package identity are untouched as `built_at` is the
+only varying field across runs.
 
 Validation prefers `bsdtar` (libarchive), which is exactly the tool used
 inside the build/publish container. The default GitHub-hosted Ubuntu runner

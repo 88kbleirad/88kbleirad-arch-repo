@@ -206,15 +206,19 @@ validate_pkg_file() {
 }
 
 write_meta() {
-  # usage: write_meta <status> <fingerprint> [extra_json]
-  local status="$1" fp="$2" extra="${3:-}"
+  # usage: write_meta <status> <fingerprint> [extra_json] [built_at_override]
+  # built_at_override makes serialization deterministic (e.g. reuse of the
+  # previously published timestamp on a cache hit); when empty a fresh UTC
+  # timestamp is used.
+  local status="$1" fp="$2" extra="${3:-}" bat="${4:-}"
+  [[ -n "$bat" ]] || bat="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   {
     printf '{\n'
     printf '  "package": %s,\n' "$(printf '%s' "$PKG" | jq -R .)"
     printf '  "profile": %s,\n' "$(printf '%s' "$BUILD_PROFILE" | jq -R .)"
     printf '  "status": %s,\n' "$(printf '%s' "$status" | jq -R .)"
     printf '  "fingerprint": %s,\n' "$(printf '%s' "$fp" | jq -R .)"
-    printf '  "built_at": %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ | jq -R .)"
+    printf '  "built_at": %s\n' "$(printf '%s' "$bat" | jq -R .)"
     [[ -n "$extra" ]] && printf ',%s\n' "$extra"
     printf '}\n'
   } > "$WORKSPACE/output/$META_FILE"
@@ -311,7 +315,25 @@ if [[ "$NEEDS_BUILD" == "false" ]]; then
   done
   if [[ "$CACHE_OK" == "true" ]]; then
     echo "$PKG" > "$WORKSPACE/output/status-skipped-$PKG.txt"
-    write_meta skipped "$FINGERPRINT"
+    # Deterministic metadata on a cache hit: the content is byte-identical
+    # to the previously published meta (same profile/status/fingerprint),
+    # so reuse the previous built_at instead of stamping a fresh timestamp.
+    # This keeps serialization deterministic and makes repeated identical
+    # runs produce no asset mutations. built_at is informational and has no
+    # functional consumers.
+    prev_built_at=""
+    if [[ -n "$PREV_META" && -f "$PREV_META" ]]; then
+      prev_status=$(jq -r '.status // empty' "$PREV_META" 2>/dev/null)
+      prev_fp=$(jq -r '.fingerprint // empty' "$PREV_META" 2>/dev/null)
+      if [[ "$prev_status" == "skipped" && "$prev_fp" == "$FINGERPRINT" ]]; then
+        prev_built_at=$(jq -r '.built_at // empty' "$PREV_META" 2>/dev/null)
+      fi
+    fi
+    if [[ -n "$prev_built_at" ]]; then
+      write_meta skipped "$FINGERPRINT" "" "$prev_built_at"
+    else
+      write_meta skipped "$FINGERPRINT"
+    fi
     say "cache hit: $PKG"
   else
     NEEDS_BUILD=true

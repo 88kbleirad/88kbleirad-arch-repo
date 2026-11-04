@@ -232,11 +232,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "cache hit metadata is deterministic across repeated identical runs"
+# Run the same cache-hit build a second time with identical inputs; the
+# metadata must be byte-identical (no fresh built_at timestamp), i.e. a
+# second publish of the same run produces zero asset mutations.
+# Update the fake release with the first cache run's metadata so this run
+# compares against an identical (skipped) cache hit.
+cp "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" "$WS/fake-release/"
+rc=$(run_build cache2)
+if [[ "$rc" -eq 0 ]]; then
+  ok "second cache run exit 0"
+else
+  bad "second cache run failed (rc=$rc): $(tail -5 "$WORKDIR/cache2.log")"
+fi
+if [[ -f "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" && -f "$WORKDIR/snap-cache2/v4-hello-v4test.meta.json" ]]; then
+  if cmp -s "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" \
+           "$WORKDIR/snap-cache2/v4-hello-v4test.meta.json"; then
+    ok "cache-hit metadata byte-identical across runs"
+  else
+    bad "cache-hit metadata changed across identical runs:"
+    diff "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" \
+         "$WORKDIR/snap-cache2/v4-hello-v4test.meta.json" || true
+  fi
+else
+  bad "meta snapshots missing for determinism check"
+fi
+
+# ---------------------------------------------------------------------------
 note "tampered cached package: must be rejected and rebuilt, never published"
-# corrupt the cached archive in the fake release; the cache-hit path must
-# detect it (validate_pkg_file) and fall back to a real rebuild.
+# Truncate the cached archive, which guarantees zstd extraction fails
+# (unlike a mid-file byte flip, which can land in ignored padding).
 docker exec "$CID" bash -c "
-  printf 'x' | dd of='$WS/fake-release/hello-v4test-1.0-1-any.pkg.tar.zst' bs=1 seek=700 count=1 conv=notrunc 2>/dev/null
+  size=\$(stat -c %s '$WS/fake-release/hello-v4test-1.0-1-any.pkg.tar.zst')
+  truncate -s \$(( size / 2 )) '$WS/fake-release/hello-v4test-1.0-1-any.pkg.tar.zst'
 "
 rc=$(run_build tampered)
 if [[ "$rc" -eq 0 ]]; then
