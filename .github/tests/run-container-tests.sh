@@ -512,6 +512,84 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "fingerprint distinctness: different SKIP packages must NOT share a fingerprint"
+# Regression for the shared-fingerprint bug: pointing fp_src at the
+# scratch dir (deleted before hashing) made every SKIP-normalizable
+# package hash only the shared makepkg.conf → identical fingerprints for
+# all packages. Two different packages must yield two DIFFERENT
+# fingerprints, and neither may equal the config-only hash.
+mkdir -p "$WS/hello-skip2"
+mkdir -p "$WS/src-tarball/hello-skip2-1.0/usr/share"
+printf 'skip-source-2\n' > "$WS/src-tarball/hello-skip2-1.0/usr/share/hello-skip2-data"
+( cd "$WS/src-tarball" && tar -czf "$WS/hello-skip2-1.0.tar.gz" hello-skip2-1.0 )
+cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
+pkgname=hello-skip2
+pkgver=1.0
+pkgrel=1
+pkgdesc="second SKIP package"
+arch=('any')
+url="https://example.com"
+license=('MIT')
+depends=()
+source=("hello-skip2-1.0.tar.gz")
+sha256sums=('SKIP')
+package() {
+  install -Dm644 /dev/null "$pkgdir/usr/share/hello-skip2"
+}
+PB
+ln -sf "$WS/hello-skip2-1.0.tar.gz" "$WS/hello-skip2/hello-skip2-1.0.tar.gz"
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+
+rc=$(run_build distb hello-skip2)
+FP_SKIP1=$(jq -r '.fingerprint' "$WORKDIR/snap-skipb/v4-hello-skip.meta.json" 2>/dev/null || true)
+FP_SKIP2=$(jq -r '.fingerprint' "$WORKDIR/snap-distb/v4-hello-skip2.meta.json" 2>/dev/null || true)
+CONFIG_ONLY=$(docker exec "$CID" bash -c '{ cat /etc/makepkg.conf; for f in /etc/makepkg.conf.d/*.conf; do cat "$f"; done; } | sha256sum | awk "{print \$1}"')
+if [[ -n "$FP_SKIP1" && -n "$FP_SKIP2" && "$FP_SKIP1" != "$FP_SKIP2" ]]; then
+  ok "distinct SKIP packages have distinct fingerprints"
+else
+  bad "fingerprints not distinct: skip1=$FP_SKIP1 skip2=$FP_SKIP2"
+fi
+if [[ -n "$FP_SKIP1" && "$FP_SKIP1" != "$CONFIG_ONLY" && "$FP_SKIP2" != "$CONFIG_ONLY" ]]; then
+  ok "fingerprints are package-specific (not config-only)"
+else
+  bad "fingerprint equals config-only hash ($CONFIG_ONLY)"
+fi
+if [[ -s "$WORKDIR/snap-distb/v4-hello-skip2.meta.json" ]]; then
+  ok "second SKIP package meta written"
+else
+  bad "second SKIP package meta missing"
+fi
+
+# ---------------------------------------------------------------------------
+note "fingerprint stability: unchanged recipe must produce identical fingerprint"
+# Rebuild hello-skip2 in a scratch copy of the container config; the
+# fingerprint must be byte-identical to the previous run's (stable).
+# Then invalidate by changing the source content — the fingerprint must
+# change (cache invalidated).
+rc=$(run_build distc hello-skip2)
+FP_SKIP2_B=$(jq -r '.fingerprint' "$WORKDIR/snap-distc/v4-hello-skip2.meta.json" 2>/dev/null || true)
+if [[ "$FP_SKIP2" == "$FP_SKIP2_B" ]]; then
+  ok "unchanged recipe fingerprint stable across runs"
+else
+  bad "fingerprint unstable: $FP_SKIP2 != $FP_SKIP2_B"
+fi
+
+# invalidate: change the payload (source content), rebuild, expect a
+# different fingerprint
+mkdir -p "$WS/src-tarball-mod/hello-skip2-1.0/usr/share"
+printf 'skip-source-MODIFIED\n' > "$WS/src-tarball-mod/hello-skip2-1.0/usr/share/hello-skip2-data"
+( cd "$WS/src-tarball-mod" && tar -czf "$WS/hello-skip2-mod.tar.gz" hello-skip2-1.0 )
+cp "$WS/hello-skip2-mod.tar.gz" "$WS/hello-skip2/hello-skip2-1.0.tar.gz"
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+rc=$(run_build distmod hello-skip2)
+FP_SKIP2_MOD=$(jq -r '.fingerprint' "$WORKDIR/snap-distmod/v4-hello-skip2.meta.json" 2>/dev/null || true)
+if [[ -n "$FP_SKIP2_MOD" && "$FP_SKIP2_MOD" != "$FP_SKIP2" ]]; then
+  ok "meaningful source change invalidates fingerprint"
+else
+  bad "fingerprint did not change on source change: $FP_SKIP2_MOD"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

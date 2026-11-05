@@ -596,6 +596,53 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "publish-prod: preflight blocks metadata-only drift (identical payload, different build metadata)"
+# Mirrors the real xclicker/xmousepasteblock incident: the local archive
+# carries the SAME payload bytes and package identity as the published
+# one, but differs only in build metadata (builddate / .PKGINFO timestamps).
+# The byte-drift gate must still reject it (never silently replace a
+# same-version production archive), with zero remote mutation.
+W11m="$WORKDIR/release-preflight-metadata"
+rm -rf "$W11m"; mkdir -p "$W11m"; touch "$W11m/.created"; : > "$W11m/.ids"
+seed_rel_archive testa "$W11m"
+# local output: testa with identical payload but a DIFFERENT builddate in
+# .PKGINFO (the .PKGINFO content differs → archive bytes differ, while the
+# actual payload file is byte-identical).
+rm -rf "$WORKDIR/preflight-meta-out"; mkdir -p "$WORKDIR/preflight-meta-out"
+dm="$WORKDIR/pkgbuild/testa-meta"
+mkdir -p "$dm/usr/share"; printf 'x\n' > "$dm/usr/share/testa"
+cat > "$dm/.PKGINFO" <<PKG
+pkgname = testa
+pkgbase = testa
+pkgver = 1.0-1
+pkgdesc = fixture
+url = https://example.com
+builddate = 999999999
+packager = 88kbleirad <88kbleirad@users.noreply.github.com>
+size = 8
+arch = x86_64
+license = MIT
+PKG
+touch -t 202001010000.00 "$dm/.PKGINFO" "$dm/usr" "$dm/usr/share" "$dm/usr/share/testa"
+mk_tar "$WORKDIR/preflight-meta-out/testa-1.0-1-x86_64.pkg.tar.zst" "$dm"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/preflight-meta-out/v4-testa.meta.json"
+before=$(ls "$W11m" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod preflight-meta "$W11m" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/preflight-meta-out")
+after=$(ls "$W11m" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -ne 0 ]] && grep -q "preflight aborted" "$WORKDIR/preflight-meta.log"; then
+  ok "preflight aborted on metadata-only drift (rc=$rc)"
+else
+  bad "preflight did not abort on metadata-only drift (rc=$rc): $(tail -5 "$WORKDIR/preflight-meta.log")"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched by metadata-only abort" || bad "release mutated despite metadata-only abort"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/preflight-meta.events"; then
+  bad "remote mutation attempted despite metadata-only abort: $(cat "$WORKDIR/preflight-meta.events")"
+else
+  ok "no remote mutation attempted on metadata-only abort"
+fi
+
+# ---------------------------------------------------------------------------
 note "publish-prod: preflight blocks a VCS version regression (downgrade)"
 # Seed a release with testa at version 2.0; the run's local archive is the
 # same package at version 1.0 (simulating an upstream history/tag rewrite

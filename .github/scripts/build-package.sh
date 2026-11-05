@@ -189,8 +189,18 @@ compute_fingerprint() {
           && rm -rf "$scratch/src" "$scratch/pkg" 2>/dev/null \
           && chown -R builder:builder "$scratch" 2>/dev/null \
           && sudo -u builder bash -lc "cd '$scratch' && updpkgsums" >/dev/null 2>&1 \
-          && [[ -f "$scratch/PKGBUILD" ]]; then
-        fp_src="$scratch/PKGBUILD"
+          && [[ -s "$scratch/PKGBUILD" ]]; then
+        # Preserve the normalized PKGBUILD to a byte-exact file BEFORE the
+        # scratch dir is removed: pointing fp_src into the scratch dir
+        # would break the hash below (the dir is gone by then), silently
+        # producing a config-only fingerprint identical for ALL packages.
+        local norm_src
+        norm_src="$(mktemp "$WORKSPACE/.fp.norm.XXXXXX")" || norm_src=""
+        if [[ -n "$norm_src" ]] && cp "$scratch/PKGBUILD" "$norm_src" 2>/dev/null; then
+          fp_src="$norm_src"
+        elif [[ -n "$norm_src" ]]; then
+          rm -f "$norm_src" 2>/dev/null || true
+        fi
       fi
       rm -rf "$scratch" 2>/dev/null || true
     fi
@@ -198,6 +208,10 @@ compute_fingerprint() {
   local fp_raw fp_eff
   fp_raw="$({ cat "$pkgbuild"; [[ -f /etc/makepkg.conf ]] && cat /etc/makepkg.conf; for f in /etc/makepkg.conf.d/*.conf; do [[ -f "$f" ]] && cat "$f"; done; } | sha256sum | awk '{print $1}')"
   fp_eff="$({ cat "$fp_src"; [[ -f /etc/makepkg.conf ]] && cat /etc/makepkg.conf; for f in /etc/makepkg.conf.d/*.conf; do [[ -f "$f" ]] && cat "$f"; done; } | sha256sum | awk '{print $1}')"
+  # cleanup the temporary normalized copy (never the committed pkgbuild)
+  if [[ "$fp_src" != "$pkgbuild" ]]; then
+    rm -f "$fp_src" 2>/dev/null || true
+  fi
   # line 1 = effective (normalized) fingerprint; line 2 = raw committed
   # fingerprint. Callers parse both; when they differ, updpkgsums had
   # changed the PKGBUILD form (checksum normalization) and the effective
