@@ -355,6 +355,42 @@ gh_asset_status() {
   return 1
 }
 
+# pkg_identity <archive> -> canonical package identity "name|version|arch"
+# (or empty). Extracts .PKGINFO; handles pacman-7 embedded EVR and legacy
+# separate epoch/pkgrel lines. Used by the same-version replacement policy
+# to compare local vs remote package identity independently of bytes.
+pkg_identity() {
+  local archive="$1" tmp pkginfo name evr arch epoch pkgver pkgrel
+  tmp="$(mktemp)"
+  if tar --zstd -xOf "$archive" .PKGINFO > "$tmp" 2>/dev/null \
+      && [[ -s "$tmp" ]]; then
+    :
+  elif command -v bsdtar >/dev/null 2>&1 \
+      && bsdtar -xOf "$archive" .PKGINFO > "$tmp" 2>/dev/null \
+      && [[ -s "$tmp" ]]; then
+    :
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+  name=$(awk -F' = ' '/^pkgname/{print $2; exit}' "$tmp")
+  pkgver=$(awk -F' = ' '/^pkgver/{print $2; exit}' "$tmp")
+  pkgrel=$(awk -F' = ' '/^pkgrel/{print $2; exit}' "$tmp")
+  epoch=$(awk -F' = ' '/^epoch/{print $2; exit}' "$tmp")
+  arch=$(awk -F' = ' '/^arch/{print $2; exit}' "$tmp")
+  rm -f "$tmp"
+  [[ -n "$name" && -n "$pkgver" && -n "$arch" ]] || return 1
+  if [[ -n "$pkgrel" ]]; then
+    evr="${pkgver}-${pkgrel}"
+  else
+    evr="$pkgver"
+  fi
+  if [[ -n "$epoch" && "$epoch" != "0" ]]; then
+    evr="${epoch}:${evr}"
+  fi
+  printf '%s|%s|%s\n' "$name" "$evr" "$arch"
+}
+
 # gh_publish_asset <tag> <repo> <file> <workdir> [kind]
 # Content-aware upload: skips identical content, replaces changed content,
 # uploads new content. Logs the required classification lines and updates
@@ -386,6 +422,37 @@ gh_publish_asset() {
       return 0
       ;;
     CHANGED)
+      # Package-version integrity gate: a package archive that changed
+      # bytes while keeping the same name/version/pkgrel/arch identity is
+      # NEVER silently replaced. This is a deliberate, fail-closed
+      # safeguard (Phase D): it forces an explicit, intentional release
+      # (e.g. a pkgrel bump or an explicit ALLOW_SAME_VERSION_REPLACE=1
+      # override) before different bytes are published under the same
+      # version. Necessary recovery of MISSING assets is handled by the
+      # NEW path, and recovery of a CORRUPT remote asset is allowed below
+      # (a remote archive that cannot be read/validated is not a valid
+      # reference to protect). The database and metadata kinds do not
+      # carry a package identity and are unaffected.
+      if [[ "$kind" == "package" && "${ALLOW_SAME_VERSION_REPLACE:-0}" != "1" ]]; then
+        local local_id remote_archive remote_id
+        local_id="$(pkg_identity "$file")"
+        remote_archive="$workdir/.remote-samever/$(basename "$file")"
+        if [[ -n "$local_id" ]] \
+            && mkdir -p "$(dirname "$remote_archive")" \
+            && gh_download_asset_retry "$tag" "$repo" "$(basename "$file")" "$(dirname "$remote_archive")"; then
+          if remote_id="$(pkg_identity "$remote_archive")" && [[ "$remote_id" == "$local_id" ]]; then
+            gh_err "asset '$(basename "$file")' has the same package identity ($local_id) as the published asset but different bytes; refusing to silently replace a same-version archive. Bump pkgrel/version or set ALLOW_SAME_VERSION_REPLACE=1 to force."
+            echo "[publish] FAILED ${kind}: $(basename "$file") (same-version byte drift; fail-closed)"
+            PUBLISH_COUNTERS[failed]=$(( PUBLISH_COUNTERS[failed] + 1 ))
+            return 1
+          fi
+          # remote archive exists but is unreadable/invalid (no identity):
+          # a corrupt asset — allow the replacement (legitimate recovery).
+          if [[ -z "${remote_id:-}" ]]; then
+            gh_log "asset '$(basename "$file")': remote archive is unreadable (corrupt); allowing recovery replacement"
+          fi
+        fi
+      fi
       echo "[publish] CHANGED ${kind}: ${name}"
       if ! gh_upload_asset "$tag" "$repo" "$file"; then
         echo "[publish] FAILED ${kind}: ${name}"

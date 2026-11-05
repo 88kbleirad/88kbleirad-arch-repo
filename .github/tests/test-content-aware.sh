@@ -161,6 +161,84 @@ gh_publish_asset repository owner/repo "$WORKDIR/file7.txt" "$WORKDIR" "asset"
 grep -q 'delete-asset\|upload ' "$FAKE_EVENTS_LOG" || ok "no mutations on repeated publish" || bad "mutations occurred on repeated publish"
 
 # ---------------------------------------------------------------------------
+# Same-version archive integrity gate (Phase D). Build real package
+# archives (tar zst + .PKGINFO) so the publisher can compare identity.
+mk_pkg_archive() { # dir name version arch [payload]
+  local d="$1" name="$2" ver="$3" arch="$4" payload="${5:-payload.txt}"
+  mkdir -p "$d/usr/share/$name"
+  printf '%s\n' "$payload" > "$d/usr/share/$name/$payload"
+  cat > "$d/.PKGINFO" <<EOF
+pkgname = $name
+pkgbase = $name
+pkgver = $ver
+pkgdesc = fixture
+url = https://example.com
+builddate = 1
+packager = 88kbleirad <88kbleirad@users.noreply.github.com>
+size = 8
+arch = $arch
+license = MIT
+EOF
+  ( cd "$d" && tar --zstd -cf "$WORKDIR/$name-$ver-$arch.pkg.tar.zst" .PKGINFO usr )
+}
+
+# ---------------------------------------------------------------------------
+note "same-version gate: identical identity, different bytes -> fail closed"
+declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+: > "$FAKE_EVENTS_LOG"
+d="$WORKDIR/pkg-samever-old"; mkdir -p "$d"; mk_pkg_archive "$d" sver 1.0 x86_64 "old-bytes"
+cp "$WORKDIR/sver-1.0-x86_64.pkg.tar.zst" "$FAKE_RELEASE_DIR/sver-1.0-x86_64.pkg.tar.zst"
+d="$WORKDIR/pkg-samever-new"; mkdir -p "$d"; mk_pkg_archive "$d" sver 1.0 x86_64 "new-bytes"
+set +e
+gh_publish_asset repository owner/repo "$WORKDIR/sver-1.0-x86_64.pkg.tar.zst" "$WORKDIR" "package"
+rc=$?
+set -e
+[[ $rc -ne 0 ]] && ok "same-version drift blocked (rc=$rc)" || bad "same-version drift unexpectedly published"
+[[ "${PUBLISH_COUNTERS[replaced]}" == "0" ]] && ok "no replacement counter increment" || bad "replaced=${PUBLISH_COUNTERS[replaced]}"
+[[ "${PUBLISH_COUNTERS[failed]}" == "1" ]] && ok "failure counter incremented" || bad "failed=${PUBLISH_COUNTERS[failed]}"
+grep -q 'delete-asset\|upload ' "$FAKE_EVENTS_LOG" && bad "remote mutated despite fail-closed" || ok "no remote mutation"
+# remote asset still has old bytes
+remote_hex=$(sha256sum "$FAKE_RELEASE_DIR/sver-1.0-x86_64.pkg.tar.zst" | awk '{print $1}')
+local_hex=$(sha256sum "$WORKDIR/sver-1.0-x86_64.pkg.tar.zst" | awk '{print $1}')
+[[ "$remote_hex" != "$local_hex" ]] && ok "remote archive preserved" || bad "remote archive was replaced"
+
+# ---------------------------------------------------------------------------
+note "same-version gate: explicit override publishes"
+export ALLOW_SAME_VERSION_REPLACE=1
+declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+: > "$FAKE_EVENTS_LOG"
+gh_publish_asset repository owner/repo "$WORKDIR/sver-1.0-x86_64.pkg.tar.zst" "$WORKDIR" "package"
+rc=$?
+unset ALLOW_SAME_VERSION_REPLACE
+[[ $rc -eq 0 ]] && ok "override allows replace (rc=0)" || bad "override failed rc=$rc"
+[[ "${PUBLISH_COUNTERS[replaced]}" == "1" ]] && ok "replacement counted" || bad "replaced=${PUBLISH_COUNTERS[replaced]}"
+
+# ---------------------------------------------------------------------------
+note "same-version gate: legit version bump still publishes normally"
+declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+: > "$FAKE_EVENTS_LOG"
+d="$WORKDIR/pkg-ver2"; mkdir -p "$d"; mk_pkg_archive "$d" sver 2.0 x86_64 "new-version"
+set +e
+gh_publish_asset repository owner/repo "$WORKDIR/sver-2.0-x86_64.pkg.tar.zst" "$WORKDIR" "package"
+rc=$?
+set -e
+[[ $rc -eq 0 ]] && ok "version bump publishes (rc=0)" || bad "version bump blocked rc=$rc"
+[[ "${PUBLISH_COUNTERS[uploaded]}" == "1" ]] && ok "uploaded counted" || bad "uploaded=${PUBLISH_COUNTERS[uploaded]}"
+[[ -f "$FAKE_RELEASE_DIR/sver-2.0-x86_64.pkg.tar.zst" ]] && ok "new version present remotely" || bad "new version missing"
+
+# ---------------------------------------------------------------------------
+note "same-version gate: kind != package is unaffected (database/metadata)"
+declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+: > "$FAKE_EVENTS_LOG"
+printf 'db-new\n' > "$WORKDIR/db2.tar.gz"
+cp "$WORKDIR/db2.tar.gz" "$FAKE_RELEASE_DIR/db2.tar.gz"
+printf 'db-changed\n' > "$WORKDIR/db2.tar.gz"
+gh_publish_asset repository owner/repo "$WORKDIR/db2.tar.gz" "$WORKDIR" "database"
+rc=$?
+[[ $rc -eq 0 ]] && ok "database kind replacement allowed" || bad "database kind blocked rc=$rc"
+[[ "${PUBLISH_COUNTERS[replaced]}" == "1" ]] && ok "database replaced counted" || bad "replaced=${PUBLISH_COUNTERS[replaced]}"
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

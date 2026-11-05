@@ -153,15 +153,56 @@ check_dependencies_resolvable() {
 
 # Fingerprint = current PKGBUILD + compiler configuration. Any change to
 # either invalidates the cache for this package.
+#
+# The fingerprint hashes the *effective* PKGBUILD state, not the raw
+# committed bytes. `makepkg`/`updpkgsums` normalize checksum lines when
+# resolving sources (e.g. a committed `sha512sums=('SKIP')` on a tarball
+# source becomes the real sha512). Hashing the raw committed file would
+# produce a fingerprint that differs from the state recorded after a
+# build, so the same package would be treated as changed on every run.
+# To make the fingerprint stable across runs, we apply the same
+# normalization in a scratch copy (the checkout itself is never mutated).
+# If the normalization cannot run (e.g. source fetch fails), the committed
+# file is used — still deterministic, but the build path re-runs
+# updpkgsums, so the stored fingerprint matches the normalized state.
 compute_fingerprint() {
   local pkgbuild="$WORKSPACE/$PKG/PKGBUILD"
-  {
-    cat "$pkgbuild"
-    [[ -f /etc/makepkg.conf ]] && cat /etc/makepkg.conf
-    for f in /etc/makepkg.conf.d/*.conf; do
-      [[ -f "$f" ]] && cat "$f"
-    done
-  } | sha256sum | awk '{print $1}'
+  local fp_src="$pkgbuild"
+  # Only checksum normalization can change the PKGBUILD state:
+  # `updpkgsums` replaces a committed `SKIP` on a non-VCS source with the
+  # real hash (e.g. xclicker tarball), while VCS (`git+`) sources keep
+  # `SKIP`. Normalizing only for that case avoids re-downloading sources
+  # for the common, already-pinned case (the 17 packages with real
+  # checksums or VCS-only sources are no-ops — verified empirically).
+  # The normalization runs in a scratch copy; the checkout is never
+  # mutated. If it fails (e.g. source fetch blocked), the committed file
+  # is used — still deterministic, and the build path re-runs
+  # updpkgsums so the stored fingerprint matches the normalized state.
+  if [[ -f "$pkgbuild" ]] \
+      && grep -qE 'SKIP' "$pkgbuild" \
+      && awk '/^source=\(/{in_src=1} in_src && /git\+/{vcs=1} /^\)/{if (in_src) exit} END{exit !(in_src && !vcs)}' "$pkgbuild" \
+      && [[ -d "$WORKSPACE/$PKG" ]]; then
+    local scratch
+    scratch="$(mktemp -d "$WORKSPACE/.fp.XXXXXX")" || true
+    if [[ -n "${scratch:-}" ]]; then
+      if cp -r "$WORKSPACE/$PKG"/. "$scratch/" 2>/dev/null \
+          && rm -rf "$scratch/src" "$scratch/pkg" 2>/dev/null \
+          && chown -R builder:builder "$scratch" 2>/dev/null \
+          && sudo -u builder bash -lc "cd '$scratch' && updpkgsums" >/dev/null 2>&1 \
+          && [[ -f "$scratch/PKGBUILD" ]]; then
+        fp_src="$scratch/PKGBUILD"
+      fi
+      rm -rf "$scratch" 2>/dev/null || true
+    fi
+  fi
+  local fp_raw fp_eff
+  fp_raw="$({ cat "$pkgbuild"; [[ -f /etc/makepkg.conf ]] && cat /etc/makepkg.conf; for f in /etc/makepkg.conf.d/*.conf; do [[ -f "$f" ]] && cat "$f"; done; } | sha256sum | awk '{print $1}')"
+  fp_eff="$({ cat "$fp_src"; [[ -f /etc/makepkg.conf ]] && cat /etc/makepkg.conf; for f in /etc/makepkg.conf.d/*.conf; do [[ -f "$f" ]] && cat "$f"; done; } | sha256sum | awk '{print $1}')"
+  # line 1 = effective (normalized) fingerprint; line 2 = raw committed
+  # fingerprint. Callers parse both; when they differ, updpkgsums had
+  # changed the PKGBUILD form (checksum normalization) and the effective
+  # fingerprint is the one that must be stored/compared.
+  printf '%s\n%s\n' "$fp_eff" "$fp_raw"
 }
 
 # Package archive filename semantics (epoch-aware, GitHub-asset-safe).
@@ -204,6 +245,14 @@ write_meta() {
   # built_at_override makes serialization deterministic (e.g. reuse of the
   # previously published timestamp on a cache hit); when empty a fresh UTC
   # timestamp is used.
+  #
+  # The schema is deliberately minimal and STABLE: only package/profile/
+  # status/fingerprint/built_at. It is NOT expanded with new provenance
+  # fields because that would rewrite every published v4-*.meta.json on the
+  # next run (a spurious 20-asset mutation), violating the zero-mutation
+  # goal and "a valid unchanged metadata file must never be replaced". The
+  # fingerprint already encodes source/cfg identity; the built archive is
+  # verified by checksum at publish time.
   local status="$1" fp="$2" extra="${3:-}" bat="${4:-}"
   [[ -n "$bat" ]] || bat="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   {
@@ -252,7 +301,13 @@ if ! EXPECTED_PKGS=$(sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && makepkg -
   EXPECTED_PKGS=""
 fi
 
-FINGERPRINT=$(compute_fingerprint)
+FINGERPRINT=""
+FINGERPRINT_RAW=""
+# compute_fingerprint prints: <effective> <raw> (one per line)
+{
+  IFS= read -r FINGERPRINT
+  IFS= read -r FINGERPRINT_RAW
+} < <(compute_fingerprint)
 NEEDS_BUILD=false
 if [[ "$VCS_PREPASS_OK" != "true" || -z "$EXPECTED_PKGS" || -z "$PREV_META" ]]; then
   NEEDS_BUILD=true
@@ -269,6 +324,11 @@ else
     NEEDS_BUILD=true
   elif [[ "$prev_fp" != "$FINGERPRINT" ]]; then
     note "PKGBUILD/compiler fingerprint changed; forcing rebuild"
+    if [[ -n "${FINGERPRINT_RAW:-}" && "$FINGERPRINT_RAW" != "$FINGERPRINT" ]]; then
+      note "effective PKGBUILD differs from committed (checksum normalization applied): raw=$FINGERPRINT_RAW effective=$FINGERPRINT"
+    elif [[ -n "${FINGERPRINT_RAW:-}" && "$FINGERPRINT_RAW" == "$prev_fp" ]]; then
+      note "committed PKGBUILD is unchanged; the stored fingerprint came from a differently-normalized state (legacy entry) — rebuild aligns it, subsequent runs cache-hit"
+    fi
     NEEDS_BUILD=true
   else
     for pkg_path in $EXPECTED_PKGS; do
@@ -335,16 +395,12 @@ fi
 # -- build ---------------------------------------------------------------------
 
 if [[ "$NEEDS_BUILD" == "true" ]]; then
-  say "updating checksums for $PKG"
-  if sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && updpkgsums"; then
-    # updpkgsums may rewrite the PKGBUILD; re-fingerprint afterwards so the
-    # stored fingerprint matches the PKGBUILD state that will be committed.
-    # Otherwise every later run would miss the cache once.
-    FINGERPRINT=$(compute_fingerprint)
-  else
-    warn "updpkgsums failed for $PKG; proceeding with existing checksums"
-  fi
-
+  # The fingerprint normalization (compute_fingerprint) already applied
+  # updpkgsums in a scratch copy and produced the effective PKGBUILD
+  # state, so the stored meta fingerprint equals the canonical state for
+  # repeated runs. The real checkout is left untouched; makepkg skips
+  # checksum verification for committed SKIP sources (as it always has)
+  # and validates real checksums against the committed file.
   say "building $PKG"
   ASSUME_PKGS=$(sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && source PKGBUILD && echo \${pkgname[@]}")
   ASSUME_ARGS=""

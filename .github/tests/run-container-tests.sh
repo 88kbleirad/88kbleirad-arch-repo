@@ -441,6 +441,77 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "fingerprint loop: SKIP-checksum package cache-hits on repeat run"
+# Regression for the Phase 3.5 root cause: packages whose committed
+# checksum is `SKIP` on a non-VCS source (xclicker/xmousepasteblock/
+# beautyline) had their fingerprint computed on the raw committed file
+# while the stored meta fingerprint was computed after updpkgsums had
+# rewritten the checksum to the real hash. Every later run therefore saw
+# "PKGBUILD/compiler fingerprint changed" and rebuilt forever. The
+# fingerprint now normalizes the effective PKGBUILD state, so a repeat
+# run with identical inputs must cache-hit.
+mkdir -p "$WS/hello-skip"
+# local tarball source: no network needed; updpkgsums can compute the real
+# checksum, exactly like the CI container does for a remote tarball.
+mkdir -p "$WS/src-tarball/hello-skip-1.0/usr/share"
+printf 'skip-source\n' > "$WS/src-tarball/hello-skip-1.0/usr/share/hello-skip-data"
+( cd "$WS/src-tarball" && tar -czf "$WS/hello-skip-1.0.tar.gz" hello-skip-1.0 )
+cat > "$WS/hello-skip/PKGBUILD" <<'PB'
+pkgname=hello-skip
+pkgver=1.0
+pkgrel=1
+pkgdesc="SKIP checksum fingerprint regression"
+arch=('any')
+license=('MIT')
+source=("hello-skip-$pkgver.tar.gz")
+sha256sums=('SKIP')
+package() {
+  cd "$srcdir/hello-skip-$pkgver"
+  install -Dm644 usr/share/hello-skip-data "$pkgdir/usr/share/hello-skip"
+}
+PB
+ln -sf "$WS/hello-skip-1.0.tar.gz" "$WS/hello-skip/hello-skip-1.0.tar.gz"
+
+rc=$(run_build skipb hello-skip)
+if [[ "$rc" -eq 0 ]]; then
+  ok "SKIP-checksum build exit 0"
+else
+  bad "SKIP-checksum build failed (rc=$rc): $(tail -8 "$WORKDIR/skipb.log")"
+fi
+grep -q 'PKGBUILD/compiler fingerprint changed' "$WORKDIR/skipb.log" \
+  && bad "first run should not report fingerprint change" || ok "first run built clean"
+
+# seed the fake release from the first run (db + meta + archive)
+rm -rf "$WS/fake-release"; mkdir -p "$WS/fake-release"
+cp "$WORKDIR/snap-skipb"/hello-skip-1.0-1-any.pkg.tar.zst "$WS/fake-release/"
+cp "$WORKDIR/snap-skipb/v4-hello-skip.meta.json" "$WS/fake-release/"
+docker exec -e WS="$WS" "$CID" bash -c "
+  set -euo pipefail
+  cd /tmp && rm -rf dbbuild-skip && mkdir dbbuild-skip && cd dbbuild-skip
+  cp \"\$WS/.snap/skipb\"/hello-skip-1.0-1-any.pkg.tar.zst .
+  repo-add 88kbleirad.db.tar.gz hello-skip-1.0-1-any.pkg.tar.zst >/dev/null 2>&1
+  cp 88kbleirad.db.tar.gz 88kbleirad.files.tar.gz \"\$WS/fake-release/\"
+"
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+
+rc=$(run_build skipc hello-skip)
+if [[ "$rc" -eq 0 ]]; then
+  ok "SKIP-checksum repeat run exit 0"
+else
+  bad "SKIP-checksum repeat run failed (rc=$rc): $(tail -8 "$WORKDIR/skipc.log")"
+fi
+if grep -q "package is up to date" "$WORKDIR/skipc.log"; then
+  ok "SKIP-checksum repeat run is a cache hit (fingerprint loop fixed)"
+else
+  bad "SKIP-checksum repeat run rebuilt: $(grep -E 'fingerprint|cache|up to date|forcing' "$WORKDIR/skipc.log" | head -3)"
+fi
+if [[ -f "$WORKDIR/snap-skipc/status-skipped-hello-skip.txt" ]]; then
+  ok "SKIP-checksum status-skipped written"
+else
+  bad "SKIP-checksum status-skipped missing"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -90,6 +90,19 @@ size = 8
 arch = x86_64
 license = MIT
 PKG
+  # deterministic mtimes: fixture archives must be byte-stable across
+  # regeneration (tar embeds member mtimes by default, which would make
+  # each run's archive bytes differ and trip the same-version drift gate)
+  touch -t 202001010000.00 "$d/.PKGINFO" "$d/usr" "$d/usr/share" "$d/usr/share/$name"
+}
+
+# deterministic tar: fixed mtime, sorted member order, ./-free paths
+# (same member layout as the original tar --zstd -cf .PKGINFO usr)
+mk_tar() { # <archive> <dir>
+  local archive="$1" dir="$2"
+  ( cd "$dir" && find . -mindepth 1 \( -type f -o -type d \) | sort \
+      | sed 's|^\./||' \
+      | tar --zstd --mtime='@1' -cf "$archive" -T - )
 }
 
 # -- minimal release fixture -------------------------------------------------
@@ -99,7 +112,7 @@ make_release() { # dir
   # testa + testb packages (valid archives)
   for name in testa testb; do
     mk_pkgbuild "$name"
-    ( cd "$WORKDIR/pkgbuild/$name" && tar --zstd -cf "$dir/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+    mk_tar "$dir/$name-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/$name"
     printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$name" \
       > "$dir/v4-$name.meta.json"
   done
@@ -146,7 +159,7 @@ SHIM
   elif [[ -n "$fixtures" ]]; then
     for name in ${fixtures//,/ }; do
       mk_pkgbuild "$name"
-      ( cd "$WORKDIR/pkgbuild/$name" && tar --zstd -cf "$ws/output/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+      mk_tar "$ws/output/$name-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/$name"
       printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$name" \
         > "$ws/output/v4-$name.meta.json"
     done
@@ -327,7 +340,7 @@ note "publish-prod: missing database asset is recovered from package archives"
 seed_rel_archive() { # name rel
   local name="$1" rel="$2"
   mk_pkgbuild "$name"
-  ( cd "$WORKDIR/pkgbuild/$name" && tar --zstd -cf "$rel/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+  mk_tar "$rel/$name-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/$name"
   printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$name" \
     > "$rel/v4-$name.meta.json"
 }
@@ -452,7 +465,7 @@ EXP12='["testa","testb","c1","c2","c3","c4","c5","c6","c7","c8","c9","c10"]'
 rm -rf "$WORKDIR/expand12-out"; mkdir -p "$WORKDIR/expand12-out"
 for n in testa testb c1 c2 c3 c4 c5 c6 c7 c8 c9 c10; do
   mk_pkgbuild "$n"
-  ( cd "$WORKDIR/pkgbuild/$n" && tar --zstd -cf "$WORKDIR/expand12-out/$n-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+  mk_tar "$WORKDIR/expand12-out/$n-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/$n"
   printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$n" \
     > "$WORKDIR/expand12-out/v4-$n.meta.json"
 done
@@ -481,7 +494,7 @@ EXPFAIL='["testa","testb","newfail"]'
 rm -rf "$WORKDIR/expandfail-out"; mkdir -p "$WORKDIR/expandfail-out"
 for n in testa testb; do
   mk_pkgbuild "$n"
-  ( cd "$WORKDIR/pkgbuild/$n" && tar --zstd -cf "$WORKDIR/expandfail-out/$n-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+  mk_tar "$WORKDIR/expandfail-out/$n-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/$n"
   printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$n" \
     > "$WORKDIR/expandfail-out/v4-$n.meta.json"
 done
