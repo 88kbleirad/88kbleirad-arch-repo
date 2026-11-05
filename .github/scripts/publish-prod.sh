@@ -328,6 +328,116 @@ else
   echo "Production release $TAG does not exist yet; nothing to merge."
 fi
 
+# -- preflight: detect every package conflict BEFORE any mutation ---------
+# Authoritative remote package versions used by the downgrade guard:
+# - db mode: parsed from the downloaded production database (canonical);
+# - missing/recovery mode: parsed from the release's validated package
+#   archives — including release copies superseded by fresh local builds,
+#   which are fetched to a scratch dir purely for identity comparison.
+#   This keeps the "never downgrade" invariant in the degraded recovery
+#   path, not only when the canonical DB asset is present.
+declare -A REMOTE_VER=()
+if [[ "$PREV_DB_MODE" == "db" ]]; then
+  for desc in "$MERGE_DIR/db"/*/desc; do
+    [[ -f "$desc" ]] || continue
+    dn=$(awk '/^%NAME%/{getline; print}' "$desc")
+    dv=$(awk '/^%VERSION%/{getline; print}' "$desc")
+    [[ -n "$dn" && -n "$dv" ]] && REMOTE_VER["$dn"]="$dv"
+  done
+elif [[ "$PREV_DB_MODE" == "missing" ]]; then
+  # No canonical DB: derive each package's published version from the
+  # release archives. The recovery loop downloads every remote archive
+  # whose filename differs from a fresh local build (name encodes version,
+  # so an equal filename already implies an equal version) — those are
+  # exactly the archives that could carry a HIGHER version, so this set is
+  # complete for downgrade detection.
+  for f in "${local_assets[@]}"; do
+    rid="$(pkg_identity "$f")" || continue
+    IFS='|' read -r rn rv _ <<< "$rid"
+    [[ -n "$rn" && -n "$rv" ]] && REMOTE_VER["$rn"]="$rv"
+  done
+fi
+preflight_package_assets() {
+
+  local conflict=0
+  local f
+  for f in "${pkg_assets[@]}"; do
+    local name
+    name="$(basename "$f")"
+    # pkg_assets at preflight time contains only archives (detached .sig
+    # files are created later by package signing, and carry no package
+    # identity to compare)
+    [[ "$name" == *.pkg.tar.zst ]] || continue
+    local local_id
+    local_id="$(pkg_identity "$f")"
+    [[ -n "$local_id" ]] || { echo "::error::preflight: cannot read package identity for $name"; conflict=1; continue; }
+    local lname lver larch
+    IFS='|' read -r lname lver larch <<< "$local_id"
+
+    gh_asset_status "$TAG" "$REPO" "$f" "$PWD" || true
+    case "$ASSET_STATUS" in
+      CHANGED)
+        if [[ "${ALLOW_SAME_VERSION_REPLACE:-0}" != "1" ]]; then
+          local remote_archive remote_id
+          remote_archive="$PWD/.remote-samever/$name"
+          if [[ -n "$local_id" ]] \
+              && mkdir -p "$(dirname "$remote_archive")" \
+              && gh_download_asset_retry "$TAG" "$REPO" "$name" "$(dirname "$remote_archive")"; then
+            if remote_id="$(pkg_identity "$remote_archive")" && [[ "$remote_id" == "$local_id" ]]; then
+              echo "::error::preflight: package $name has the same identity ($local_id) as the published asset but different bytes; refusing to publish (set ALLOW_SAME_VERSION_REPLACE=1 only for an intentional override)."
+              conflict=1
+            fi
+          fi
+        fi
+        ;;
+    esac
+
+    # version regression check against the published database: if the same
+    # package name exists remotely with a HIGHER version, this run would
+    # downgrade it.
+    local rver="${REMOTE_VER[$lname]:-}"
+    if [[ -n "$rver" ]]; then
+      local sign
+      sign=$(vercmp "$lver" "$rver")
+      if [[ "$sign" == "-1" ]]; then
+        echo "::error::preflight: package $lname version regression: local $lver < published $rver (pacman semantics); refusing to downgrade. Upstream history/tag change or wrong pkgver() requires explicit approval."
+        conflict=1
+      fi
+    fi
+  done
+  if [[ "$conflict" -eq 1 ]]; then
+    echo "::error::preflight aborted: package conflict/regression detected; no Release assets were modified."
+    rm -rf "$MERGE_DIR"
+    exit 1
+  fi
+  echo "preflight: all ${#pkg_assets[@]} package assets conflict-free"
+}
+
+# -- preflight package asset sets (defined before the downgrade guard) -----
+# Only the *archives* are needed by the preflight (detached .sig files
+# are not package identities and may not exist yet — package signing runs
+# later). The full publish-time sets (including .sig files) are
+# regenerated after signing below.
+shopt -s nullglob
+pkg_assets=( *.pkg.tar.zst )
+meta_assets=( v4-*.meta.json )
+if (( ${#pkg_assets[@]} == 0 )); then
+  echo "::error::No package files in output/; refusing to publish."
+  rm -rf "$MERGE_DIR"
+  exit 1
+fi
+if (( ${#meta_assets[@]} == 0 )); then
+  echo "::error::No architecture metadata files; refusing to publish."
+  rm -rf "$MERGE_DIR"
+  exit 1
+fi
+
+# The downgrade guard must run BEFORE the database is regenerated: repo-add
+# keeps only the highest version for a given package name, so a version
+# regression could otherwise be masked (or fail later with a confusing
+# validation error). Aborts the run before any Release mutation.
+preflight_package_assets
+
 if [[ "$SIGNING_MODE" == "signed" ]]; then
   echo "== Sign package archives =="
   if ! ensure_all_packages_signed; then
@@ -443,6 +553,9 @@ if [[ -n "${EXPECTED_PACKAGES:-}" ]]; then
 fi
 
 echo "== Publish to production release (non-destructive) =="
+# Full publish-time asset sets, regenerated after package signing and DB
+# signing so detached .sig files are included (signed mode).
+shopt -s nullglob
 if [[ "$SIGNING_MODE" == "signed" ]]; then
   pkg_assets=( *.pkg.tar.zst *.pkg.tar.zst.sig )
 else
@@ -488,85 +601,10 @@ else
     --field body="Auto-built pacman repository." >/dev/null 2>&1
 fi
 
-# -- preflight: detect every package conflict BEFORE any mutation ---------
-# Scan all local package assets against the remote release (via the
-# published database and per-asset state). Two hard errors abort the run
-# before a single upload/delete happens:
-#   1. same-version byte drift (identical name/version/pkgrel/arch,
-#      different bytes) — never silently replaced;
-#   2. version regression — a local package version lower than the
-#      published version (pacman vercmp semantics), e.g. a VCS package
-#      resolving below its published version after an upstream history
-#      rewrite/tag deletion. The repository must never be downgraded.
-# The per-asset gate in gh_publish_asset remains as a second line of
-# defense.
-preflight_package_assets() {
-  # remote published name -> version (from the downloaded production DB)
-  local -A REMOTE_VER=()
-  if [[ "$PREV_DB_MODE" == "db" ]]; then
-    local desc
-    for desc in "$MERGE_DIR/db"/*/desc; do
-      [[ -f "$desc" ]] || continue
-      local dn dv
-      dn=$(awk '/^%NAME%/{getline; print}' "$desc")
-      dv=$(awk '/^%VERSION%/{getline; print}' "$desc")
-      [[ -n "$dn" && -n "$dv" ]] && REMOTE_VER["$dn"]="$dv"
-    done
-  fi
-
-  local conflict=0
-  local f
-  for f in "${pkg_assets[@]}"; do
-    local name
-    name="$(basename "$f")"
-    # signed mode includes detached .sig assets in pkg_assets; they are
-    # not package archives and carry no identity to compare
-    [[ "$name" == *.pkg.tar.zst ]] || continue
-    local local_id
-    local_id="$(pkg_identity "$f")"
-    [[ -n "$local_id" ]] || { echo "::error::preflight: cannot read package identity for $name"; conflict=1; continue; }
-    local lname lver larch
-    IFS='|' read -r lname lver larch <<< "$local_id"
-
-    gh_asset_status "$TAG" "$REPO" "$f" "$PWD" || true
-    case "$ASSET_STATUS" in
-      CHANGED)
-        if [[ "${ALLOW_SAME_VERSION_REPLACE:-0}" != "1" ]]; then
-          local remote_archive remote_id
-          remote_archive="$PWD/.remote-samever/$name"
-          if [[ -n "$local_id" ]] \
-              && mkdir -p "$(dirname "$remote_archive")" \
-              && gh_download_asset_retry "$TAG" "$REPO" "$name" "$(dirname "$remote_archive")"; then
-            if remote_id="$(pkg_identity "$remote_archive")" && [[ "$remote_id" == "$local_id" ]]; then
-              echo "::error::preflight: package $name has the same identity ($local_id) as the published asset but different bytes; refusing to publish (set ALLOW_SAME_VERSION_REPLACE=1 only for an intentional override)."
-              conflict=1
-            fi
-          fi
-        fi
-        ;;
-    esac
-
-    # version regression check against the published database: if the same
-    # package name exists remotely with a HIGHER version, this run would
-    # downgrade it.
-    local rver="${REMOTE_VER[$lname]:-}"
-    if [[ -n "$rver" ]]; then
-      local sign
-      sign=$(vercmp "$lver" "$rver")
-      if [[ "$sign" == "-1" ]]; then
-        echo "::error::preflight: package $lname version regression: local $lver < published $rver (pacman semantics); refusing to downgrade. Upstream history/tag change or wrong pkgver() requires explicit approval."
-        conflict=1
-      fi
-    fi
-  done
-  if [[ "$conflict" -eq 1 ]]; then
-    echo "::error::preflight aborted: package conflict/regression detected; no Release assets were modified."
-    rm -rf "$MERGE_DIR"
-    exit 1
-  fi
-  echo "preflight: all ${#pkg_assets[@]} package assets conflict-free"
-}
-preflight_package_assets
+# Configure preflight conflict/regression guards (runs earlier, before
+# signing / DB regeneration / validation): detects every package conflict
+# BEFORE any mutation. The per-asset gate in gh_publish_asset remains as a
+# second line of defense.
 
 # Publish content-aware (Objective A): skip identical checksums, upload
 # only new/changed assets, never delete a valid asset because its checksum

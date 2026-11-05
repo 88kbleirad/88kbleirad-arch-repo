@@ -373,6 +373,55 @@ want_all=$(for a in testa testb staypkg; do printf '%s\n' "${a}-1.0-1-x86_64.pkg
   || bad "package archives lost during recovery: $(printf '%s ' $have_all)"
 
 # ---------------------------------------------------------------------------
+note "publish-prod: recovery-mode downgrade blocked before any mutation"
+# Release has NO .db.tar.gz (recovery path); its archive is testa@1.0 and
+# the run's local archive is testa@1.0 (same version). A genuine
+# downgrade (remote 2.0, local 1.0) must abort in recovery mode too, with
+# the release untouched.
+W5c="$WORKDIR/release-recover-downgrade"
+rm -rf "$W5c"; mkdir -p "$W5c"; touch "$W5c/.created"; : > "$W5c/.ids"
+# remote release archive: testa@2.0 (no db asset — superseded-copy fetch
+# path must still compare versions)
+rm -rf "$WORKDIR/pkgbuild/testa-remote"; mkdir -p "$WORKDIR/pkgbuild/testa-remote/usr/share"
+printf 'payload2\n' > "$WORKDIR/pkgbuild/testa-remote/usr/share/testa"
+cat > "$WORKDIR/pkgbuild/testa-remote/.PKGINFO" <<PKG
+pkgname = testa
+pkgbase = testa
+pkgver = 2.0-1
+pkgdesc = fixture
+url = https://example.com
+builddate = 1
+packager = 88kbleirad <88kbleirad@users.noreply.github.com>
+size = 8
+arch = x86_64
+license = MIT
+PKG
+touch -t 202001010000.00 "$WORKDIR/pkgbuild/testa-remote/.PKGINFO" "$WORKDIR/pkgbuild/testa-remote/usr" "$WORKDIR/pkgbuild/testa-remote/usr/share" "$WORKDIR/pkgbuild/testa-remote/usr/share/testa"
+mk_tar "$W5c/testa-2.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa-remote"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$W5c/v4-testa.meta.json"
+# local output: same package at version 1.0 (downgrade)
+rm -rf "$WORKDIR/downgrade-recover-out"; mkdir -p "$WORKDIR/downgrade-recover-out"
+mk_pkgbuild testa
+mk_tar "$WORKDIR/downgrade-recover-out/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/downgrade-recover-out/v4-testa.meta.json"
+before=$(ls "$W5c" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod recover-downgrade "$W5c" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/downgrade-recover-out")
+after=$(ls "$W5c" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -ne 0 ]] && grep -q "version regression" "$WORKDIR/recover-downgrade.log"; then
+  ok "recovery-mode downgrade blocked (rc=$rc)"
+else
+  bad "recovery-mode downgrade not blocked (rc=$rc): $(tail -4 "$WORKDIR/recover-downgrade.log")"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched by recovery downgrade abort" || bad "release mutated despite recovery downgrade abort"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/recover-downgrade.events"; then
+  bad "remote mutation attempted despite recovery downgrade abort: $(cat "$WORKDIR/recover-downgrade.events")"
+else
+  ok "no remote mutation attempted on recovery downgrade abort"
+fi
+
+# ---------------------------------------------------------------------------
 note "publish-prod: missing database + incomplete expected inventory refuses to publish"
 # Release archives cover only testa; expected inventory also requires
 # staypkg which exists nowhere (neither built nor released). Recovery must
@@ -540,6 +589,11 @@ else
   bad "preflight did not abort (rc=$rc): $(tail -5 "$WORKDIR/preflight.log")"
 fi
 [[ "$before" == "$after" ]] && ok "release untouched by preflight abort" || bad "release mutated despite preflight abort"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/preflight.events"; then
+  bad "remote mutation attempted despite preflight abort: $(cat "$WORKDIR/preflight.events")"
+else
+  ok "no remote mutation attempted on preflight abort"
+fi
 
 # ---------------------------------------------------------------------------
 note "publish-prod: preflight blocks a VCS version regression (downgrade)"
@@ -597,6 +651,11 @@ else
   bad "preflight did not block downgrade (rc=$rc): $(tail -5 "$WORKDIR/downgrade.log")"
 fi
 [[ "$before" == "$after" ]] && ok "release untouched by downgrade abort" || bad "release mutated despite downgrade abort"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/downgrade.events"; then
+  bad "remote mutation attempted despite downgrade abort: $(cat "$WORKDIR/downgrade.events")"
+else
+  ok "no remote mutation attempted on downgrade abort"
+fi
 
 fi # RUN_PROD_SCENARIOS
 
