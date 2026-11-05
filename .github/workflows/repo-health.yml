@@ -34,9 +34,6 @@ on:
         required: false
         type: string
         default: ''
-  schedule:
-    # weekly (disabled until approved — same policy as production cron)
-    # - cron: '0 4 * * 1'
   workflow_call:
     inputs:
       release-tag:
