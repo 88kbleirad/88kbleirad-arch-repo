@@ -169,18 +169,18 @@ compute_fingerprint() {
   local pkgbuild="$WORKSPACE/$PKG/PKGBUILD"
   local fp_src="$pkgbuild"
   # Only checksum normalization can change the PKGBUILD state:
-  # `updpkgsums` replaces a committed `SKIP` on a non-VCS source with the
-  # real hash (e.g. xclicker tarball), while VCS (`git+`) sources keep
-  # `SKIP`. Normalizing only for that case avoids re-downloading sources
-  # for the common, already-pinned case (the 17 packages with real
-  # checksums or VCS-only sources are no-ops — verified empirically).
+  # `updpkgsums` replaces a committed `SKIP` on a source whose checksum
+  # it can compute — a plain tarball or a VCS source pinned to a specific
+  # revision (`git+...#commit=…`/`#tag=…`). A branch/HEAD `git+` source
+  # keeps `SKIP` (no fixed revision to hash). Normalizing only for the
+  # former avoids re-downloading sources for the already-pinned case.
   # The normalization runs in a scratch copy; the checkout is never
   # mutated. If it fails (e.g. source fetch blocked), the committed file
-  # is used — still deterministic, and the build path re-runs
-  # updpkgsums so the stored fingerprint matches the normalized state.
+  # is used — still deterministic, and the stored fingerprint then
+  # matches the committed state (the build proceeds with those checksums).
   if [[ -f "$pkgbuild" ]] \
       && grep -qE 'SKIP' "$pkgbuild" \
-      && awk '/^source=\(/{in_src=1} in_src && /git\+/{vcs=1} /^\)/{if (in_src) exit} END{exit !(in_src && !vcs)}' "$pkgbuild" \
+      && awk '/^source=\(/{in_src=1} in_src && /git\+/ && !/#(commit|tag)=/{plain_vcs=1} /^\)/{if (in_src) exit} END{exit (plain_vcs==1)}' "$pkgbuild" \
       && [[ -d "$WORKSPACE/$PKG" ]]; then
     local scratch
     scratch="$(mktemp -d "$WORKSPACE/.fp.XXXXXX")" || true

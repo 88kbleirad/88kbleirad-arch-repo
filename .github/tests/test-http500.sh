@@ -511,6 +511,93 @@ else
 fi
 [[ "$before" == "$after" ]] && ok "release unchanged after blocked expansion" || bad "release changed despite blocked expansion"
 
+# ---------------------------------------------------------------------------
+note "publish-prod: preflight catches same-version drift before ANY mutation"
+# Seed a release with testa (1.0); the run's output has a *different-bytes*
+# testa (same version) plus a new package c1. The preflight must abort
+# before uploading c1 or touching the release at all.
+W11="$WORKDIR/release-preflight"
+rm -rf "$W11"; mkdir -p "$W11"; touch "$W11/.created"; : > "$W11/.ids"
+seed_rel_archive testa "$W11"
+# local output: testa with a DIFFERENT payload (same name/version/arch)
+rm -rf "$WORKDIR/preflight-out"; mkdir -p "$WORKDIR/preflight-out"
+d="$WORKDIR/pkgbuild/testa"
+printf 'drift-bytes\n' > "$d/usr/share/testa"
+touch -t 202001010000.00 "$d/.PKGINFO" "$d/usr" "$d/usr/share" "$d/usr/share/testa"
+mk_tar "$WORKDIR/preflight-out/testa-1.0-1-x86_64.pkg.tar.zst" "$d"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/preflight-out/v4-testa.meta.json"
+mk_pkgbuild c1
+mk_tar "$WORKDIR/preflight-out/c1-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/c1"
+printf '{"package": "c1", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/preflight-out/v4-c1.meta.json"
+before=$(ls "$W11" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod preflight "$W11" '["testa","c1"]' WS_FIXTURES_DIR="$WORKDIR/preflight-out")
+after=$(ls "$W11" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -ne 0 ]] && grep -q "preflight aborted" "$WORKDIR/preflight.log"; then
+  ok "preflight aborted on same-version drift (rc=$rc)"
+else
+  bad "preflight did not abort (rc=$rc): $(tail -5 "$WORKDIR/preflight.log")"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched by preflight abort" || bad "release mutated despite preflight abort"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: preflight blocks a VCS version regression (downgrade)"
+# Seed a release with testa at version 2.0; the run's local archive is the
+# same package at version 1.0 (simulating an upstream history/tag rewrite
+# producing a lower VCS version). Preflight must abort BEFORE any mutation
+# using pacman version semantics.
+W12="$WORKDIR/release-preflight-downgrade"
+rm -rf "$W12"; mkdir -p "$W12"; touch "$W12/.created"; : > "$W12/.ids"
+rm -rf "$WORKDIR/pkgbuild/testa"; mkdir -p "$WORKDIR/pkgbuild/testa"
+printf 'payload2\n' > "$WORKDIR/pkgbuild/testa/usr/share/testa" 2>/dev/null || { mkdir -p "$WORKDIR/pkgbuild/testa/usr/share"; printf 'payload2\n' > "$WORKDIR/pkgbuild/testa/usr/share/testa"; }
+cat > "$WORKDIR/pkgbuild/testa/.PKGINFO" <<PKG
+pkgname = testa
+pkgbase = testa
+pkgver = 2.0-1
+pkgdesc = fixture
+url = https://example.com
+builddate = 1
+packager = 88kbleirad <88kbleirad@users.noreply.github.com>
+size = 8
+arch = x86_64
+license = MIT
+PKG
+touch -t 202001010000.00 "$WORKDIR/pkgbuild/testa/.PKGINFO" "$WORKDIR/pkgbuild/testa/usr" "$WORKDIR/pkgbuild/testa/usr/share" "$WORKDIR/pkgbuild/testa/usr/share/testa"
+mk_tar "$W12/testa-2.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$W12/v4-testa.meta.json"
+( cd "$W12" && repo-add 88kbleirad.db.tar.gz testa-2.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+# local output: same package at version 1.0 (downgrade)
+rm -rf "$WORKDIR/pkgbuild/testa"; mkdir -p "$WORKDIR/pkgbuild/testa/usr/share"
+printf 'payload1\n' > "$WORKDIR/pkgbuild/testa/usr/share/testa"
+cat > "$WORKDIR/pkgbuild/testa/.PKGINFO" <<PKG
+pkgname = testa
+pkgbase = testa
+pkgver = 1.0-1
+pkgdesc = fixture
+url = https://example.com
+builddate = 1
+packager = 88kbleirad <88kbleirad@users.noreply.github.com>
+size = 8
+arch = x86_64
+license = MIT
+PKG
+touch -t 202001010000.00 "$WORKDIR/pkgbuild/testa/.PKGINFO" "$WORKDIR/pkgbuild/testa/usr" "$WORKDIR/pkgbuild/testa/usr/share" "$WORKDIR/pkgbuild/testa/usr/share/testa"
+rm -rf "$WORKDIR/downgrade-out"; mkdir -p "$WORKDIR/downgrade-out"
+mk_tar "$WORKDIR/downgrade-out/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/downgrade-out/v4-testa.meta.json"
+before=$(ls "$W12" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod downgrade "$W12" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/downgrade-out")
+after=$(ls "$W12" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -ne 0 ]] && grep -q "version regression" "$WORKDIR/downgrade.log"; then
+  ok "preflight blocked version downgrade (rc=$rc)"
+else
+  bad "preflight did not block downgrade (rc=$rc): $(tail -5 "$WORKDIR/downgrade.log")"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched by downgrade abort" || bad "release mutated despite downgrade abort"
+
 fi # RUN_PROD_SCENARIOS
 
 # ---------------------------------------------------------------------------

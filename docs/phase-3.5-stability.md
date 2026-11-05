@@ -297,3 +297,174 @@ a one-time realignment may first rebuild a package.
 - All results above are **local** (container + mock-gh harness). No live
   GitHub Actions run, publish, or release modification was performed.
 - The `built_at` values in the production meta files were not modified.
+
+---
+
+# Hotfix Addendum (2026-11-05): BeautyLine 2:3.0.5-2
+
+## H1. Reproduced root cause (publish block)
+
+The 20-package production run after Phase 3.5 failed because the newly
+built `beautyline` archive had different bytes from the published
+`2:3.0.5-1` archive (fail-closed gate correctly refused the overwrite).
+
+- Committed `beautyline/PKGBUILD` SHA256: `c05c6c712c5e4784fcd39d5daec00e255ba00c19a99cac006d0cf7a22f660e0e`
+  (contains `sha256sums=('SKIP')`).
+- `updpkgsums` rewrites it to the real source hash → PKGBUILD SHA256
+  `670f588725035ea80cf0028f5728de50d604a9e835a38493c9c46e946940e9a1`
+  (matches the old production archive's `.BUILDINFO pkgbuild_sha256sum`).
+- Production archive sha256 `ce88d47734d22947a2db009e2762b21c2ff8c04c3a37004f1d1625d52f17136b`
+  vs new CI archive `74acd8a24417e05b48009a4e7a39ada50235d29c8d25a39e65542eec6d8fdd7c`
+  — identical identity (`2:3.0.5-1`, any), `.PKGINFO builddate` differs,
+  payloads identical (symlink-safe `diff` exit 0 except .PKGINFO/.BUILDINFO/.MTREE).
+
+## H2. BeautyLine PKGBUILD changes
+
+- `pkgrel` 1 → 2 (epoch=2, pkgver=3.0.5 preserved).
+- `sha256sums=('SKIP')` → verified pin
+  `cab222dbed3008f214ce10494fb03a9f983f991477a7534885aedf119bb5cf79`
+  (verified against the GitLab tarball for pinned commit
+  `07e3736f8be38f9f48cf015d992f56f06e455002`).
+- `package()` now repairs absolute symlinks (below).
+
+## H3. Absolute symlink repair
+
+The source ships 24 absolute symlinks pointing into the author's dev
+environment (`/home/troupal/…`, `/home/oosh/…`, `/git/beautyline/…`,
+`/home/tango/…`, `/usr/share/icons/breeze-dark/…`). The new `package()`
+loop:
+
+1. For each absolute link, derives the target basename.
+2. Finds the matching entry (file or symlink) inside the packaged
+   BeautyLine tree (excluding the link itself).
+3. Verifies the resolved target stays inside the package.
+4. Replaces the absolute link with a relative link computed via
+   `realpath --relative-to`.
+5. Fails the build if no target exists or resolution fails (fail closed).
+
+One special case: `mimetypes/scalable/text-vnd.kde.kcrash-report.svg`
+points at a KDE Breeze mimetype icon not present in the source; it is
+mapped to `text-plain.svg` (which itself resolves to the package's
+`text-x-generic.svg` — the canonical generic text-document icon per the
+Freedesktop mimetype fallback chain). Documented semantic substitution
+(approved; updated from the earlier text-xml approximation).
+
+Validation of the built `2:3.0.5-2` archive:
+- Absolute symlinks: 0
+- Broken/unresolved symlinks: 0
+- `dialog-transform.svg → transform-scale.svg` resolves, and wireless-100
+  chains and kcrash all resolve.
+- Icon payload count: 3165 files (3164 source icons + COPYING license) —
+  no icons removed.
+
+## H4. Fingerprint predicate correction
+
+The Phase 3.5 normalization guard only normalized `SKIP` on non-VCS
+sources. Verification of the 20-package audit found `xmousepasteblock`
+(`git+…#commit=` source) is ALSO rewritten by `updpkgsums`, so its
+fingerprint still mismatched. The predicate now normalizes `SKIP` for any
+source whose checksum updpkgsums can compute — plain tarballs AND VCS
+pinned to `#commit=`/`#tag=`; branch/HEAD `git+` sources keep `SKIP`.
+
+## H5. 20-package preflight audit
+
+Effective fingerprints vs stored release fingerprints (exact CI config):
+
+| Package | classification |
+|---|---|
+| all-contributors-cli, catppuccin-fcitx5-git, catppuccin-whiskers-bin, ksuperkey, luajit-lgi, magika, nmtui-go, obs-pipewire-audio-capture, osu-mime, physlock, pvpn-go, pwvucontrol, rate-mirrors, ripdrag, snapper-rollback | UNCHANGED (match) |
+| xclicker | UNCHANGED (match after normalize) |
+| xmousepasteblock | UNCHANGED (match after predicate fix) |
+| anpan-git | LEGITIMATE_VERSION_UPGRADE (source moved: 1.0.3.r1.g55609cd → 0.4.0.r6.g88dd31e) |
+| catppuccin-obs-theme-git | LEGITIMATE_VERSION_UPGRADE (source moved: r35.054a297 → r21.d90002a) |
+| beautyline | LEGITIMATE_VERSION_UPGRADE (2:3.0.5-1 → 2:3.0.5-2) |
+
+No `SAME_VERSION_CONFLICT` remains: the only same-version drift that was
+blocked was beautyline, now resolved by a genuine version bump.
+
+## H6. Publishing preflight (new)
+
+`publish-prod.sh` now runs `preflight_package_assets()` before any remote
+mutation: every local package asset is classified against the remote
+release; a same-version byte-drift aborts the run before a single
+upload/delete, so a conflict in one package cannot leave a partially
+modified Release. The per-asset gate in `gh_publish_asset` remains as a
+second line of defense.
+
+## H7. Release plan (not executed)
+
+Deployment requires approval. Sequence:
+1. Commit + push reviewed changes.
+2. Run signed staging (`repository-v4-test`) — full matrix.
+3. Verify repaired symlinks inside staged archive + signatures + 20 DB
+   entries.
+4. Run unsigned production (`repository`) — full matrix.
+5. Verify DB consistency + download-only smoke install of beautyline in an
+   isolated environment.
+6. Repeat production with unchanged inputs → zero-mutation goal
+   (`unchanged=44 uploaded=0 replaced=0 failed=0`).
+
+## H8. Hotfix regression results
+
+- Container suite: PASS=34 FAIL=0 (hello-skip regression still green after
+  predicate fix).
+- test-http500.sh (container): PASS=49 FAIL=0 (incl. same-version preflight
+  and downgrade-regression preflight tests).
+- test-signing-mode.sh: PASS=18 FAIL=0 (after deterministic fixture + .sig
+  preflight skip).
+- test-signing.sh: PASS=37 FAIL=0.
+- Full suite `run-tests.sh` (RUN_PROD_SCENARIOS=1): **overall PASS=36
+  FAIL=0** (rc=0); host lib 6/0/1skip, content-aware 30, build-cache 20,
+  rustc 10, epoch 8, matrix 85, http500-prod 49, signing 37, signing-mode
+  18, verify-remote 14, container 34.
+- Static gates: `bash -n` all scripts, YAML safe_load, actionlint,
+  `git diff --check` — all exit 0.
+
+Remaining limitations unchanged: builddate embedded by makepkg (full byte
+reproducibility not claimed); same-version gate requires pkgrel bump or
+explicit override for any future same-version byte drift.
+
+## H9. VCS version regression review (pre-deployment)
+
+The 20-package preflight flagged two VCS packages whose *committed*
+`pkgver=` placeholders appeared lower than the published versions. Full
+investigation (vercmp + upstream ancestry + pkgver() resolution):
+
+| Package | committed pkgver | pkgver() resolved | published | verdict |
+|---|---|---|---|---|
+| anpan-git | 0.4.0.r6.g88dd31e | **1.0.3.r1.g55609cd** | 1.0.3.r1.g55609cd-1 | no regression — resolved == published |
+| catppuccin-obs-theme-git | r21.d90002a | **r35.054a297** | r35.054a297-1 | no regression — resolved == published |
+
+- `vercmp 1.0.3.r1.g55609cd-1 0.4.0.r6.g88dd31e-1` → 1 (only the stale
+  placeholder is lower; the resolved VCS version is unchanged).
+- Upstream ancestry verified: anpan HEAD = `55609cd`, obs HEAD =
+  `054a297` (35 commits) — both identical to the published builds.
+- The committed `pkgver=` lines are AUR-sync placeholders; `pkgver()`
+  rewrites them during makepkg's prepass. The pipeline fingerprints the
+  **post-prepass** PKGBUILD, matching the stored production fingerprints
+  exactly (`16d9ba3c…`, `ab2c1611…`) → cache HIT, no rebuild.
+- The earlier "mismatch" was an audit-probe artifact (it hashed the
+  pre-prepass file), not a pipeline defect. No PKGBUILD correction is
+  required or made.
+
+### Downgrade-prevention preflight (new)
+
+`publish-prod.sh` preflight additionally detects genuine version
+regressions: for each local package it compares the resolved version
+against the published database version via pacman `vercmp`; if local <
+published, the run aborts before any mutation (e.g. an upstream history
+rewrite or tag deletion lowering a VCS package's version). Tested: a
+local `testa-1.0` against published `testa-2.0` aborts with the release
+untouched.
+
+## H10. BeautyLine symlink semantic review
+
+All 24 repaired links reviewed. 23 are semantically faithful (each maps
+to the same icon subject: projects-folder, wireless-network, zoom,
+transform/scale, dosbox app). The single flagged case
+`text-vnd.kde.kcrash-report.svg` (original target: a KDE Breeze mimetype
+icon absent from the source) is mapped to `text-plain.svg`, which
+resolves to the package's `text-x-generic.svg` — the canonical generic
+text-document icon in the Freedesktop mimetype fallback chain. This is a
+documented semantic substitution (the closest available generic text
+icon), not an arbitrary same-basename match.

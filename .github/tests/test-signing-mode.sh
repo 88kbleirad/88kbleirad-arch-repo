@@ -81,7 +81,12 @@ size = 8
 arch = x86_64
 license = MIT
 PKG
-  ( cd "$dir" && tar --zstd -cf "$out/$name-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+  # deterministic mtimes so a re-publish of the same package is byte-identical
+  # (otherwise the same-version drift gate would spuriously abort)
+  touch -t 202001010000.00 "$dir/.PKGINFO" "$dir/usr" "$dir/usr/share" "$dir/usr/share/$name"
+  ( cd "$dir" && find . -mindepth 1 \( -type f -o -type d \) | sort \
+      | sed 's|^\./||' \
+      | tar --zstd --mtime='@1' -cf "$out/$name-1.0-1-x86_64.pkg.tar.zst" -T - )
   printf '{"package": "%s", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' "$name" \
     > "$out/v4-$name.meta.json"
 }
