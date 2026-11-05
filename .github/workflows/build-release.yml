@@ -298,8 +298,17 @@ jobs:
   # release is not HEALTHY for the expected inventory (derived from the
   # prepare matrix, never hardcoded).
   health-check:
-    needs: [publish, publish-signed]
-    if: ${{ ! inputs.dry-run }}
+    needs: [prepare, publish, publish-signed]
+    if: >-
+      ${{
+        always() &&
+        !inputs.dry-run &&
+        needs.prepare.result == 'success' &&
+        (
+          (inputs.signing-mode == 'unsigned' && needs.publish.result == 'success') ||
+          (inputs.signing-mode == 'signed' && needs.publish-signed.result == 'success')
+        )
+      }}
     uses: ./.github/workflows/repo-health.yml
     with:
       release-tag: repository
