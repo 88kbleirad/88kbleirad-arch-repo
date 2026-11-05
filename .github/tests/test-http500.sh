@@ -498,8 +498,66 @@ grep -q 'upload ' "$WORKDIR/idem2.events" \
   && bad "second run uploaded assets" || ok "second run uploaded nothing"
 grep -q 'delete-asset' "$WORKDIR/idem2.events" \
   && bad "second run deleted assets" || ok "second run deleted nothing"
+# a replacement is a delete followed by an upload of the same asset;
+# require zero of either on a byte-identical repeat
+if grep -qE 'upload |delete-asset ' "$WORKDIR/idem2.events"; then
+  bad "second run mutated assets: $(cat "$WORKDIR/idem2.events")"
+else
+  ok "second run produced zero asset mutations"
+fi
 grep -q "Remote verification passed" "$WORKDIR/idem2.log" \
   && ok "second run remote verification passed" || bad "remote verification missing on second run"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: built-status metadata is preserved (no replacement on repeat)"
+# Mirrors the beautyline incident: the release carries a meta with
+# status=built (and a fixed built_at); the local cache-hit output carries
+# the byte-identical meta. Publishing must classify it UNCHANGED — zero
+# uploads/replacements/deletions — while keeping the archived meta intact.
+W8b="$WORKDIR/release-meta-stable"
+rm -rf "$W8b"; mkdir -p "$W8b"; touch "$W8b/.created"; : > "$W8b/.ids"
+seed_rel_archive testa "$W8b"
+# seed the repository database so the publish runs in normal db mode
+( cd "$W8b" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+# force the remote meta to status=built with a fixed built_at (like a
+# real first build publish)
+cat > "$W8b/v4-testa.meta.json" <<'META'
+{
+  "package": "testa",
+  "profile": "x86-64-v4",
+  "status": "built",
+  "fingerprint": "abc",
+  "built_at": "2026-11-05T14:43:35Z"
+}
+META
+# local output: byte-identical archives + meta (the cache-hit output)
+rm -rf "$WORKDIR/meta-stable-out"; mkdir -p "$WORKDIR/meta-stable-out"
+cp "$W8b/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/meta-stable-out/"
+cp "$W8b/v4-testa.meta.json" "$WORKDIR/meta-stable-out/"
+before_meta=$(sha256sum "$W8b/v4-testa.meta.json" | awk '{print $1}')
+rc=$(run_prod meta-stable "$W8b" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/meta-stable-out")
+after_meta=$(sha256sum "$W8b/v4-testa.meta.json" | awk '{print $1}')
+if [[ "$rc" -eq 0 ]]; then
+  ok "publish succeeds with built-status meta"
+else
+  bad "publish failed (rc=$rc): $(tail -4 "$WORKDIR/meta-stable.log")"
+fi
+if grep -q "SUMMARY unchanged=" "$WORKDIR/meta-stable.log" \
+    && grep -q "unchanged=.* uploaded=0 replaced=0 failed=0" "$WORKDIR/meta-stable.log"; then
+  ok "zero uploads/replacements/failures on built-status meta repeat"
+else
+  bad "summary not zero-mutation: $(grep -E 'SUMMARY' "$WORKDIR/meta-stable.log")"
+fi
+if [[ "$before_meta" == "$after_meta" ]]; then
+  ok "remote built-status meta byte-identical after repeat"
+else
+  bad "remote meta replaced on repeat"
+fi
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/meta-stable.events"; then
+  bad "remote mutation despite identical meta: $(cat "$WORKDIR/meta-stable.events")"
+else
+  ok "no remote mutation on built-status meta repeat"
+fi
 
 # ---------------------------------------------------------------------------
 note "publish-prod: expansion to 12 packages succeeds (mixed new + unchanged)"

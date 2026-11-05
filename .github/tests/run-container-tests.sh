@@ -231,6 +231,24 @@ if [[ -f "$WORKDIR/snap-cache/hello-v4test-1.0-1-any.pkg.tar.zst" ]]; then
 else
   bad "cached binary not present"
 fi
+# The release was seeded from the FIRST BUILD's meta (status=built). A
+# cache hit must preserve that metadata byte-for-byte — status stays
+# "built", built_at stays the original build timestamp. Regenerating it
+# would flip status to "skipped" and stamp a fresh built_at, rewriting
+# the released meta on every repeat (the beautyline non-idempotency).
+if cmp -s "$WORKDIR/snap-build/v4-hello-v4test.meta.json" \
+     "$WORKDIR/snap-cache/v4-hello-v4test.meta.json"; then
+  ok "first-build metadata preserved byte-identical on cache hit"
+else
+  bad "cache hit rewrote first-build metadata:"
+  diff "$WORKDIR/snap-build/v4-hello-v4test.meta.json" \
+       "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" || true
+fi
+if jq -e '.status == "built"' "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" >/dev/null 2>&1; then
+  ok "persistent status remains built after cache hit"
+else
+  bad "persistent status changed after cache hit"
+fi
 
 # ---------------------------------------------------------------------------
 note "cache hit metadata is deterministic across repeated identical runs"
@@ -254,6 +272,14 @@ if [[ -f "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" && -f "$WORKDIR/snap-ca
     bad "cache-hit metadata changed across identical runs:"
     diff "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" \
          "$WORKDIR/snap-cache2/v4-hello-v4test.meta.json" || true
+  fi
+  # consecutive cache hits: built_at must be stable (no fresh timestamp)
+  ba1=$(jq -r '.built_at' "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" 2>/dev/null)
+  ba2=$(jq -r '.built_at' "$WORKDIR/snap-cache2/v4-hello-v4test.meta.json" 2>/dev/null)
+  if [[ -n "$ba1" && "$ba1" == "$ba2" ]]; then
+    ok "built_at stable across consecutive cache hits"
+  else
+    bad "built_at regenerated on cache hit: $ba1 vs $ba2"
   fi
 else
   bad "meta snapshots missing for determinism check"
@@ -587,6 +613,161 @@ if [[ -n "$FP_SKIP2_MOD" && "$FP_SKIP2_MOD" != "$FP_SKIP2" ]]; then
   ok "meaningful source change invalidates fingerprint"
 else
   bad "fingerprint did not change on source change: $FP_SKIP2_MOD"
+fi
+
+# ---------------------------------------------------------------------------
+note "genuine version upgrade: package and metadata update correctly"
+# A committed pkgver bump (source change) must NOT be masked by the meta
+# reuse logic: the fingerprint changes, the build must happen, and both
+# the archive and its metadata must carry the new version. Uses one
+# consistent package identity (hello-skip2): first a pristine v1.0 build,
+# release seeded from it, then an in-place v2.0 upgrade.
+# recreate pristine v1.0 state
+rm -rf "$WS/hello-skip2"; mkdir -p "$WS/hello-skip2"
+rm -rf "$WS/src-tarball/hello-skip2-1.0"; mkdir -p "$WS/src-tarball/hello-skip2-1.0/usr/share"
+printf 'skip-source\n' > "$WS/src-tarball/hello-skip2-1.0/usr/share/hello-skip2-data"
+( cd "$WS/src-tarball" && tar -czf "$WS/hello-skip2-1.0.tar.gz" hello-skip2-1.0 )
+cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
+pkgname=hello-skip2
+pkgver=1.0
+pkgrel=1
+pkgdesc="second SKIP package"
+arch=('any')
+url="https://example.com"
+license=('MIT')
+depends=()
+source=("hello-skip2-1.0.tar.gz")
+sha256sums=('SKIP')
+package() {
+  install -Dm644 /dev/null "$pkgdir/usr/share/hello-skip2"
+}
+PB
+ln -sf "$WS/hello-skip2-1.0.tar.gz" "$WS/hello-skip2/hello-skip2-1.0.tar.gz"
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+
+# baseline v1.0 build
+rc=$(run_build upbase hello-skip2)
+if [[ "$rc" -eq 0 ]]; then
+  ok "baseline v1.0 build exit 0"
+else
+  bad "baseline build failed (rc=$rc): $(tail -5 "$WORKDIR/upbase.log")"
+fi
+BASE_FP=$(jq -r '.fingerprint // empty' "$WORKDIR/snap-upbase/v4-hello-skip2.meta.json" 2>/dev/null || true)
+
+# seed the release with the v1.0 baseline
+rm -rf "$WS/fake-release"; mkdir -p "$WS/fake-release"
+cp "$WORKDIR/snap-upbase/hello-skip2-1.0-1-any.pkg.tar.zst" "$WS/fake-release/"
+cp "$WORKDIR/snap-upbase/v4-hello-skip2.meta.json" "$WS/fake-release/"
+docker exec -e WS="$WS" "$CID" bash -c "
+  set -euo pipefail
+  cd /tmp && rm -rf dbbuild-up && mkdir dbbuild-up && cd dbbuild-up
+  cp \"\$WS/.snap/upbase\"/hello-skip2-1.0-1-any.pkg.tar.zst .
+  repo-add 88kbleirad.db.tar.gz hello-skip2-1.0-1-any.pkg.tar.zst >/dev/null 2>&1
+  cp 88kbleirad.db.tar.gz 88kbleirad.files.tar.gz \"\$WS/fake-release/\"
+"
+
+# upgrade in place to v2.0 (same package identity)
+rm -rf "$WS/src-tarball-up/hello-skip2-2.0"; mkdir -p "$WS/src-tarball-up/hello-skip2-2.0/usr/share"
+printf 'skip-upgrade\n' > "$WS/src-tarball-up/hello-skip2-2.0/usr/share/hello-skip2-data"
+( cd "$WS/src-tarball-up" && tar -czf "$WS/hello-skip2-2.0.tar.gz" hello-skip2-2.0 )
+cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
+pkgname=hello-skip2
+pkgver=2.0
+pkgrel=1
+pkgdesc="upgraded hello-skip2"
+arch=('any')
+url="https://example.com"
+license=('MIT')
+depends=()
+source=("hello-skip2-2.0.tar.gz")
+sha256sums=('SKIP')
+package() {
+  install -Dm644 /dev/null "$pkgdir/usr/share/hello-skip2"
+}
+PB
+ln -sf "$WS/hello-skip2-2.0.tar.gz" "$WS/hello-skip2/hello-skip2-2.0.tar.gz"
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+
+rc=$(run_build upgradeb hello-skip2)
+if [[ "$rc" -eq 0 ]]; then
+  ok "upgrade build exit 0"
+else
+  bad "upgrade build failed (rc=$rc): $(tail -5 "$WORKDIR/upgradeb.log")"
+fi
+if [[ -f "$WORKDIR/snap-upgradeb/hello-skip2-2.0-1-any.pkg.tar.zst" ]]; then
+  ok "new version archive produced"
+else
+  bad "new version archive missing: $(ls "$WORKDIR/snap-upgradeb" | tr '\n' ' ')"
+fi
+UP_FP=$(jq -r '.fingerprint // empty' "$WORKDIR/snap-upgradeb/v4-hello-skip2.meta.json" 2>/dev/null || true)
+if [[ -n "$UP_FP" && "$UP_FP" != "$BASE_FP" ]]; then
+  ok "upgrade metadata carries new fingerprint"
+else
+  bad "upgrade fingerprint not updated: $UP_FP"
+fi
+if grep -q "PKGBUILD/compiler fingerprint changed" "$WORKDIR/upgradeb.log"; then
+  ok "cache invalidated on version upgrade"
+else
+  bad "fingerprint change not reported on upgrade"
+fi
+
+# restore pristine v1.0 state for the directory
+rm -rf "$WS/hello-skip2"; mkdir -p "$WS/hello-skip2"
+cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
+pkgname=hello-skip2
+pkgver=1.0
+pkgrel=1
+pkgdesc="second SKIP package"
+arch=('any')
+url="https://example.com"
+license=('MIT')
+depends=()
+source=("hello-skip2-1.0.tar.gz")
+sha256sums=('SKIP')
+package() {
+  install -Dm644 /dev/null "$pkgdir/usr/share/hello-skip2"
+}
+PB
+ln -sf "$WS/hello-skip2-1.0.tar.gz" "$WS/hello-skip2/hello-skip2-1.0.tar.gz"
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+
+# ---------------------------------------------------------------------------
+note "corrupted remote metadata: fail closed (rebuild, never blind reuse)"
+# A release whose v4 meta is corrupt (invalid JSON) must NOT be reused:
+# the cache gate sees an unresolvable prev fingerprint and forces a
+# rebuild rather than trusting bad metadata.
+rm -rf "$WS/fake-release"; mkdir -p "$WS/fake-release"
+cp "$WORKDIR/snap-skipb/hello-skip-1.0-1-any.pkg.tar.zst" "$WS/fake-release/"
+printf 'not-json{{{' > "$WS/fake-release/v4-hello-skip.meta.json"
+docker exec -e WS="$WS" "$CID" bash -c "
+  set -euo pipefail
+  cd /tmp && rm -rf dbbuild-corrupt && mkdir dbbuild-corrupt && cd dbbuild-corrupt
+  cp \"\$WS/.snap/skipb\"/hello-skip-1.0-1-any.pkg.tar.zst .
+  repo-add 88kbleirad.db.tar.gz hello-skip-1.0-1-any.pkg.tar.zst >/dev/null 2>&1
+  cp 88kbleirad.db.tar.gz 88kbleirad.files.tar.gz \"\$WS/fake-release/\"
+"
+rc=$(run_build corruptb hello-skip)
+if [[ "$rc" -eq 0 ]]; then
+  ok "corrupt-meta run exit 0 (rebuilt)"
+else
+  bad "corrupt-meta run failed (rc=$rc): $(tail -5 "$WORKDIR/corruptb.log")"
+fi
+if grep -q "is not reusable\|PKGBUILD/compiler fingerprint changed\|forcing rebuild" "$WORKDIR/corruptb.log"; then
+  ok "corrupt remote meta forced rebuild (fail closed)"
+else
+  bad "corrupt remote meta did not force rebuild: $(tail -5 "$WORKDIR/corruptb.log")"
+fi
+# the corrupted meta must NOT be reused verbatim
+if [[ -f "$WORKDIR/snap-corruptb/v4-hello-skip.meta.json" ]] \
+    && jq -e . "$WORKDIR/snap-corruptb/v4-hello-skip.meta.json" >/dev/null 2>&1; then
+  ok "corrupt meta replaced with valid regenerated metadata"
+else
+  bad "corrupt meta not regenerated to valid JSON"
+fi
+if [[ -f "$WORKDIR/snap-corruptb/status-built-hello-skip.txt" ]]; then
+  ok "corrupt-meta rebuild produced status-built"
+else
+  bad "corrupt-meta rebuild status missing"
 fi
 
 # ---------------------------------------------------------------------------

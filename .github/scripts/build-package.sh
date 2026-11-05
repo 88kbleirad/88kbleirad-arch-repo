@@ -381,23 +381,31 @@ if [[ "$NEEDS_BUILD" == "false" ]]; then
   done
   if [[ "$CACHE_OK" == "true" ]]; then
     echo "$PKG" > "$WORKSPACE/output/status-skipped-$PKG.txt"
-    # Deterministic metadata on a cache hit: the content is byte-identical
-    # to the previously published meta (same profile/status/fingerprint),
-    # so reuse the previous built_at instead of stamping a fresh timestamp.
-    # This keeps serialization deterministic and makes repeated identical
-    # runs produce no asset mutations. built_at is informational and has no
-    # functional consumers.
-    prev_built_at=""
+    # Deterministic metadata on a cache hit: when the previously published
+    # metadata verifies against this reuse (same package, profile, status
+    # and fingerprint) the meta is byte-for-byte identical, so reuse the
+    # previous meta VERBATIM instead of regenerating it. Regenerating
+    # would stamp a fresh built_at (and flip a "built" status to
+    # "skipped"), rewriting the released meta asset on every repeated run
+    # — the observed non-idempotent replacement of v4-beautyline.meta.json.
+    # The cache-hit gate above has already verified prev_fp ==
+    # FINGERPRINT and prev_profile == BUILD_PROFILE; additionally require
+    # the previous meta to be well-formed and name this package.
+    META_REUSED=false
     if [[ -n "$PREV_META" && -f "$PREV_META" ]]; then
+      prev_pkg=$(jq -r '.package // empty' "$PREV_META" 2>/dev/null)
       prev_status=$(jq -r '.status // empty' "$PREV_META" 2>/dev/null)
       prev_fp=$(jq -r '.fingerprint // empty' "$PREV_META" 2>/dev/null)
-      if [[ "$prev_status" == "skipped" && "$prev_fp" == "$FINGERPRINT" ]]; then
-        prev_built_at=$(jq -r '.built_at // empty' "$PREV_META" 2>/dev/null)
+      prev_profile=$(jq -r '.profile // empty' "$PREV_META" 2>/dev/null)
+      if [[ "$prev_pkg" == "$PKG" ]] \
+          && { [[ "$prev_status" == "built" || "$prev_status" == "skipped" ]]; } \
+          && [[ "$prev_fp" == "$FINGERPRINT" ]] \
+          && [[ "$prev_profile" == "$BUILD_PROFILE" ]]; then
+        cp "$PREV_META" "$WORKSPACE/output/$META_FILE"
+        META_REUSED=true
       fi
     fi
-    if [[ -n "$prev_built_at" ]]; then
-      write_meta skipped "$FINGERPRINT" "" "$prev_built_at"
-    else
+    if [[ "$META_REUSED" != "true" ]]; then
       write_meta skipped "$FINGERPRINT"
     fi
     say "cache hit: $PKG"
