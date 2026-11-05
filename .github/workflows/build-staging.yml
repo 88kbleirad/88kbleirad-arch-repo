@@ -146,7 +146,7 @@ jobs:
   # Phase 4.1/4.5: post-publication health gate for the signed staging
   # release (read-only).
   health-check:
-    needs: publish
+    needs: [prepare, publish]
     uses: ./.github/workflows/repo-health.yml
     with:
       release-tag: repository-v4-test
