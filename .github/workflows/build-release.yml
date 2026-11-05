@@ -81,7 +81,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       missing: ${{ steps.set-matrix.outputs.missing }}
@@ -118,7 +118,7 @@ jobs:
 
   build:
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -154,7 +154,7 @@ jobs:
   # verification.
   cache-verify:
     needs: [prepare, build]
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -205,7 +205,7 @@ jobs:
   publish:
     needs: [prepare, build, cache-verify]
     if: ${{ inputs.signing-mode != 'signed' }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
     steps:
@@ -237,7 +237,7 @@ jobs:
   publish-signed:
     needs: [prepare, build, cache-verify]
     if: ${{ inputs.signing-mode == 'signed' }}
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: package-signing
     permissions:
       contents: write
