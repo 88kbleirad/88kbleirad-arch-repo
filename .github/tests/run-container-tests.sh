@@ -30,6 +30,7 @@ WS="$WORKDIR/ws"
 mkdir -p "$WS/.github/scripts" "$WS/hello-v4test" "$WS/output" "$WS/fake-release"
 
 cp "$REPO_ROOT/.github/scripts/build-package.sh" "$WS/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/pkg-filename-lib.sh" "$WS/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/audit-package-isa.sh" "$WS/.github/scripts/"
 cp "$REPO_ROOT/.github/tests/mock-gh.sh" "$WS/.github/scripts/mock-gh.sh"
 
@@ -115,18 +116,18 @@ chown -R builder:builder "$WS"
 EOS
 
 run_build() {
-  # usage: run_build <stage>
+  # usage: run_build <stage> [pkg]
   # each stage runs in the shared workspace with a fresh output/ dir;
   # the result is snapshotted to $WORKDIR/snap-<stage> for assertions
-  local stage="$1"
-  docker exec "$CID" bash -c "rm -rf '$WS/output'; mkdir -p '$WS/output'; rm -f '$WS/hello-v4test'/*.pkg.tar.zst"
+  local stage="$1" pkg="${2:-hello-v4test}"
+  docker exec "$CID" bash -c "rm -rf '$WS/output'; mkdir -p '$WS/output'; rm -f '$WS/$pkg'/*.pkg.tar.zst"
   docker exec \
     -e GH_TOKEN=dummy \
     -e GITHUB_REPOSITORY=owner/repo \
     -e RELEASE_TAG=repository-v4-test \
     -e REPO_DB_NAME=88kbleirad \
     -e BUILD_PROFILE=x86-64-v4 \
-    -e PKG=hello-v4test \
+    -e PKG="$pkg" \
     -e GITHUB_WORKSPACE="$WS" \
     -e GITHUB_STEP_SUMMARY="$WS/summary-$stage.md" \
     -e FAKE_RELEASE_DIR="$WS/fake-release" \
@@ -351,6 +352,92 @@ if ls "$WS/metatest/output/brokepkg"-*.pkg.tar.zst >/dev/null 2>&1; then
   bad "unexpected archive present in metadata-only output"
 else
   ok "metadata-only output has no package archive"
+fi
+
+# ---------------------------------------------------------------------------
+note "epoch package: real build validates + cache hit round-trips"
+# The epoch handling must be generic (no per-package special case). A
+# trivial package with epoch=2 + legacy .PKGINFO fields exercises the
+# whole path: makepkg produces `hello-epoch-2:1.0-1-any...`; the pipeline
+# must canonicalize to `hello-epoch-2.1.0-1-any...`, validate it, publish
+# it under the canonical name, and reuse it on the next run.
+mkdir -p "$WS/hello-epoch"
+cat > "$WS/hello-epoch/PKGBUILD" <<'PB'
+pkgname=hello-epoch
+epoch=2
+pkgver=1.0
+pkgrel=1
+pkgdesc="epoch regression package"
+arch=('any')
+license=('MIT')
+source=()
+sha256sums=()
+package() {
+  install -Dm644 /dev/null "$pkgdir/usr/share/hello-epoch"
+}
+PB
+
+rc=$(run_build epochb hello-epoch)
+if [[ "$rc" -eq 0 ]]; then
+  ok "epoch build exit 0"
+else
+  bad "epoch build failed (rc=$rc): $(tail -8 "$WORKDIR/epochb.log")"
+fi
+if [[ -f "$WORKDIR/snap-epochb/status-built-hello-epoch.txt" ]]; then
+  ok "epoch status-built written"
+else
+  bad "epoch status-built missing"
+fi
+if [[ -f "$WORKDIR/snap-epochb/hello-epoch-2.1.0-1-any.pkg.tar.zst" ]]; then
+  ok "epoch archive stored under canonical (epoch-safe) name"
+else
+  bad "epoch archive name wrong: $(ls "$WORKDIR/snap-epochb" | tr '\n' ' ')"
+fi
+# the stored archive must be a real package (not metadata-only)
+if tar --zstd -xOf "$WORKDIR/snap-epochb/hello-epoch-2.1.0-1-any.pkg.tar.zst" .PKGINFO 2>/dev/null | grep -q '^pkgver = 2:1.0-1$'; then
+  ok "stored archive carries epoch-qualified .PKGINFO"
+else
+  bad "stored archive PKGINFO wrong"
+fi
+if grep -q "cache hit" "$WORKDIR/epochb.log" || [[ -f "$WORKDIR/snap-epochb/status-skipped-hello-epoch.txt" ]]; then
+  bad "epoch first build should not be a cache hit"
+else
+  ok "epoch first build is a fresh build"
+fi
+
+# seed the fake release from the epoch build (db + meta + archive)
+rm -rf "$WS/fake-release"; mkdir -p "$WS/fake-release"
+cp "$WORKDIR/snap-epochb"/hello-epoch-2.1.0-1-any.pkg.tar.zst "$WS/fake-release/"
+cp "$WORKDIR/snap-epochb/v4-hello-epoch.meta.json" "$WS/fake-release/"
+docker exec -e WS="$WS" "$CID" bash -c "
+  set -euo pipefail
+  cd /tmp && rm -rf dbbuild2 && mkdir dbbuild2 && cd dbbuild2
+  cp \"\$WS/.snap/epochb\"/hello-epoch-2.1.0-1-any.pkg.tar.zst .
+  repo-add 88kbleirad.db.tar.gz hello-epoch-2.1.0-1-any.pkg.tar.zst >/dev/null 2>&1
+  cp 88kbleirad.db.tar.gz 88kbleirad.files.tar.gz \"\$WS/fake-release/\"
+"
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
+
+rc=$(run_build epochc hello-epoch)
+if [[ "$rc" -eq 0 ]]; then
+  ok "epoch cache run exit 0"
+else
+  bad "epoch cache run failed (rc=$rc): $(tail -8 "$WORKDIR/epochc.log")"
+fi
+if grep -q "package is up to date" "$WORKDIR/epochc.log"; then
+  ok "epoch cache hit detected"
+else
+  bad "epoch cache hit not detected: $(grep -E 'cache|reuse|built|up to date' "$WORKDIR/epochc.log" | head -3)"
+fi
+if [[ -f "$WORKDIR/snap-epochc/status-skipped-hello-epoch.txt" ]]; then
+  ok "epoch status-skipped written"
+else
+  bad "epoch status-skipped missing"
+fi
+if [[ -f "$WORKDIR/snap-epochc/hello-epoch-2.1.0-1-any.pkg.tar.zst" ]]; then
+  ok "epoch cached binary reused under canonical name"
+else
+  bad "epoch cached binary missing"
 fi
 
 # ---------------------------------------------------------------------------

@@ -78,33 +78,6 @@ done < <(gh_api_retry "list assets (${TAG})" \
 
 echo "Assets found: ${#REMOTE_NAME_TO_ID[@]}"
 
-# -- required package archives -------------------------------------------------
-pkg_available=0
-pkg_validated=0
-for name in "${expected_names[@]}"; do
-  # find the released archive for this package (filename is name-version-arch)
-  found=""
-  for rn in "${!REMOTE_NAME_TO_ID[@]}"; do
-    if [[ "$rn" == "$name"-*.pkg.tar.zst ]]; then
-      found="$rn"
-      break
-    fi
-  done
-  if [[ -z "$found" ]]; then
-    fail "missing package archive: $name"
-  else
-    pkg_available=$(( pkg_available + 1 ))
-    # download + structural validation
-    if gh_download_asset_retry "$TAG" "$REPO" "$found" "$(mktemp -d)"; then
-      pkg_validated=$(( pkg_validated + 1 ))
-    else
-      fail "cannot download package archive: $found"
-    fi
-  fi
-done
-echo "Packages available: $pkg_available"
-echo "Packages validated: $pkg_validated"
-
 # -- architecture metadata -----------------------------------------------------
 meta_validated=0
 for name in "${expected_names[@]}"; do
@@ -147,27 +120,59 @@ fi
 
 # -- compare inventory against expected --------------------------------------------
 declare -A DB_NAMES=()
+declare -A DB_BASES=()
 declare -A DB_FILENAMES=()
 for desc in "$VERIFY_DIR/db"/*/desc; do
   [[ -f "$desc" ]] || continue
   dn=$(awk '/^%NAME%/{getline; print}' "$desc")
+  dbase=$(awk '/^%BASE%/{getline; print}' "$desc")
   dfn=$(awk '/^%FILENAME%/{getline; print}' "$desc")
   [[ -n "$dn" ]] && DB_NAMES["$dn"]=1
+  [[ -n "$dbase" ]] && DB_BASES["$dbase"]=1
   [[ -n "$dfn" ]] && DB_FILENAMES["$dfn"]=1
 done
 
 for name in "${expected_names[@]}"; do
-  if [[ -z "${DB_NAMES[$name]:-}" ]]; then
+  # split packages: the matrix entry is the base name; accept a match by
+  # package name OR base in the remote database.
+  if [[ -z "${DB_NAMES[$name]:-}" && -z "${DB_BASES[$name]:-}" ]]; then
     fail "expected package not present in remote database: $name"
   fi
 done
 
-# -- database references only available package assets ------------------------------
+# Every package the database references must exist as a release asset.
+# For split packages the archive filename starts with the SUBPACKAGE name
+# (e.g. base=splitbase -> sublib-1.0-1-x86_64.pkg.tar.zst), so the
+# expected-inventory prefix match is insufficient by design; using the
+# database's own %FILENAME% list is the exact, base-agnostic source of
+# truth for the required archives.
 for fn in "${!DB_FILENAMES[@]}"; do
   if [[ -z "${REMOTE_NAME_TO_ID[$fn]:-}" ]]; then
     fail "database references missing release asset: $fn"
   fi
 done
+
+# -- required package archives (from the database filenames) -----------------
+pkg_needed=()
+for fn in "${!DB_FILENAMES[@]}"; do
+  [[ "$fn" == *.pkg.tar.zst ]] && pkg_needed+=("$fn")
+done
+pkg_available=0
+pkg_validated=0
+for fn in "${pkg_needed[@]}"; do
+  if [[ -z "${REMOTE_NAME_TO_ID[$fn]:-}" ]]; then
+    fail "missing package archive: $fn"
+    continue
+  fi
+  pkg_available=$(( pkg_available + 1 ))
+  if gh_download_asset_retry "$TAG" "$REPO" "$fn" "$(mktemp -d)"; then
+    pkg_validated=$(( pkg_validated + 1 ))
+  else
+    fail "cannot download package archive: $fn"
+  fi
+done
+echo "Packages available: $pkg_available"
+echo "Packages validated: $pkg_validated"
 
 # -- plain aliases correspond to canonical compressed counterparts ----------------
 if [[ -f "$VERIFY_DIR/${REPO_DB_NAME}.db.tar.gz" ]]; then

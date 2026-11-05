@@ -236,6 +236,48 @@ grep -q 'create repository' "$WORKDIR/miss8.events" && bad "release was created 
 grep -q 'upload ' "$WORKDIR/miss8.events" && bad "assets uploaded despite inventory failure" || ok "no uploads on inventory failure"
 
 # ---------------------------------------------------------------------------
+note "publish-prod: split package base matches inventory by %BASE%"
+# A split package's base may differ from every subpackage name (e.g.
+# fcitx5-lotus-git -> fcitx5-lotus-git/openrc/runit subpackages share
+# the base but the *primary* subpackage name equals the base; here we
+# simulate the stricter case: base=splitbase, subpackage name=sublib).
+R="$WORKDIR/release-split"
+rm -rf "$R"; mkdir -p "$R"; touch "$R/.created"; : > "$R/.ids"
+mkdir -p "$WORKDIR/pkgbuild/sublib/usr/lib"; printf 'x\n' > "$WORKDIR/pkgbuild/sublib/usr/lib/sublib.so"
+cat > "$WORKDIR/pkgbuild/sublib/.PKGINFO" <<'PKG'
+pkgname = sublib
+pkgbase = splitbase
+pkgver = 1.0-1
+pkgdesc = fixture
+url = https://example.com
+builddate = 1
+packager = 88kbleirad <88kbleirad@users.noreply.github.com>
+size = 8
+arch = x86_64
+license = MIT
+PKG
+( cd "$WORKDIR/pkgbuild/sublib" && tar --zstd -cf "$R/sublib-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+printf '{"package": "splitbase", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' > "$R/v4-splitbase.meta.json"
+( cd "$R" && repo-add 88kbleirad.db.tar.gz sublib-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+# seed the run's output/ with the fresh subpackage archive + meta
+SPLIT_OUT="$WORKDIR/split-out"
+rm -rf "$SPLIT_OUT"; mkdir -p "$SPLIT_OUT"
+cp "$R/sublib-1.0-1-x86_64.pkg.tar.zst" "$SPLIT_OUT/"
+cp "$R/v4-splitbase.meta.json" "$SPLIT_OUT/"
+rc=$(run_prod splitok "$R" '["splitbase"]' WS_FIXTURES_DIR="$SPLIT_OUT")
+if [[ "$rc" -eq 0 ]]; then
+  ok "split base accepted via %BASE% match"
+else
+  bad "split base rejected (rc=$rc): $(tail -4 "$WORKDIR/splitok.log")"
+fi
+rc=$(run_prod splitmiss "$R" '["splitbase","otherbase"]' WS_FIXTURES_DIR="$SPLIT_OUT")
+if [[ "$rc" -ne 0 ]] && grep -q "Expected package.*otherbase" "$WORKDIR/splitmiss.log"; then
+  ok "missing split base still fails inventory"
+else
+  bad "split inventory miss not detected (rc=$rc)"
+fi
+
+# ---------------------------------------------------------------------------
 note "publish-prod: metadata-only artifact not accepted as a package"
 # only metadata (no archive) for a requested package -> must fail before any
 # mutation (the archive count gate trips first: "No package files produced")

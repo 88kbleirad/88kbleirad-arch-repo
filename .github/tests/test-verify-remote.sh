@@ -201,6 +201,38 @@ set -e
 [[ $VERIFY_RC -eq 0 ]] && ok "transient download failure retried to success" || bad "transient download failure rc=$VERIFY_RC"
 
 # ---------------------------------------------------------------------------
+note "remote verify: split package (base != subpackage name) passes"
+# The expected inventory names the base (splitbase); the database contains
+# the subpackage (sublib). The required-archive set is derived from the
+# database filenames, not from a prefix guess on the expected name.
+SPLIT_REL="$WORKDIR/release-split"
+mkdir -p "$SPLIT_REL"; touch "$SPLIT_REL/.created"; : > "$SPLIT_REL/.ids"
+d="$WORKDIR/pkgbuild/sublib"; mkdir -p "$d/usr/lib"; printf 'x\n' > "$d/usr/lib/sublib.so"
+cat > "$d/.PKGINFO" <<'PKG'
+pkgname = sublib
+pkgbase = splitbase
+pkgver = 1.0-1
+pkgdesc = fixture
+url = https://example.com
+builddate = 1
+packager = 88kbleirad <88kbleirad@users.noreply.github.com>
+size = 8
+arch = x86_64
+license = MIT
+PKG
+( cd "$d" && tar --zstd -cf "$SPLIT_REL/sublib-1.0-1-x86_64.pkg.tar.zst" .PKGINFO usr )
+printf '{"package": "splitbase", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$SPLIT_REL/v4-splitbase.meta.json"
+( cd "$SPLIT_REL" && repo-add 88kbleirad.db.tar.gz sublib-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+EXPECTED='["splitbase"]'
+run_verify "$SPLIT_REL" --signing-mode unsigned
+if [[ $VERIFY_RC -eq 0 ]] && grep -q "Packages available: 1" "$WORKDIR/verify.log"; then
+  ok "split base verified via database filenames"
+else
+  bad "split base verification failed (rc=$VERIFY_RC): $(tail -5 "$WORKDIR/verify.log")"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

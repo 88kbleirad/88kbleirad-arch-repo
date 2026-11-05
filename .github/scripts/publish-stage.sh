@@ -219,15 +219,21 @@ if [[ -n "${EXPECTED_PACKAGES:-}" ]]; then
   rm -rf .inv-db; mkdir -p .inv-db
   bsdtar -xf "${REPO_DB_NAME}.db.tar.gz" -C .inv-db
   db_pkg_names=()
+  db_pkg_bases=()
   for desc in .inv-db/*/desc; do
     [[ -f "$desc" ]] || continue
     db_pkg_names+=("$(awk '/^%NAME%/{getline; print}' "$desc")")
+    base=$(awk '/^%BASE%/{getline; print}' "$desc")
+    [[ -n "$base" ]] && db_pkg_bases+=("$base")
   done
   rm -rf .inv-db
 
   missing_count=0
   for name in "${expected_names[@]}"; do
-    if ! printf '%s\n' "${db_pkg_names[@]}" | grep -qx "$name"; then
+    # a requested package is present when the database contains it by
+    # package name OR by package base (split packages: the matrix base
+    # may not equal any subpackage name).
+    if ! printf '%s\n' "${db_pkg_names[@]}" "${db_pkg_bases[@]}" | grep -qx "$name"; then
       echo "::error::Expected package '${name}' is missing from the regenerated staging database (silent-miss check)."
       missing_count=$(( missing_count + 1 ))
     fi

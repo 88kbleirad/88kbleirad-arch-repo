@@ -164,13 +164,17 @@ compute_fingerprint() {
   } | sha256sum | awk '{print $1}'
 }
 
+# Package archive filename semantics (epoch-aware, GitHub-asset-safe).
+# Single source of truth for canonical archive basenames.
+. "$(dirname "${BASH_SOURCE[0]}")/pkg-filename-lib.sh"
+
 validate_pkg_file() {
   # usage: validate_pkg_file <path> ; exits 1 on invalid package
   local f="$1"
   [[ -s "$f" ]] || { warn "package file is empty: $f"; return 1; }
   tar_probe "$f" || { warn "package archive is corrupt/not readable: $f"; return 1; }
   # verify pkg metadata inside archive
-  local tmp pkginfo pkgname pkgver pkgrel arch
+  local tmp pkginfo expected
   tmp=$(mktemp -d)
   if extract_pkginfo "$f" > "$tmp/PKGINFO"; then
     pkginfo="$tmp/PKGINFO"
@@ -182,22 +186,12 @@ validate_pkg_file() {
     rm -rf "$tmp"
     return 1
   fi
-  pkgname=$(awk -F' = ' '/^pkgname/{print $2; exit}' "$pkginfo")
-  pkgver=$(awk -F' = ' '/^pkgver/{print $2; exit}' "$pkginfo")
-  pkgrel=$(awk -F' = ' '/^pkgrel/{print $2; exit}' "$pkginfo")
-  arch=$(awk -F' = ' '/^arch/{print $2; exit}' "$pkginfo")
-  rm -rf "$tmp"
-  [[ -n "$pkgname" && -n "$pkgver" && -n "$arch" ]] || {
-    warn "incomplete metadata in $f"; return 1; }
-  # modern makepkg (pacman 7) emits pkgver with the release embedded
-  # (e.g. "0.4-2"); legacy makepkg has separate pkgrel.
-  local version_full
-  if [[ -n "$pkgrel" ]]; then
-    version_full="${pkgver}-${pkgrel}"
-  else
-    version_full="$pkgver"
+  if ! expected=$(archive_basename "$pkginfo"); then
+    warn "incomplete metadata in $f"
+    rm -rf "$tmp"
+    return 1
   fi
-  local expected="$pkgname-$version_full-$arch.pkg.tar.zst"
+  rm -rf "$tmp"
   if [[ "$(basename "$f")" != "$expected" ]]; then
     warn "filename mismatch: expected '$expected', got '$(basename "$f")'"
     return 1
@@ -256,8 +250,6 @@ EXPECTED_PKGS=""
 if ! EXPECTED_PKGS=$(sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && makepkg --packagelist"); then
   warn "makepkg --packagelist failed for $PKG; forcing rebuild"
   EXPECTED_PKGS=""
-else
-  EXPECTED_PKGS="${EXPECTED_PKGS//:/.}"
 fi
 
 FINGERPRINT=$(compute_fingerprint)
@@ -280,7 +272,7 @@ else
     NEEDS_BUILD=true
   else
     for pkg_path in $EXPECTED_PKGS; do
-      pkg_basename=$(basename "$pkg_path")
+      pkg_basename=$(_archive_mangle_name "$(basename "$pkg_path")")
       if ! grep -q -x "$pkg_basename" /tmp/repo-files/*/desc 2>/dev/null; then
         NEEDS_BUILD=true
         break
@@ -295,7 +287,7 @@ if [[ "$NEEDS_BUILD" == "false" ]]; then
   say "package is up to date (profile=$BUILD_PROFILE); fetching cached binaries"
   CACHE_OK=true
   for pkg_path in $EXPECTED_PKGS; do
-    pkg_basename=$(basename "$pkg_path")
+    pkg_basename=$(_archive_mangle_name "$(basename "$pkg_path")")
     gh_download_retry "$pkg_basename" "$WORKSPACE/output"
     download_rc=$?
     if [[ $download_rc -ne 0 ]]; then
@@ -412,6 +404,26 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
   BUILT_FILES=()
   shopt -s nullglob
   for f in "$WORKSPACE/$PKG"/*.pkg.tar.zst; do
+    # Canonicalize the archive filename BEFORE validation: makepkg names
+    # epoch packages with a literal `:` (beautyline-2:3.0.5-1-any...),
+    # which GitHub Release assets cannot store. archive_basename derives
+    # the stored (epoch-safe) name from .PKGINFO; without the rename the
+    # pipeline-wide basename equality would break for epoch packages.
+    canon_info=$(mktemp)
+    canon_basename=""
+    if extract_pkginfo "$f" > "$canon_info" 2>/dev/null; then
+      canon_basename=$(archive_basename "$canon_info" 2>/dev/null || true)
+    fi
+    rm -f "$canon_info"
+    if [[ -z "$canon_basename" ]]; then
+      warn "produced package has unreadable metadata; will not be published: $(basename "$f")"
+      continue
+    fi
+    if [[ "$(basename "$f")" != "$canon_basename" ]]; then
+      say "canonicalizing archive name: $(basename "$f") -> $canon_basename (epoch-safe)"
+      mv "$f" "$WORKSPACE/$PKG/$canon_basename"
+      f="$WORKSPACE/$PKG/$canon_basename"
+    fi
     if validate_pkg_file "$f"; then
       # Packager metadata gate: every freshly built archive must carry the
       # repository identity in .PKGINFO (PACKAGER configured in
@@ -520,14 +532,6 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
 fi
 
 # -- cleanup --------------------------------------------------------------------
-
-for f in "$WORKSPACE/output/"*:* ; do
-  if [[ -f "$f" ]]; then
-    new_f="${f//:/.}"
-    echo "Renaming $f to $new_f"
-    mv "$f" "$new_f"
-  fi
-done
 
 sudo -u builder rm -rf "$WORKSPACE/$PKG/src" "$WORKSPACE/$PKG/pkg"
 

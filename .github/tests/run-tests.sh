@@ -74,7 +74,12 @@ fi
 
 # -- 3. standalone host suite (lib + matrix) -------------------------------
 note "standalone host suite (gh-release-lib + matrix gates)"
-if bash "$REPO_ROOT/.github/tests/test-http500.sh"; then
+# The publish-prod scenarios in test-http500.sh require the pinned Arch
+# container (repo-add must run as root and pacman-contrib must exist). They
+# are executed by step 5 below inside the container; the host run MUST skip
+# them explicitly (never inherit RUN_PROD_SCENARIOS from the caller's
+# environment, which would attempt them as an unprivileged host user).
+if RUN_PROD_SCENARIOS=0 bash "$REPO_ROOT/.github/tests/test-http500.sh"; then
   ok "host suite (lib retries + inventory logic)"
 else
   bad "host suite"
@@ -100,6 +105,13 @@ if bash "$REPO_ROOT/.github/tests/test-rustc-wrapper.sh"; then
   ok "rustc wrapper suite"
 else
   bad "rustc wrapper suite"
+fi
+
+note "epoch-aware archive filename suite"
+if bash "$REPO_ROOT/.github/tests/test-epoch-filenames.sh"; then
+  ok "epoch-aware archive filename suite"
+else
+  bad "epoch-aware archive filename suite"
 fi
 
 # -- 4. matrix gate tests ---------------------------------------------------
