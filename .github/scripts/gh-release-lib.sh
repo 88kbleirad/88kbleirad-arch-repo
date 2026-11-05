@@ -32,7 +32,7 @@ GH_API_BASE_DELAY="${GH_API_BASE_DELAY:-2}"
 
 # counters for content-aware publishing; the publisher may reset them
 if [[ -z "${PUBLISH_COUNTERS+x}" ]]; then
-  declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+  declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 [api_requests]=0 )
 fi
 
 # Diagnostic logging goes to stderr: stdout is reserved for function
@@ -86,6 +86,7 @@ GH_LAST_RAW=""
 GH_LAST_RC=0
 gh_api_call() {
   local out rc
+  PUBLISH_COUNTERS[api_requests]=$(( PUBLISH_COUNTERS[api_requests] + 1 ))
   out="$(gh api --include "$@" 2>&1)"
   rc=$?
   GH_LAST_RAW="$out"
@@ -413,6 +414,11 @@ gh_publish_asset() {
       ;;
     MISSING|NEW)
       echo "[publish] NEW ${kind}: ${name}"
+      if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        echo "[publish] DRY-RUN: would upload ${kind}: ${name}"
+        PUBLISH_COUNTERS[uploaded]=$(( PUBLISH_COUNTERS[uploaded] + 1 ))
+        return 0
+      fi
       if ! gh_upload_asset "$tag" "$repo" "$file"; then
         echo "[publish] FAILED ${kind}: ${name}"
         PUBLISH_COUNTERS[failed]=$(( PUBLISH_COUNTERS[failed] + 1 ))
@@ -454,6 +460,11 @@ gh_publish_asset() {
         fi
       fi
       echo "[publish] CHANGED ${kind}: ${name}"
+      if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        echo "[publish] DRY-RUN: would replace ${kind}: ${name}"
+        PUBLISH_COUNTERS[replaced]=$(( PUBLISH_COUNTERS[replaced] + 1 ))
+        return 0
+      fi
       if ! gh_upload_asset "$tag" "$repo" "$file"; then
         echo "[publish] FAILED ${kind}: ${name}"
         PUBLISH_COUNTERS[failed]=$(( PUBLISH_COUNTERS[failed] + 1 ))

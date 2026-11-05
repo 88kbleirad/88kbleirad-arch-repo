@@ -1,0 +1,124 @@
+name: Repository Health Check
+
+# Phase 4.1 — read-only repository health monitoring for production and
+# staging releases. Never mutates any release: no uploads, no deletions,
+# no replacements. Emits a machine-readable JSON report artifact plus a
+# human-readable GitHub Actions summary.
+#
+# Triggers:
+#   - manual (workflow_dispatch): choose release + signing expectation
+#   - schedule (weekly, disabled until approved)
+#   - post-publication: invoked via workflow_call from build-release.yml /
+#     build-staging.yml after publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: 'Release tag to audit (repository | repository-v4-test)'
+        required: true
+        type: choice
+        options:
+          - repository
+          - repository-v4-test
+      signing-mode:
+        description: 'Expected signing mode for the audited release'
+        required: false
+        type: choice
+        options:
+          - unsigned
+          - signed
+        default: unsigned
+      expected-packages:
+        description: 'Optional JSON array of expected package names (default: derive from release database)'
+        required: false
+        type: string
+        default: ''
+  schedule:
+    # weekly (disabled until approved — same policy as production cron)
+    # - cron: '0 4 * * 1'
+  workflow_call:
+    inputs:
+      release-tag:
+        description: 'Release tag to audit'
+        required: true
+        type: string
+      signing-mode:
+        description: 'Expected signing mode'
+        required: false
+        type: string
+        default: unsigned
+      expected-packages:
+        description: 'JSON array of expected package names'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      overall-status:
+        description: 'HEALTHY | DEGRADED | FAILED'
+        value: ${{ jobs.health.outputs.overall-status }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: health-check-${{ inputs.release-tag || 'repository' }}
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-24.04
+    outputs:
+      overall-status: ${{ steps.run.outputs.overall-status }}
+    env:
+      RELEASE_TAG: ${{ inputs.release-tag || 'repository' }}
+      SIGNING_MODE: ${{ inputs.signing-mode || 'unsigned' }}
+      EXPECTED_PACKAGES: ${{ inputs.expected-packages || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install audit/validation tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libarchive-tools zstd jq
+
+      - name: Run repository health check
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPO_DB_NAME: 88kbleirad
+          BUILD_PROFILE: x86-64-v4
+        run: |
+          set -euo pipefail
+          json_args=()
+          if [[ -n "$EXPECTED_PACKAGES" ]]; then
+            json_args=(--expected "$EXPECTED_PACKAGES")
+          fi
+          set +e
+          bash "$GITHUB_WORKSPACE/.github/scripts/repo-health.sh" \
+            "$RELEASE_TAG" "$GITHUB_REPOSITORY" \
+            --signing-mode "$SIGNING_MODE" \
+            --build-profile "$BUILD_PROFILE" \
+            --json "$GITHUB_WORKSPACE/health-report.json" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            "${json_args[@]}"
+          rc=$?
+          set -e
+          status=$(jq -r '.overall_status' "$GITHUB_WORKSPACE/health-report.json")
+          echo "overall-status=$status" >> "$GITHUB_OUTPUT"
+          echo "::notice::Repository health: $status (rc=$rc)"
+          # FAILED/DEGRADED must fail this job (read-only; no mutations)
+          test "$rc" -eq 0
+
+      - name: Upload health report artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: health-report-${{ inputs.release-tag || 'repository' }}
+          path: health-report.json
+          retention-days: 14
+          if-no-files-found: error

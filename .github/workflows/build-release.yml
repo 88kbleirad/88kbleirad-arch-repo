@@ -64,6 +64,11 @@ on:
         required: false
         type: boolean
         default: false
+      dry-run:
+        description: 'Plan the publication without mutating the release (report intended uploads/replacements/deletions only).'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -228,6 +233,7 @@ jobs:
           PUBLISH_SCRIPT: publish-prod.sh
           EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
           SIGNING_MODE: unsigned
+          DRY_RUN: ${{ inputs.dry-run }}
           EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
@@ -282,6 +288,20 @@ jobs:
           PUBLISH_SCRIPT: publish-prod.sh
           EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
           SIGNING_MODE: signed
+          DRY_RUN: ${{ inputs.dry-run }}
           EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
+
+  # Phase 4.1/4.5: post-publication repository health gate. Runs after a
+  # real (non-dry) publish. Read-only; fails the overall workflow if the
+  # release is not HEALTHY for the expected inventory (derived from the
+  # prepare matrix, never hardcoded).
+  health-check:
+    needs: [publish, publish-signed]
+    if: ${{ ! inputs.dry-run }}
+    uses: ./.github/workflows/repo-health.yml
+    with:
+      release-tag: repository
+      signing-mode: ${{ inputs.signing-mode }}
+      expected-packages: ${{ needs.prepare.outputs.matrix }}

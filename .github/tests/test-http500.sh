@@ -373,6 +373,68 @@ want_all=$(for a in testa testb staypkg; do printf '%s\n' "${a}-1.0-1-x86_64.pkg
   || bad "package archives lost during recovery: $(printf '%s ' $have_all)"
 
 # ---------------------------------------------------------------------------
+note "publish-prod: recovery is idempotent (invoked more than once)"
+# Running the same missing-DB recovery a second time (same local inputs)
+# must produce zero further mutations — the recovered release is already
+# the target state.
+rm -rf "$WORKDIR/recover-idem-out"; mkdir -p "$WORKDIR/recover-idem-out"
+mk_pkgbuild testa; mk_pkgbuild testb
+mk_tar "$WORKDIR/recover-idem-out/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+mk_tar "$WORKDIR/recover-idem-out/testb-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testb"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/recover-idem-out/v4-testa.meta.json"
+printf '{"package": "testb", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/recover-idem-out/v4-testb.meta.json"
+# first recovery run against a release missing the DB
+W5r="$WORKDIR/release-recover-idem"
+rm -rf "$W5r"; mkdir -p "$W5r"; touch "$W5r/.created"; : > "$W5r/.ids"
+seed_rel_archive testa "$W5r"
+seed_rel_archive testb "$W5r"
+seed_rel_archive staypkg "$W5r"
+# drop the db assets only (keep archives+metas)
+rm -f "$W5r/88kbleirad.db" "$W5r/88kbleirad.db.tar.gz" "$W5r/88kbleirad.files" "$W5r/88kbleirad.files.tar.gz"
+rc1=$(run_prod recover-idem1 "$W5r" '["testa","testb","staypkg"]' WS_FIXTURES_DIR="$WORKDIR/recover-idem-out")
+if [[ "$rc1" -eq 0 ]]; then
+  ok "first recovery run succeeds"
+else
+  bad "first recovery failed (rc=$rc1): $(tail -4 "$WORKDIR/recover-idem1.log")"
+fi
+# second run: same release (now with db), same local inputs
+cp "$WORKDIR/ws-recover-idem1/output/." "$WORKDIR/recover-idem-out/" 2>/dev/null || true
+before=$(ls "$W5r" | sort | md5sum | awk '{print $1}')
+rc2=$(run_prod recover-idem2 "$W5r" '["testa","testb","staypkg"]' WS_FIXTURES_DIR="$WORKDIR/recover-idem-out")
+after=$(ls "$W5r" | sort | md5sum | awk '{print $1}')
+if [[ "$rc2" -eq 0 ]]; then
+  ok "repeat recovery run exits 0"
+else
+  bad "repeat recovery failed (rc=$rc2): $(tail -4 "$WORKDIR/recover-idem2.log")"
+fi
+if grep -q "SUMMARY unchanged=.* uploaded=0 replaced=0 failed=0" "$WORKDIR/recover-idem2.log"; then
+  ok "repeat recovery is zero-mutation"
+else
+  bad "repeat recovery mutated: $(grep -E 'SUMMARY|DRY' "$WORKDIR/recover-idem2.log" | head -2)"
+fi
+[[ "$before" == "$after" ]] && ok "release unchanged by repeat recovery" || bad "release changed by repeat recovery"
+
+# ---------------------------------------------------------------------------
+note "publish-prod: recovery on API failure aborts (never partial)"
+# If the DB download fails with a transient API error during recovery, the
+# run must abort cleanly (never fall back to guessing) and leave the
+# release untouched.
+W5f="$WORKDIR/release-recover-api-fail"
+rm -rf "$W5f"; mkdir -p "$W5f"; touch "$W5f/.created"; : > "$W5f/.ids"
+seed_rel_archive testa "$W5f"
+before=$(ls "$W5f" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod recover-api-fail "$W5f" '["testa"]' FAIL_DOWNLOAD_ON="88kbleirad.db.tar.gz")
+after=$(ls "$W5f" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -ne 0 ]]; then
+  ok "recovery aborts on API failure"
+else
+  bad "recovery did not abort on API failure (rc=$rc)"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched after recovery API failure" || bad "release mutated despite recovery API failure"
+
+# ---------------------------------------------------------------------------
 note "publish-prod: recovery-mode downgrade blocked before any mutation"
 # Release has NO .db.tar.gz (recovery path); its archive is testa@1.0 and
 # the run's local archive is testa@1.0 (same version). A genuine
@@ -557,6 +619,72 @@ if grep -qE 'upload |delete-asset |create ' "$WORKDIR/meta-stable.events"; then
   bad "remote mutation despite identical meta: $(cat "$WORKDIR/meta-stable.events")"
 else
   ok "no remote mutation on built-status meta repeat"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: dry-run plans changes without mutating the release"
+# DRY_RUN=1 must report the exact intended uploads/replacements/deletions
+# and leave the release byte-for-byte untouched (zero events).
+W8d="$WORKDIR/release-dryrun"
+rm -rf "$W8d"; mkdir -p "$W8d"; touch "$W8d/.created"; : > "$W8d/.ids"
+seed_rel_archive testa "$W8d"
+( cd "$W8d" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+# local output: a NEW package (c1) + an unchanged testa
+rm -rf "$WORKDIR/dryrun-out"; mkdir -p "$WORKDIR/dryrun-out"
+mk_pkgbuild c1
+mk_tar "$WORKDIR/dryrun-out/c1-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/c1"
+printf '{"package": "c1", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/dryrun-out/v4-c1.meta.json"
+cp "$W8d/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/dryrun-out/"
+cp "$W8d/v4-testa.meta.json" "$WORKDIR/dryrun-out/"
+before=$(ls "$W8d" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod dryrun "$W8d" '["testa","c1"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-out" DRY_RUN=1)
+after=$(ls "$W8d" | sort | md5sum | awk '{print $1}')
+if [[ "$rc" -eq 0 ]]; then
+  ok "dry-run publish exits 0"
+else
+  bad "dry-run failed (rc=$rc): $(tail -4 "$WORKDIR/dryrun.log")"
+fi
+if grep -q "DRY-RUN: would upload" "$WORKDIR/dryrun.log"; then
+  ok "dry-run reports intended upload"
+else
+  bad "dry-run upload plan missing: $(grep -E 'DRY-RUN|SUMMARY' "$WORKDIR/dryrun.log" | head -3)"
+fi
+if [[ "$before" == "$after" ]]; then
+  ok "dry-run leaves release untouched"
+else
+  bad "dry-run mutated release"
+fi
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun.events" 2>/dev/null; then
+  bad "dry-run performed remote mutations: $(cat "$WORKDIR/dryrun.events")"
+else
+  ok "dry-run performed zero remote mutations"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: pre-mutation manifest is recorded after a real publish"
+# After a successful (non-dry) publish, the pre-mutation manifest must
+# exist and describe the release that existed before mutation.
+W8e="$WORKDIR/release-manifest"
+rm -rf "$W8e"; mkdir -p "$W8e"; touch "$W8e/.created"; : > "$W8e/.ids"
+seed_rel_archive testa "$W8e"
+( cd "$W8e" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+rm -rf "$WORKDIR/manifest-out"; mkdir -p "$WORKDIR/manifest-out"
+cp "$W8e/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/manifest-out/"
+cp "$W8e/v4-testa.meta.json" "$WORKDIR/manifest-out/"
+rc=$(run_prod manifestcheck "$W8e" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/manifest-out")
+MANIFEST="$WORKDIR/ws-manifestcheck/output/publish-manifest-repository.json"
+if [[ "$rc" -eq 0 ]] && [[ -f "$MANIFEST" ]]; then
+  ok "pre-mutation manifest recorded"
+else
+  bad "manifest missing after publish (rc=$rc): $MANIFEST"
+fi
+if [[ -s "$MANIFEST" ]] \
+    && jq -e '.assets | any(.name == "testa-1.0-1-x86_64.pkg.tar.zst")' \
+      "$MANIFEST" >/dev/null 2>&1; then
+  ok "manifest contains pre-existing package asset"
+else
+  bad "manifest asset list wrong"
 fi
 
 # ---------------------------------------------------------------------------

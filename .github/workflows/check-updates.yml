@@ -1,0 +1,97 @@
+name: Package Update Detection
+
+# Phase 4.4 — read-only upstream update detection. Never modifies package
+# sources, never pushes to main, never publishes. Produces a JSON report
+# and a Markdown summary; optionally opens (or updates) a reviewable
+# pull request containing ONLY the report + a proposed PKGBUILD patch for
+# human review (the PR branch is merge-guarded by existing review rules).
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Comma-separated packages to check (default: all in packages.txt)'
+        required: false
+        type: string
+        default: ''
+      open-pr:
+        description: 'Create/update a reviewable update-proposal PR (report + patches)'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # weekly (disabled until approved)
+    # - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: update-detection
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl git
+
+      - name: Run update detection (read-only)
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          args=(--json "$GITHUB_WORKSPACE/update-report.json" --summary "$GITHUB_STEP_SUMMARY")
+          if [[ -n "${{ inputs.packages }}" ]]; then
+            IFS=',' read -ra PKG_ARRAY <<< "${{ inputs.packages }}"
+            args+=("${PKG_ARRAY[@]}")
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/check-updates.sh" "${args[@]}"
+          # exit 0 on success; the checker never fails on upstream hiccups
+          # (reported as CHECK_FAILED)
+
+      - name: Upload update report artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: update-report
+          path: update-report.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Summarize classification counts
+        run: |
+          set -euo pipefail
+          jq -r 'group_by(.update_type)[] | "\(.[0].update_type): \(length)"' \
+            "$GITHUB_WORKSPACE/update-report.json" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Create reviewable update proposal PR (report only)
+        if: ${{ inputs.open-pr }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="update-proposal/$(date -u +%Y%m%d%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          mkdir -p docs/update-proposals
+          cp "$GITHUB_WORKSPACE/update-report.json" "docs/update-proposals/update-report-$(date -u +%Y%m%d).json"
+          git add docs/update-proposals
+          git commit -m "docs(updates): update detection report $(date -u +%Y-%m-%d)" || echo "no changes"
+          git push -u origin "$branch"
+          gh pr create \
+            --base main --head "$branch" \
+            --title "Update detection report $(date -u +%Y-%m-%d)" \
+            --body "Read-only upstream update detection (Phase 4.4). See docs/update-proposals/. No package sources modified; no publication triggered." || true

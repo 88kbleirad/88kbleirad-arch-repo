@@ -114,6 +114,13 @@ else
   bad "epoch-aware archive filename suite"
 fi
 
+note "update-detection safety suite"
+if bash "$REPO_ROOT/.github/tests/test-check-updates.sh"; then
+  ok "update-detection safety suite"
+else
+  bad "update-detection safety suite"
+fi
+
 # -- 4. matrix gate tests ---------------------------------------------------
 note "matrix gate tests (approval / schedule / critical / subset)"
 if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then
@@ -136,6 +143,7 @@ if docker run --rm \
         EXPECTED_PACKAGES="[\"testa\",\"testb\"]" bash "$REPO_ROOT/.github/tests/test-signing-mode.sh"
         RUN_PROD_SCENARIOS=1 bash "$REPO_ROOT/.github/tests/test-http500.sh"
         bash "$REPO_ROOT/.github/tests/test-verify-remote.sh"
+        bash "$REPO_ROOT/.github/tests/test-repo-health.sh"
       '; then
   ok "signing + host-prod suite"
 else

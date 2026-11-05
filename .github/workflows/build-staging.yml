@@ -142,3 +142,13 @@ jobs:
           EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
+
+  # Phase 4.1/4.5: post-publication health gate for the signed staging
+  # release (read-only).
+  health-check:
+    needs: publish
+    uses: ./.github/workflows/repo-health.yml
+    with:
+      release-tag: repository-v4-test
+      signing-mode: signed
+      expected-packages: ${{ needs.prepare.outputs.matrix }}

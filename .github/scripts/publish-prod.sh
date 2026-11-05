@@ -634,7 +634,36 @@ else
   publish_assets_loop "$TAG" "$REPO" "$PWD" "database" "${db_files[@]}" || exit 1
 fi
 
-echo "[publish] SUMMARY unchanged=${PUBLISH_COUNTERS[unchanged]} uploaded=${PUBLISH_COUNTERS[uploaded]} replaced=${PUBLISH_COUNTERS[replaced]} failed=${PUBLISH_COUNTERS[failed]}"
+echo "[publish] SUMMARY unchanged=${PUBLISH_COUNTERS[unchanged]} uploaded=${PUBLISH_COUNTERS[uploaded]} replaced=${PUBLISH_COUNTERS[replaced]} failed=${PUBLISH_COUNTERS[failed]} api_requests=${PUBLISH_COUNTERS[api_requests]}"
+
+# -- recovery: record the pre-mutation remote asset manifest ----------------
+# Local artifact (never uploaded): captures exactly what the release looked
+# like before this run's mutations. Used to reconcile interrupted publishes
+# and to plan recovery. Written before any mutation happens.
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+  MANIFEST_FILE="$PWD/publish-manifest-${TAG}.json"
+  {
+    echo "{"
+    echo "  \"repository\": $(printf '%s' "$REPO" | jq -R .),"
+    echo "  \"release_tag\": $(printf '%s' "$TAG" | jq -R .),"
+    echo "  \"recorded_at\": $(date -u +%Y-%m-%dT%H:%M:%SZ | jq -R .),"
+    echo "  \"assets\": ["
+    first=1
+    while IFS='|' read -r name id digest; do
+      [[ -n "$name" ]] || continue
+      [[ $first -eq 0 ]] && echo ","
+      printf '    {"name": %s, "id": %s, "digest": %s}' \
+        "$(printf '%s' "$name" | jq -R .)" "$(printf '%s' "$id" | jq -R .)" "$(printf '%s' "$digest" | jq -R .)"
+      first=0
+    done < <(gh_api_retry "list assets (${TAG})" \
+        "/repos/${REPO}/releases/tags/${TAG}" \
+        --jq '.assets[] | "\(.name)|\(.id)|\(.digest // "")"' 2>/dev/null)
+    echo
+    echo "  ]"
+    echo "}"
+  } > "$MANIFEST_FILE"
+  echo "[publish] recorded pre-mutation manifest: $MANIFEST_FILE"
+fi
 
 # -- drift cleanup: delete only stale un-protected package assets ---------
 stale_assets=()
@@ -677,6 +706,10 @@ if (( ${#stale_assets[@]} > 0 )); then
   echo "Deleting stale assets that are no longer part of the repository:"
   for stale in "${stale_assets[@]}"; do
     echo "  - $stale"
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+      echo "[publish] DRY-RUN: would delete stale asset: $stale"
+      continue
+    fi
     if ! gh_delete_asset "$TAG" "$REPO" "$stale"; then
       echo "::error::Cannot delete stale asset $stale; the next run will retry."
       exit 1
@@ -684,8 +717,12 @@ if (( ${#stale_assets[@]} > 0 )); then
     # its detached signature is stale with it (the archive is gone, so
     # a leftover .sig would be an orphan asset)
     if gh_list_assets "$TAG" "$REPO" | grep -qx "${stale}.sig"; then
-      gh_delete_asset "$TAG" "$REPO" "${stale}.sig" \
-        || echo "::warning::Cannot delete orphaned signature ${stale}.sig; the next run will retry."
+      if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        echo "[publish] DRY-RUN: would delete orphaned signature ${stale}.sig"
+      else
+        gh_delete_asset "$TAG" "$REPO" "${stale}.sig" \
+          || echo "::warning::Cannot delete orphaned signature ${stale}.sig; the next run will retry."
+      fi
     fi
   done
 else
@@ -702,11 +739,21 @@ if [[ "$SIGNING_MODE" == "unsigned" ]]; then
     case "$asset" in
       *.pkg.tar.zst.sig|"${REPO_DB_NAME}.db.sig"|"${REPO_DB_NAME}.db.tar.gz.sig"|"${REPO_DB_NAME}.files.sig"|"${REPO_DB_NAME}.files.tar.gz.sig")
         echo "Deleting superseded signature asset: $asset"
-        gh_delete_asset "$TAG" "$REPO" "$asset" \
-          || echo "::warning::Cannot delete stale signature $asset; the next run will retry."
+        if [[ "${DRY_RUN:-0}" == "1" ]]; then
+          echo "[publish] DRY-RUN: would delete signature asset: $asset"
+        else
+          gh_delete_asset "$TAG" "$REPO" "$asset" \
+            || echo "::warning::Cannot delete stale signature $asset; the next run will retry."
+        fi
         ;;
     esac
   done < <(gh_list_assets "$TAG" "$REPO")
+fi
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  echo "DRY-RUN: skipping remote post-publish verification (no mutations performed)."
+  echo "DRY-RUN: planned mutations recorded above."
+  exit 0
 fi
 
 echo "Published production release: $REPO/releases/tag/$TAG"

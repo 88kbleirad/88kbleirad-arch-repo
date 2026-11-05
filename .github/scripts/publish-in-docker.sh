@@ -165,6 +165,7 @@ docker exec \
   -e GITHUB_STEP_SUMMARY="$SUMMARY_FILE" \
   -e EXCLUDED_BASES_FILE="${EXCLUDED_BASES_FILE:-}" \
   -e SIGNING_MODE="${SIGNING_MODE:-unsigned}" \
+  -e DRY_RUN="${DRY_RUN:-0}" \
   -e EXPECTED_PACKAGES="${EXPECTED_PACKAGES:-}" \
   -e GPG_KEY_FILE="/run/secrets/gpg-key" \
   -e GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:+/run/secrets/gpg-passphrase}" \
