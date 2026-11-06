@@ -196,7 +196,7 @@ if [[ "${1:-}" == "release" && "${2:-}" == "view" ]]; then
     {
       printf '{"assets":['
       first=1
-      local name
+      name=""
       while IFS= read -r name; do
         [[ -n "$name" ]] || continue
         [[ $first -eq 0 ]] && printf ','

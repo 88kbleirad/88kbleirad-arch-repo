@@ -7,7 +7,6 @@ name: Repository Health Check
 #
 # Triggers:
 #   - manual (workflow_dispatch): choose release + signing expectation
-#   - schedule (weekly, disabled until approved)
 #   - post-publication: invoked via workflow_call from build-release.yml /
 #     build-staging.yml after publish
 
@@ -71,6 +70,7 @@ jobs:
       RELEASE_TAG: ${{ inputs.release-tag || 'repository' }}
       SIGNING_MODE: ${{ inputs.signing-mode || 'unsigned' }}
       EXPECTED_PACKAGES: ${{ inputs.expected-packages || '' }}
+      COMMIT_SHA: ${{ github.sha || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -106,13 +106,24 @@ jobs:
             "${json_args[@]}"
           rc=$?
           set -e
+          # If the diagnostic report is missing the health check itself
+          # failed at infrastructure level (bad checkout, missing tools,
+          # script error). Expose that clearly instead of succeeding.
+          if [[ ! -s "$GITHUB_WORKSPACE/health-report.json" ]]; then
+            echo "::error::Repository health report was not generated (infrastructure failure)."
+            exit 1
+          fi
           status=$(jq -r '.overall_status' "$GITHUB_WORKSPACE/health-report.json")
           echo "overall-status=$status" >> "$GITHUB_OUTPUT"
           echo "::notice::Repository health: $status (rc=$rc)"
           # FAILED/DEGRADED must fail this job (read-only; no mutations)
           test "$rc" -eq 0
 
+      # Diagnostic retention: upload the report even when the health check
+      # failed (rc != 0). The report is then authored by repo-health.sh
+      # (never this shell), so the job's failure status is not masked.
       - name: Upload health report artifact
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: health-report-${{ inputs.release-tag || 'repository' }}

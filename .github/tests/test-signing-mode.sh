@@ -93,7 +93,8 @@ PKG
 
 # -- run publish-prod --------------------------------------------------------
 run_prod() { # scenario mode keymode [releasedir]
-  local scenario="$1" mode="$2" keymode="$3" rel="${4:-$WORKDIR/release-$scenario}"
+  local scenario="$1" mode="$2" keymode="$3"
+  local rel="${4:-$WORKDIR/release-$scenario}"
   local ws="$WORKDIR/ws-$scenario"
   rm -rf "$ws"; mkdir -p "$ws/.github/scripts" "$ws/output" "$ws/bin"
   cp "$REPO_COPY/.github/scripts/"*.sh "$ws/.github/scripts/"

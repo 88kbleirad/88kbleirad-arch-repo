@@ -32,8 +32,9 @@ permissions:
   contents: read
 
 concurrency:
+  # Never cancel an in-flight staging publish (non-atomic release).
   group: release-repo-v4-test
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   RELEASE_TAG: repository-v4-test

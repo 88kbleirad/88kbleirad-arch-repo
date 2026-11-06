@@ -212,6 +212,16 @@ if jq -e '.unexpected_assets | contains("v4-ghost")' "$WORKDIR/health.json" >/de
 else
   bad "orphan not detected: $(jq -r '.unexpected_assets' "$WORKDIR/health.json")"
 fi
+if [[ "$HEALTH_RC" -ne 0 ]]; then
+  ok "orphaned repo fails the job (rc=$HEALTH_RC)"
+else
+  bad "orphaned repo did not fail (rc=0)"
+fi
+if [[ "$(jq -r '.overall_status' "$WORKDIR/health.json")" == "DEGRADED" ]]; then
+  ok "orphaned repo verdict is DEGRADED (never HEALTHY)"
+else
+  bad "orphaned repo verdict != DEGRADED: $(jq -r '.overall_status' "$WORKDIR/health.json")"
+fi
 
 # ---------------------------------------------------------------------------
 note "health: unsigned release with stray signature is detected"
@@ -223,6 +233,149 @@ if jq -e '.signing_status == "FAIL"' "$WORKDIR/health.json" >/dev/null; then
   ok "stray signature detected in unsigned release"
 else
   bad "stray signature not detected: $(jq -r '.signing_status' "$WORKDIR/health.json")"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: malformed expected inventory is a validation failure"
+REL="$WORKDIR/release-bad-inventory"
+make_release "$REL"
+EXPECTED_SAVE="$EXPECTED"; EXPECTED='not-json'
+run_health "$REL"
+EXPECTED="$EXPECTED_SAVE"
+if [[ "$HEALTH_RC" -ne 0 ]]; then
+  ok "malformed expected inventory -> nonzero exit"
+else
+  bad "malformed inventory not detected (rc=0)"
+fi
+if [[ "$(jq -r '.overall_status' "$WORKDIR/health.json")" == "FAILED" ]]; then
+  ok "malformed inventory -> overall_status=FAILED"
+else
+  bad "malformed inventory overall != FAILED: $(jq -r '.overall_status' "$WORKDIR/health.json")"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: orphaned signature (owner asset missing) is detected"
+REL="$WORKDIR/release-orphan-sig"
+make_release "$REL"
+# orphaned .sig: owner archive does not exist in the release at all
+printf 'garbage' > "$REL/ghost-1.0-1-x86_64.pkg.tar.zst.sig"
+run_health "$REL"
+if jq -e '.unexpected_assets | contains("ghost-1.0-1-x86_64.pkg.tar.zst.sig")' "$WORKDIR/health.json" >/dev/null; then
+  ok "orphaned signature detected"
+else
+  bad "orphaned signature not detected: $(jq -r '.unexpected_assets' "$WORKDIR/health.json")"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: cleanup proposal lists exact names, ids, sizes, digests"
+REL="$WORKDIR/release-proposal"
+make_release "$REL"
+printf '{"package":"ghost","profile":"x86-64-v4","status":"built","fingerprint":"abc"}\n' \
+  > "$REL/v4-ghost.meta.json"
+printf 'stale-bytes' > "$REL/stale-1.0-1-x86_64.pkg.tar.zst"
+run_health "$REL"
+if jq -e '(.cleanup_proposal | length) >= 2' "$WORKDIR/health.json" >/dev/null; then
+  ok "cleanup_proposal lists orphaned assets"
+else
+  bad "cleanup_proposal missing/empty: $(jq -c '.cleanup_proposal' "$WORKDIR/health.json")"
+fi
+if jq -e '.cleanup_proposal[] | select(.name == "stale-1.0-1-x86_64.pkg.tar.zst") | (.id != "" and .size != "" and .digest != "")' "$WORKDIR/health.json" >/dev/null; then
+  ok "proposal entries carry id/size/digest"
+else
+  bad "proposal entry missing id/size/digest: $(jq -c '.cleanup_proposal' "$WORKDIR/health.json")"
+fi
+if jq -e '.cleanup_proposal[] | select(.name == "v4-ghost.meta.json")' "$WORKDIR/health.json" >/dev/null; then
+  ok "proposal contains orphaned metadata"
+else
+  bad "proposal missing orphaned metadata"
+fi
+if jq -e '.cleanup_proposal[] | select(.name == "stale-1.0-1-x86_64.pkg.tar.zst") | .type == "archive" and (.reason | length > 0)' "$WORKDIR/health.json" >/dev/null; then
+  ok "proposal carries type + reason classification"
+else
+  bad "proposal classification missing: $(jq -c '.cleanup_proposal' "$WORKDIR/health.json")"
+fi
+if jq -e '.cleanup_proposal[] | select(.name == "v4-ghost.meta.json") | .type == "metadata"' "$WORKDIR/health.json" >/dev/null; then
+  ok "proposal types metadata assets"
+else
+  bad "proposal metadata type missing"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: orphaned metadata detected even without an expected inventory"
+REL="$WORKDIR/release-orphan-meta-noexpected"
+make_release "$REL"
+printf '{"package":"ghost","profile":"x86-64-v4","status":"built","fingerprint":"abc"}\n' \
+  > "$REL/v4-ghost.meta.json"
+EXPECTED_SAVE="$EXPECTED"; EXPECTED=''
+run_health "$REL"
+EXPECTED="$EXPECTED_SAVE"
+if jq -e '.unexpected_assets | contains("v4-ghost.meta.json")' "$WORKDIR/health.json" >/dev/null; then
+  ok "orphaned metadata detected without expected inventory"
+else
+  bad "orphaned metadata missed without expected inventory: $(jq -r '.unexpected_assets' "$WORKDIR/health.json")"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: commit_sha populated deterministically from trusted context"
+REL="$WORKDIR/release-commit"
+make_release "$REL"
+run_health "$REL" COMMIT_SHA=abc123
+if [[ "$(jq -r '.commit_sha' "$WORKDIR/health.json")" == "abc123" ]]; then
+  ok "commit_sha populated from COMMIT_SHA"
+else
+  bad "commit_sha not populated: $(jq -r '.commit_sha' "$WORKDIR/health.json")"
+fi
+run_health "$REL"
+if [[ "$(jq -r '.commit_sha' "$WORKDIR/health.json")" == "" ]]; then
+  ok "commit_sha stays empty when unavailable (never invented)"
+else
+  bad "commit_sha invented when unavailable: $(jq -r '.commit_sha' "$WORKDIR/health.json")"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: report is written even when the release is not found"
+REL="$WORKDIR/release-absent"
+rm -rf "$REL"; mkdir -p "$REL"   # no .created marker -> 404
+run_health "$REL"
+if [[ "$HEALTH_RC" -ne 0 ]] && [[ -s "$WORKDIR/health.json" ]]; then
+  ok "release-not-found still produces a JSON report (FAILED)"
+else
+  bad "release-not-found report missing (rc=$HEALTH_RC)"
+fi
+if [[ "$(jq -r '.overall_status' "$WORKDIR/health.json")" == "FAILED" ]]; then
+  ok "release-not-found report overall=FAILED"
+else
+  bad "release-not-found overall != FAILED"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: transient API/download failure is a FAIL report, never success"
+REL="$WORKDIR/release-dl-fail"
+make_release "$REL"
+run_health "$REL" FAIL_DOWNLOAD_ON="testa-1.0-1-x86_64.pkg.tar.zst"
+if [[ "$HEALTH_RC" -ne 0 ]] && [[ -s "$WORKDIR/health.json" ]]; then
+  ok "download failure fails the job and still writes a report"
+else
+  bad "download failure not surfaced (rc=$HEALTH_RC, report=$([[ -s "$WORKDIR/health.json" ]] && echo present || echo missing))"
+fi
+if [[ "$(jq -r '.checksum_status' "$WORKDIR/health.json")" == "FAIL" ]]; then
+  ok "download failure -> checksum_status=FAIL"
+else
+  bad "download failure not checksum FAIL: $(jq -r '.checksum_status' "$WORKDIR/health.json")"
+fi
+
+# ---------------------------------------------------------------------------
+note "health: report never contains sensitive material"
+# The JSON schema is repository metadata only. No tokens, keys, or
+# credentials may ever be embedded.
+REL="$WORKDIR/release-sensitive"
+make_release "$REL"
+run_health "$REL"
+if grep -qiE 'GH_TOKEN|GITHUB_TOKEN|BEGIN (RSA |OPENSSH |PGP )?PRIVATE KEY|ghp_|github_pat_|secret' \
+    "$WORKDIR/health.json"; then
+  bad "report contains sensitive-looking content"
+else
+  ok "report free of tokens/credentials"
 fi
 
 # ---------------------------------------------------------------------------

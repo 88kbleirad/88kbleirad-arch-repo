@@ -10,6 +10,20 @@ RELEASE_TAG="${RELEASE_TAG:?RELEASE_TAG is required}"
 REPO_DB_NAME="${REPO_DB_NAME:?REPO_DB_NAME is required}"
 GH_TOKEN="${GH_TOKEN:?GH_TOKEN is required}"
 
+# Fail closed on any dry-run request: publish-stage.sh mutates via the
+# legacy `gh release create/upload` subcommands, which have no dry-run
+# mode. The staging workflow never passes DRY_RUN (only build-release.yml
+# does, with the lib-based publish-prod.sh path); if a dry-run request
+# ever reaches this script, abort BEFORE any remote mutation rather than
+# silently publishing.
+case "${DRY_RUN:-0}" in
+  0|false|FALSE|no|NO|'') ;;
+  *)
+    echo "::error::publish-stage.sh does not support DRY_RUN=${DRY_RUN}; refusing to publish staging."
+    exit 1
+    ;;
+esac
+
 pacman -Syu --noconfirm --needed \
   github-cli pacman-contrib jq libarchive gnupg
 
@@ -266,7 +280,7 @@ if ! export_public_key; then
   echo "::error::Failed to export the public signing key; refusing to publish."
   exit 1
 fi
-pub_assets=( ${REPO_DB_NAME}.pub.asc )
+pub_assets=( "${REPO_DB_NAME}.pub.asc" )
 
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "Staging release $TAG exists; merging this run into it."

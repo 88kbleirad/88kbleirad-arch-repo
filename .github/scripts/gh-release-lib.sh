@@ -155,6 +155,11 @@ gh_list_assets() {
 # Reconciliation-safe: if the asset is already gone (404), that is success.
 gh_delete_asset() {
   local tag="$1" repo="$2" name="$3" id
+  # Dry-run: block the write BEFORE any API call (no remote state query).
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    gh_log "DRY-RUN: would delete '${name}' (no mutation)"
+    return 0
+  fi
   id="$(gh_asset_id "$tag" "$repo" "$name")"
   if [[ -z "$id" ]]; then
     gh_log "delete '${name}': already absent (nothing to do)"
@@ -175,6 +180,13 @@ gh_upload_asset() {
 
   name="$(basename "$file")"
   [[ -s "$file" ]] || { gh_err "upload '${name}': local file missing/empty"; return 1; }
+
+  # Dry-run: block the write BEFORE any API call. Remote state is never
+  # touched; the plan is reported by the caller (gh_publish_asset).
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    gh_log "DRY-RUN: would upload '${name}' (no mutation)"
+    return 0
+  fi
 
   # always drop any pre-existing asset first (clobber semantics without PATCH)
   gh_delete_asset "$tag" "$repo" "$name" || return 1
@@ -324,9 +336,23 @@ gh_asset_status() {
       "/repos/${repo}/releases/tags/${tag}" \
       --jq ".assets[] | select(.name == \"${name}\") | {id,digest}" \
       >/dev/null 2>&1; then
-    gh_err "asset status '${name}': failed to query release assets"
-    ASSET_STATUS="FAILED"
-    return 2
+    # A failed release-by-tag query can mean the release itself does not
+    # exist (404). Then no remote asset can exist, so every local file is
+    # NEW. Only in that case classify MISSING without guessing; any other
+    # failure (release exists but list/transport failed) stays FAILED —
+    # never mutate on an unverifiable state. Distinguish by asking for the
+    # release again: a second failure is a missing release (or a double
+    # transient failure, which the subsequent publish loop re-checks via
+    # gh_asset_status before any mutation anyway).
+    if gh_api_retry "view release (${tag})" \
+        "/repos/${repo}/releases/tags/${tag}" >/dev/null 2>&1; then
+      gh_err "asset status '${name}': failed to query release assets"
+      ASSET_STATUS="FAILED"
+      return 2
+    fi
+    gh_log "asset status '${name}': release ${tag} not found; classifying as NEW/MISSING"
+    ASSET_STATUS="MISSING"
+    return 1
   fi
 
   local found

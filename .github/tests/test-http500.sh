@@ -230,6 +230,58 @@ unset PERMANENT_ON
 gh_delete_asset repository owner/repo "never-existed.jar" >/dev/null 2>&1 && \
   ok "delete of missing asset succeeds (idempotent)" || bad "delete of missing asset failed"
 
+# ---------------------------------------------------------------------------
+note "gh-release-lib: asset status of a missing release is MISSING, not FAILED"
+# A 404 on the release-by-tag query means the release does not exist; the
+# asset status must be MISSING (every local file is NEW) so dry-run can
+# plan uploads — never FAILED (which would abort the plan on a missing
+# release).
+WM="$WORKDIR/lib-missing-release"
+rm -rf "$WM"; mkdir -p "$WM"           # no .created marker -> release absent
+printf 'local-bytes' > "$WM/new-asset.jar"
+prev_fake="$FAKE_RELEASE_DIR"; export FAKE_RELEASE_DIR="$WM"
+prev_events="$FAKE_EVENTS_LOG"; export FAKE_EVENTS_LOG=/dev/null
+rc_status=0
+gh_asset_status repository owner/repo "$WM/new-asset.jar" "$WM" >/dev/null 2>&1 || rc_status=$?
+export FAKE_RELEASE_DIR="$prev_fake"; export FAKE_EVENTS_LOG="$prev_events"
+if [[ "$ASSET_STATUS" == "MISSING" ]]; then
+  ok "missing release classified MISSING (rc=$rc_status)"
+else
+  bad "missing release classified '$ASSET_STATUS' (rc=$rc_status)"
+fi
+
+# ---------------------------------------------------------------------------
+note "gh-release-lib: DRY_RUN blocks writes before any API call"
+# lib-level defense in depth: even if a caller invokes the mutation
+# helpers directly, dry-run must never touch the fake release.
+WDRY="$WORKDIR/lib-dryrun"
+rm -rf "$WDRY"; mkdir -p "$WDRY/src" "$WDRY/release"
+touch "$WDRY/release/.created"; : > "$WDRY/release/.ids"
+printf 'seed-bytes' > "$WDRY/release/seed.jar"
+printf 'local-bytes' > "$WDRY/src/new-asset.jar"
+DRY_EVENTS="$WORKDIR/dryrun-lib.events"
+: > "$DRY_EVENTS"
+export DRY_RUN=1
+prev_fake="$FAKE_RELEASE_DIR"; export FAKE_RELEASE_DIR="$WDRY/release"
+prev_events="$FAKE_EVENTS_LOG"; export FAKE_EVENTS_LOG="$DRY_EVENTS"
+rc_upload=0
+gh_upload_asset repository owner/repo "$WDRY/src/new-asset.jar" >/dev/null 2>&1 || rc_upload=$?
+rc_delete=0
+gh_delete_asset repository owner/repo "seed.jar" >/dev/null 2>&1 || rc_delete=$?
+export FAKE_RELEASE_DIR="$prev_fake"; export FAKE_EVENTS_LOG="$prev_events"
+unset DRY_RUN
+[[ "$rc_upload" -eq 0 && "$rc_delete" -eq 0 ]] \
+  && ok "dry-run mutation helpers exit 0" || bad "dry-run helpers failed (upload=$rc_upload delete=$rc_delete)"
+[[ ! -f "$WDRY/release/new-asset.jar" ]] \
+  && ok "dry-run upload wrote nothing" || bad "dry-run upload created a file"
+[[ -f "$WDRY/release/seed.jar" ]] \
+  && ok "dry-run delete removed nothing" || bad "dry-run delete removed an asset"
+if grep -qE 'upload |delete-asset |create ' "$DRY_EVENTS" 2>/dev/null; then
+  bad "dry-run lib-level mutations logged: $(cat "$DRY_EVENTS")"
+else
+  ok "dry-run lib-level zero remote mutations"
+fi
+
 if [[ "${RUN_PROD_SCENARIOS:-0}" != "1" ]]; then
   skip "publish-prod scenarios (require test container; set RUN_PROD_SCENARIOS=1)"
 else
@@ -622,6 +674,34 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "publish-prod: dry-run of a no-change publication plans zero mutations"
+# Dry-run where every local asset is byte-identical to remote: the plan
+# must contain no uploads/replacements/deletions, the SUMMARY must be
+# zero-mutation, and the release must remain untouched.
+W8n="$WORKDIR/release-dryrun-nochange"
+rm -rf "$W8n"; mkdir -p "$W8n"; touch "$W8n/.created"; : > "$W8n/.ids"
+seed_rel_archive testa "$W8n"
+( cd "$W8n" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+rm -rf "$WORKDIR/dryrun-nochange-out"; mkdir -p "$WORKDIR/dryrun-nochange-out"
+cp "$W8n/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/dryrun-nochange-out/"
+cp "$W8n/v4-testa.meta.json" "$WORKDIR/dryrun-nochange-out/"
+before=$(ls "$W8n" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod dryrun-nochange "$W8n" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-nochange-out" DRY_RUN=1)
+after=$(ls "$W8n" | sort | md5sum | awk '{print $1}')
+[[ "$rc" -eq 0 ]] && ok "no-change dry-run exits 0" || bad "no-change dry-run failed (rc=$rc)"
+if grep -q "SUMMARY unchanged=.* uploaded=0 replaced=0 failed=0" "$WORKDIR/dryrun-nochange.log"; then
+  ok "no-change dry-run SUMMARY is zero-mutation"
+else
+  bad "no-change dry-run SUMMARY not zero-mutation: $(grep -E 'SUMMARY' "$WORKDIR/dryrun-nochange.log" | head -2)"
+fi
+[[ "$before" == "$after" ]] && ok "no-change dry-run leaves release untouched" || bad "no-change dry-run mutated release"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun-nochange.events" 2>/dev/null; then
+  bad "no-change dry-run performed mutations"
+else
+  ok "no-change dry-run performed zero remote mutations"
+fi
+
+# ---------------------------------------------------------------------------
 note "publish-prod: dry-run plans changes without mutating the release"
 # DRY_RUN=1 must report the exact intended uploads/replacements/deletions
 # and leave the release byte-for-byte untouched (zero events).
@@ -662,7 +742,187 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-note "publish-prod: pre-mutation manifest is recorded after a real publish"
+note "publish-prod: dry-run is repeatable (same plan, zero mutations twice)"
+before1=$(ls "$W8d" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod dryrun2 "$W8d" '["testa","c1"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-out" DRY_RUN=1)
+after1=$(ls "$W8d" | sort | md5sum | awk '{print $1}')
+[[ "$rc" -eq 0 ]] && [[ "$before1" == "$after1" ]] \
+  && ok "repeated dry-run exits 0 and leaves release untouched" \
+  || bad "repeated dry-run failed/mutated (rc=$rc)"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun2.events" 2>/dev/null; then
+  bad "repeated dry-run performed remote mutations"
+else
+  ok "repeated dry-run performed zero remote mutations"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: dry-run never creates a missing release"
+W8m="$WORKDIR/release-dryrun-missing"
+rm -rf "$W8m"; mkdir -p "$W8m"; : > "$W8m/.ids"   # NO .created marker
+rm -rf "$WORKDIR/dryrun-missing-out"; mkdir -p "$WORKDIR/dryrun-missing-out"
+mk_pkgbuild testa
+mk_tar "$WORKDIR/dryrun-missing-out/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/dryrun-missing-out/v4-testa.meta.json"
+rc=$(run_prod dryrun-missing "$W8m" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-missing-out" DRY_RUN=1)
+if [[ ! -f "$W8m/.created" ]]; then
+  ok "dry-run did not create a missing release"
+else
+  bad "dry-run created a release (mutation!)"
+fi
+if [[ "$rc" -eq 0 ]]; then
+  ok "dry-run against a missing release exits 0"
+else
+  bad "dry-run missing-release failed (rc=$rc): $(tail -4 "$WORKDIR/dryrun-missing.log")"
+fi
+if grep -q "would create it" "$WORKDIR/dryrun-missing.log"; then
+  ok "dry-run reports the would-create release plan"
+else
+  bad "would-create plan missing: $(grep -E 'DRY-RUN' "$WORKDIR/dryrun-missing.log" | head -3)"
+fi
+if grep -q "DRY-RUN: would upload" "$WORKDIR/dryrun-missing.log"; then
+  ok "dry-run plans uploads for a missing release"
+else
+  bad "missing-release upload plan missing: $(grep -E 'DRY-RUN' "$WORKDIR/dryrun-missing.log" | head -3)"
+fi
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun-missing.events" 2>/dev/null; then
+  bad "dry-run mutated while missing: $(cat "$WORKDIR/dryrun-missing.events")"
+else
+  ok "dry-run zero mutations while release missing"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: dry-run plans stale-archive and orphan-signature deletion"
+W8s="$WORKDIR/release-dryrun-stale"
+rm -rf "$W8s"; mkdir -p "$W8s"; touch "$W8s/.created"; : > "$W8s/.ids"
+seed_rel_archive testa "$W8s"
+( cd "$W8s" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+# stale archive not referenced by the (new) repo + an orphaned signature
+mk_pkgbuild obsolete
+mk_tar "$W8s/obsolete-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/obsolete"
+printf 'sig-bytes' > "$W8s/testa-1.0-1-x86_64.pkg.tar.zst.sig"
+rm -rf "$WORKDIR/dryrun-stale-out"; mkdir -p "$WORKDIR/dryrun-stale-out"
+cp "$W8s/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/dryrun-stale-out/"
+cp "$W8s/v4-testa.meta.json" "$WORKDIR/dryrun-stale-out/"
+before=$(ls "$W8s" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod dryrun-stale "$W8s" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-stale-out" DRY_RUN=1)
+after=$(ls "$W8s" | sort | md5sum | awk '{print $1}')
+[[ "$rc" -eq 0 ]] && ok "dry-run with stale/orphan assets exits 0" || bad "dry-run stale failed (rc=$rc)"
+if grep -q "DRY-RUN: would delete stale asset: obsolete-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/dryrun-stale.log"; then
+  ok "dry-run plans stale-archive deletion"
+else
+  bad "stale deletion plan missing: $(grep -E 'DRY-RUN' "$WORKDIR/dryrun-stale.log" | head -3)"
+fi
+if grep -q "DRY-RUN: would delete signature asset: testa-1.0-1-x86_64.pkg.tar.zst.sig" "$WORKDIR/dryrun-stale.log"; then
+  ok "dry-run plans orphan-signature deletion"
+else
+  bad "signature deletion plan missing: $(grep -E 'DRY-RUN' "$WORKDIR/dryrun-stale.log" | head -3)"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched by dry-run stale plan" || bad "dry-run stale mutated release"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun-stale.events" 2>/dev/null; then
+  bad "dry-run stale performed mutations: $(cat "$WORKDIR/dryrun-stale.events")"
+else
+  ok "dry-run stale performed zero remote mutations"
+fi
+if grep -q "SUMMARY unchanged=.* uploaded=0 replaced=0 failed=0" "$WORKDIR/dryrun-stale.log"; then
+  ok "dry-run stale plan is zero-mutation per SUMMARY"
+else
+  bad "dry-run stale SUMMARY not zero-mutation: $(grep -E 'SUMMARY' "$WORKDIR/dryrun-stale.log" | head -2)"
+fi
+if ! grep -q "DRY-RUN: would delete stale asset: obsolete-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/dryrun-stale.log"; then
+  bad "stale deletion plan not recorded"
+fi
+if grep -q "Deleting stale assets" "$WORKDIR/dryrun-stale.log"; then
+  bad "dry-run issued real deletion message"
+else
+  ok "dry-run never issues real deletion messages"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: dry-run plans metadata replacement (changed bytes)"
+W8c="$WORKDIR/release-dryrun-meta"
+rm -rf "$W8c"; mkdir -p "$W8c"; touch "$W8c/.created"; : > "$W8c/.ids"
+seed_rel_archive testa "$W8c"
+( cd "$W8c" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+rm -rf "$WORKDIR/dryrun-meta-out"; mkdir -p "$WORKDIR/dryrun-meta-out"
+mk_pkgbuild testa
+mk_tar "$WORKDIR/dryrun-meta-out/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+# different metadata bytes (same profile, different fingerprint)
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "different"}\n' \
+  > "$WORKDIR/dryrun-meta-out/v4-testa.meta.json"
+before=$(ls "$W8c" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod dryrun-meta "$W8c" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-meta-out" DRY_RUN=1)
+after=$(ls "$W8c" | sort | md5sum | awk '{print $1}')
+[[ "$rc" -eq 0 ]] && ok "dry-run metadata change exits 0" || bad "dry-run meta failed (rc=$rc)"
+if grep -q "DRY-RUN: would replace metadata: v4-testa.meta.json" "$WORKDIR/dryrun-meta.log"; then
+  ok "dry-run plans metadata replacement"
+else
+  bad "metadata replacement plan missing: $(grep -E 'DRY-RUN' "$WORKDIR/dryrun-meta.log" | head -3)"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched by dry-run metadata plan" || bad "dry-run meta mutated release"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun-meta.events" 2>/dev/null; then
+  bad "dry-run meta performed mutations"
+else
+  ok "dry-run meta performed zero remote mutations"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: dry-run preflight still blocks same-version drift"
+# the same-version gate runs before any plan; even in dry-run a
+# different-bytes same-identity package must abort with zero mutations
+W8v="$WORKDIR/release-dryrun-samever"
+rm -rf "$W8v"; mkdir -p "$W8v"; touch "$W8v/.created"; : > "$W8v/.ids"
+seed_rel_archive testa "$W8v"
+( cd "$W8v" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+rm -rf "$WORKDIR/dryrun-samever-out"; mkdir -p "$WORKDIR/dryrun-samever-out"
+d="$WORKDIR/pkgbuild/testa"
+printf 'drift-bytes-dryrun\n' > "$d/usr/share/testa"
+touch -t 202001010000.00 "$d/.PKGINFO" "$d/usr" "$d/usr/share" "$d/usr/share/testa"
+mk_tar "$WORKDIR/dryrun-samever-out/testa-1.0-1-x86_64.pkg.tar.zst" "$d"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' \
+  > "$WORKDIR/dryrun-samever-out/v4-testa.meta.json"
+before=$(ls "$W8v" | sort | md5sum | awk '{print $1}')
+rc=$(run_prod dryrun-samever "$W8v" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-samever-out" DRY_RUN=1)
+after=$(ls "$W8v" | sort | md5sum | awk '{print $1}')
+[[ "$rc" -ne 0 ]] && ok "dry-run same-version drift aborts" || bad "dry-run samever did not abort (rc=$rc)"
+if grep -q "same identity" "$WORKDIR/dryrun-samever.log"; then
+  ok "same-version gate message present"
+else
+  bad "samever gate message missing: $(grep -E 'identity|refus' "$WORKDIR/dryrun-samever.log" | head -3)"
+fi
+[[ "$before" == "$after" ]] && ok "release untouched by dry-run samever abort" || bad "dry-run samever mutated release"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun-samever.events" 2>/dev/null; then
+  bad "dry-run samever performed mutations"
+else
+  ok "dry-run samever performed zero remote mutations"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: dry-run API failure aborts with zero mutations"
+# a failed remote query during planning (asset status) must abort the
+# dry-run without touching the release — never guess, never mutate
+W8f="$WORKDIR/release-dryrun-apifail"
+rm -rf "$W8f"; mkdir -p "$W8f"; touch "$W8f/.created"; : > "$W8f/.ids"
+seed_rel_archive testa "$W8f"
+( cd "$W8f" && repo-add 88kbleirad.db.tar.gz testa-1.0-1-x86_64.pkg.tar.zst >/dev/null 2>&1 )
+rm -rf "$WORKDIR/dryrun-apifail-out"; mkdir -p "$WORKDIR/dryrun-apifail-out"
+cp "$W8f/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/dryrun-apifail-out/"
+cp "$W8f/v4-testa.meta.json" "$WORKDIR/dryrun-apifail-out/"
+before=$(ls "$W8f" | sort | md5sum | awk '{print $1}')
+# force a failed remote checksum query: no API digest (MOCK_GH_NO_DIGEST)
+# + failing download fallback (FAIL_DOWNLOAD_ON) -> UNKNOWN -> abort
+rc=$(run_prod dryrun-apifail "$W8f" '["testa"]' WS_FIXTURES_DIR="$WORKDIR/dryrun-apifail-out" DRY_RUN=1 MOCK_GH_NO_DIGEST=1 FAIL_DOWNLOAD_ON="testa-1.0-1-x86_64.pkg.tar.zst")
+after=$(ls "$W8f" | sort | md5sum | awk '{print $1}')
+[[ "$rc" -ne 0 ]] && ok "dry-run API failure aborts" || bad "dry-run API failure did not abort (rc=$rc)"
+[[ "$before" == "$after" ]] && ok "release untouched by dry-run API failure" || bad "dry-run API failure mutated release"
+if grep -qE 'upload |delete-asset |create ' "$WORKDIR/dryrun-apifail.events" 2>/dev/null; then
+  bad "dry-run API failure performed mutations"
+else
+  ok "dry-run API failure performed zero remote mutations"
+fi
+
+# ---------------------------------------------------------------------------
+note "publish-prod: pre-mutation manifest is recorded before any upload"
 # After a successful (non-dry) publish, the pre-mutation manifest must
 # exist and describe the release that existed before mutation.
 W8e="$WORKDIR/release-manifest"

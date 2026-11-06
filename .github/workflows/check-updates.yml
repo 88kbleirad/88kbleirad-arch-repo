@@ -48,11 +48,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          INPUT_PACKAGES: ${{ inputs.packages }}
         run: |
           set -euo pipefail
           args=(--json "$GITHUB_WORKSPACE/update-report.json" --summary "$GITHUB_STEP_SUMMARY")
-          if [[ -n "${{ inputs.packages }}" ]]; then
-            IFS=',' read -ra PKG_ARRAY <<< "${{ inputs.packages }}"
+          if [[ -n "$INPUT_PACKAGES" ]]; then
+            IFS=',' read -ra PKG_ARRAY <<< "$INPUT_PACKAGES"
             args+=("${PKG_ARRAY[@]}")
           fi
           bash "$GITHUB_WORKSPACE/.github/scripts/check-updates.sh" "${args[@]}"

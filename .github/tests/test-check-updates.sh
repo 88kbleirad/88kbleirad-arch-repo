@@ -73,6 +73,14 @@ if jq -e '.[0].update_type == "CHECK_FAILED"' "$WORKDIR/report.json" >/dev/null 
 else
   bad "github probe failure not CHECK_FAILED: $(jq -r '.[0].update_type' "$WORKDIR/report.json" 2>/dev/null)"
 fi
+# the checker must resolve the package's PKGBUILD path; a CHECK_FAILED
+# caused by an empty path would silently disable all source parsing
+if jq -e '.[0].note | test("no PKGBUILD") | not' "$WORKDIR/report.json" >/dev/null 2>&1 \
+    && jq -e '.[0].current_version == "1.0.0"' "$WORKDIR/report.json" >/dev/null 2>&1; then
+  ok "PKGBUILD resolved (pkgver parsed, failure is upstream)"
+else
+  bad "PKGBUILD not resolved: $(jq -c '.[0]' "$WORKDIR/report.json")"
+fi
 
 # ---------------------------------------------------------------------------
 note "update detection: unsupported source is MANUAL_REVIEW (never guessed)"

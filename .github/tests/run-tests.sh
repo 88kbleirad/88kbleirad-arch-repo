@@ -121,6 +121,13 @@ else
   bad "update-detection safety suite"
 fi
 
+note "workflow-audit suite (triggers / gate / permissions / inventory)"
+if bash "$REPO_ROOT/.github/tests/test-workflow-audit.sh"; then
+  ok "workflow-audit suite"
+else
+  bad "workflow-audit suite"
+fi
+
 # -- 4. matrix gate tests ---------------------------------------------------
 note "matrix gate tests (approval / schedule / critical / subset)"
 if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then

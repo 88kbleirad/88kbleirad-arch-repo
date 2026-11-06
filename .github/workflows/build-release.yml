@@ -74,8 +74,12 @@ permissions:
   contents: read
 
 concurrency:
+  # A second manual run must QUEUE behind an in-flight production run, not
+  # cancel it: GitHub Releases are non-atomic, so killing a mid-publish run
+  # would orphan partial assets. The next queued run reconciles via the
+  # pre-mutation manifest + content-aware publish.
   group: release-repo
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  cancel-in-progress: false
 
 env:
   RELEASE_TAG: repository
@@ -233,7 +237,7 @@ jobs:
           PUBLISH_SCRIPT: publish-prod.sh
           EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
           SIGNING_MODE: unsigned
-          DRY_RUN: ${{ inputs.dry-run }}
+          DRY_RUN: ${{ inputs.dry-run && '1' || '0' }}
           EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
@@ -288,7 +292,7 @@ jobs:
           PUBLISH_SCRIPT: publish-prod.sh
           EXCLUDED_BASES_FILE: ${{ needs.prepare.outputs.excluded_bases_file }}
           SIGNING_MODE: signed
-          DRY_RUN: ${{ inputs.dry-run }}
+          DRY_RUN: ${{ inputs.dry-run && '1' || '0' }}
           EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
@@ -299,18 +303,23 @@ jobs:
   # prepare matrix, never hardcoded).
   health-check:
     needs: [prepare, publish, publish-signed]
+    # `inputs.signing-mode` is empty for non-workflow_dispatch events
+    # (e.g. an authorized scheduled run), which must still resolve to the
+    # documented unsigned default — otherwise neither branch below would
+    # match and the required post-publication gate would be skipped
+    # silently.
     if: >-
       ${{
         always() &&
         !inputs.dry-run &&
         needs.prepare.result == 'success' &&
         (
-          (inputs.signing-mode == 'unsigned' && needs.publish.result == 'success') ||
-          (inputs.signing-mode == 'signed' && needs.publish-signed.result == 'success')
+          ((inputs.signing-mode || 'unsigned') == 'unsigned' && needs.publish.result == 'success') ||
+          ((inputs.signing-mode || 'unsigned') == 'signed' && needs.publish-signed.result == 'success')
         )
       }}
     uses: ./.github/workflows/repo-health.yml
     with:
       release-tag: repository
-      signing-mode: ${{ inputs.signing-mode }}
+      signing-mode: ${{ inputs.signing-mode || 'unsigned' }}
       expected-packages: ${{ needs.prepare.outputs.matrix }}

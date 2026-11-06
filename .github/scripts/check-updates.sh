@@ -172,8 +172,9 @@ parse_source_url() { # PKGBUILD -> first source URL (expanded), or empty
 }
 
 check_pkg() {
-  local pkg="$1" pkgbuild="$REPO_ROOT/$pkg/PKGBUILD"
-  local cur_ver cur_rel src_url src_kind upstream_ver="" upstream_ref="" result="MANUAL_REVIEW" risk="low" note=""
+  local pkg="$1"
+  local pkgbuild="$REPO_ROOT/$pkg/PKGBUILD"
+  local cur_ver src_url upstream_ver="" upstream_ref="" result="MANUAL_REVIEW" risk="low" note=""
   if [[ ! -f "$pkgbuild" ]]; then
     printf '{"package":"%s","status":"CHECK_FAILED","reason":"no PKGBUILD"}\n' "$pkg"
     return 0

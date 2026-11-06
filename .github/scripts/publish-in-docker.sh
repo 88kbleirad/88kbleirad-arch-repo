@@ -157,6 +157,13 @@ if [[ $boot_rc -ne 0 ]]; then
 fi
 
 set -o pipefail
+# Normalize DRY_RUN to 1/0 regardless of the caller's spelling (workflow
+# boolean inputs render `true`/`false`; the publish scripts check `"1"`).
+# A stray `true` would otherwise execute real mutations.
+case "${DRY_RUN:-0}" in
+  1|true|TRUE|yes|YES) DRY_RUN=1 ;;
+  *) DRY_RUN=0 ;;
+esac
 docker exec \
   -e GH_TOKEN \
   -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
@@ -165,7 +172,7 @@ docker exec \
   -e GITHUB_STEP_SUMMARY="$SUMMARY_FILE" \
   -e EXCLUDED_BASES_FILE="${EXCLUDED_BASES_FILE:-}" \
   -e SIGNING_MODE="${SIGNING_MODE:-unsigned}" \
-  -e DRY_RUN="${DRY_RUN:-0}" \
+  -e DRY_RUN="$DRY_RUN" \
   -e EXPECTED_PACKAGES="${EXPECTED_PACKAGES:-}" \
   -e GPG_KEY_FILE="/run/secrets/gpg-key" \
   -e GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:+/run/secrets/gpg-passphrase}" \

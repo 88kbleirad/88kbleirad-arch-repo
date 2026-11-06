@@ -73,7 +73,7 @@ declare -A RESULT=(
   [repository]="$REPO"
   [release_tag]="$TAG"
   [timestamp]="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  [commit_sha]="${GITHUB_SHA:-}"
+  [commit_sha]="${COMMIT_SHA:-${GITHUB_SHA:-}}"
   [package_count]=0
   [metadata_count]=0
   [database_asset_count]=0
@@ -93,10 +93,16 @@ record_problem() { PROBLEMS+=("$1"); }
 # expected inventory
 # ---------------------------------------------------------------------------
 expected_names=()
+MALFORMED_INVENTORY=0
 if [[ -n "$EXPECTED_JSON" ]]; then
-  while IFS= read -r n; do
-    [[ -n "$n" ]] && expected_names+=("$n")
-  done < <(printf '%s\n' "$EXPECTED_JSON" | jq -r '.[]')
+  if ! printf '%s\n' "$EXPECTED_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    record_problem "malformed expected inventory (not a JSON array); treating as validation failure"
+    MALFORMED_INVENTORY=1
+  else
+    while IFS= read -r n; do
+      [[ -n "$n" ]] && expected_names+=("$n")
+    done < <(printf '%s\n' "$EXPECTED_JSON" | jq -r '.[]')
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -109,32 +115,61 @@ if ! gh_api_retry "view release (${TAG})" \
   set_result database_status FAIL
   set_result checksum_status FAIL
   set_result metadata_status FAIL
-  echo "{\"error\":\"release not found\"}"
+  set_result missing_assets "release ${TAG}"
+  JSON=$(jq -n \
+    --arg repository "${RESULT[repository]}" \
+    --arg release_tag "${RESULT[release_tag]}" \
+    --arg timestamp "${RESULT[timestamp]}" \
+    --arg commit_sha "${RESULT[commit_sha]}" \
+    --argjson package_count "${RESULT[package_count]}" \
+    --argjson metadata_count "${RESULT[metadata_count]}" \
+    --argjson database_asset_count "${RESULT[database_asset_count]}" \
+    --arg checksum_status "${RESULT[checksum_status]}" \
+    --arg database_status "${RESULT[database_status]}" \
+    --arg metadata_status "${RESULT[metadata_status]}" \
+    --arg signing_status "${RESULT[signing_status]}" \
+    --arg missing_assets "${RESULT[missing_assets]}" \
+    --arg unexpected_assets "${RESULT[unexpected_assets]}" \
+    --argjson cleanup_proposal "[]" \
+    --arg overall_status "${RESULT[overall_status]}" \
+    '{repository:$repository, release_tag:$release_tag, timestamp:$timestamp, commit_sha:$commit_sha, package_count:$package_count, metadata_count:$metadata_count, database_asset_count:$database_asset_count, checksum_status:$checksum_status, database_status:$database_status, metadata_status:$metadata_status, signing_status:$signing_status, missing_assets:$missing_assets, unexpected_assets:$unexpected_assets, cleanup_proposal:$cleanup_proposal, overall_status:$overall_status}')
+  if [[ -n "$JSON_OUT" ]]; then
+    printf '%s\n' "$JSON" > "$JSON_OUT"
+  else
+    printf '%s\n' "$JSON"
+  fi
   exit 1
 fi
 
-# enumerate assets: name|id|digest
+# enumerate assets: name|id|size|digest
 declare -A ASSET_DIGEST=()
 declare -A ASSET_ID=()
-while IFS='|' read -r name id digest; do
+declare -A ASSET_SIZE=()
+while IFS='|' read -r name id size digest; do
   [[ -n "$name" ]] || continue
   ASSET_DIGEST["$name"]="${digest#sha256:}"
   ASSET_ID["$name"]="$id"
+  ASSET_SIZE["$name"]="$size"
 done < <(gh_api_retry "list assets (${TAG})" \
     "/repos/${REPO}/releases/tags/${TAG}" \
-    --jq '.assets[] | "\(.name)|\(.id)|\(.digest // "")"' 2>/dev/null)
+    --jq '.assets[] | "\(.name)|\(.id)|\(.size // "")|\(.digest // "")"' 2>/dev/null)
 
 pkg_assets=()
 meta_assets=()
 db_assets=()
 sig_assets=()
 other_assets=()
+declare -A SIG_OWNER=()
 for name in "${!ASSET_DIGEST[@]}"; do
   case "$name" in
     *.pkg.tar.zst) pkg_assets+=("$name") ;;
     v4-*.meta.json) meta_assets+=("$name") ;;
     "${REPO_DB_NAME}".db|"${REPO_DB_NAME}".db.tar.gz|"${REPO_DB_NAME}".files|"${REPO_DB_NAME}".files.tar.gz) db_assets+=("$name") ;;
-    *.sig) sig_assets+=("$name") ;;
+    *.sig)
+      sig_assets+=("$name")
+      # owner: the archive/db asset the signature belongs to (strip .sig)
+      SIG_OWNER["$name"]="${name%.sig}"
+      ;;
     *) other_assets+=("$name") ;;
   esac
 done
@@ -262,15 +297,63 @@ for a in "${pkg_assets[@]}"; do
 done
 for a in "${meta_assets[@]}"; do
   base="${a#v4-}"; base="${base%.meta.json}"
-  # expected metas: all v4-*.meta.json whose base is in the DB or expected list
-  if (( ${#expected_names[@]} > 0 )); then
-    if ! printf '%s\n' "${expected_names[@]}" | grep -qx "$base"; then
-      if [[ -z "${DB_BASES[$base]:-}" ]] && [[ -z "${DB_NAME_SEEN[$base]:-}" ]]; then
-        unexpected_assets+=("$a")
-        record_problem "unexpected metadata asset: $a"
+  # A meta whose base is a database base/name (or an expected package) is
+  # active — even if its archive is missing, that is a missing-asset
+  # problem, not an orphan. Anything else is stale (checked regardless of
+  # whether an expected inventory was supplied).
+  if [[ -z "${DB_BASES[$base]:-}" ]] && [[ -z "${DB_NAME_SEEN[$base]:-}" ]]; then
+    if (( ${#expected_names[@]} > 0 )); then
+      if printf '%s\n' "${expected_names[@]}" | grep -qx "$base"; then
+        continue
       fi
     fi
+    unexpected_assets+=("$a")
+    record_problem "unexpected metadata asset: $a"
   fi
+done
+
+# orphaned detached signatures: a .sig whose owner asset (package archive or
+# database file) is not present in the release at all
+for a in "${sig_assets[@]}"; do
+  owner="${SIG_OWNER[$a]:-}"
+  if [[ -n "$owner" && -z "${ASSET_DIGEST[$owner]:-}" ]]; then
+    unexpected_assets+=("$a")
+    record_problem "orphaned signature asset (owner asset missing): $a"
+  fi
+done
+
+# explicit read-only cleanup proposal: every orphaned/stale asset with its
+# API identity (name, id, size, digest) and a conservative classification.
+# Report-only — never deletes. The `type` field distinguishes archives,
+# signatures, and metadata; `reason` explains why it is considered stale.
+orphan_proposal=()
+proposal_reason() {
+  local a="$1"
+  case "$a" in
+    *.pkg.tar.zst) echo "not referenced by repository database" ;;
+    *.sig) echo "owner asset missing from release" ;;
+    v4-*.meta.json) echo "no matching database/expected package base" ;;
+    *) echo "not referenced by repository database" ;;
+  esac
+}
+proposal_type() {
+  local a="$1"
+  case "$a" in
+    *.pkg.tar.zst) echo "archive" ;;
+    *.sig) echo "signature" ;;
+    v4-*.meta.json) echo "metadata" ;;
+    *) echo "asset" ;;
+  esac
+}
+for a in "${unexpected_assets[@]}"; do
+  orphan_proposal+=("$(jq -nc \
+    --arg name "$a" \
+    --arg id "${ASSET_ID[$a]:-}" \
+    --arg size "${ASSET_SIZE[$a]:-}" \
+    --arg digest "${ASSET_DIGEST[$a]:-}" \
+    --arg type "$(proposal_type "$a")" \
+    --arg reason "$(proposal_reason "$a")" \
+    '{name:$name, id:$id, size:$size, digest:$digest, type:$type, reason:$reason}')")
 done
 
 # ---------------------------------------------------------------------------
@@ -367,6 +450,12 @@ fi
 # overall status
 # ---------------------------------------------------------------------------
 overall="HEALTHY"
+if [[ "$MALFORMED_INVENTORY" -eq 1 ]]; then
+  # an unparsable expected inventory means the repository cannot be
+  # verified against the required matrix — fail closed, never HEALTHY
+  overall="FAILED"
+  set_result database_status FAIL
+fi
 if (( ${#missing_assets[@]} > 0 )) || (( ${#unexpected_assets[@]} > 0 )); then
   overall="DEGRADED"
 fi
@@ -385,6 +474,11 @@ set_result metadata_count "${#meta_assets[@]}"
 # ---------------------------------------------------------------------------
 # emit JSON
 # ---------------------------------------------------------------------------
+proposal_json="[]"
+if (( ${#orphan_proposal[@]} > 0 )); then
+  proposal_json=$(printf '%s\n' "${orphan_proposal[@]}" | jq -s -c .)
+fi
+
 JSON=$(jq -n \
   --arg repository "${RESULT[repository]}" \
   --arg release_tag "${RESULT[release_tag]}" \
@@ -399,8 +493,9 @@ JSON=$(jq -n \
   --arg signing_status "${RESULT[signing_status]}" \
   --arg missing_assets "${RESULT[missing_assets]}" \
   --arg unexpected_assets "${RESULT[unexpected_assets]}" \
+  --argjson cleanup_proposal "$proposal_json" \
   --arg overall_status "${RESULT[overall_status]}" \
-  '{repository:$repository, release_tag:$release_tag, timestamp:$timestamp, commit_sha:$commit_sha, package_count:$package_count, metadata_count:$metadata_count, database_asset_count:$database_asset_count, checksum_status:$checksum_status, database_status:$database_status, metadata_status:$metadata_status, signing_status:$signing_status, missing_assets:$missing_assets, unexpected_assets:$unexpected_assets, overall_status:$overall_status}')
+  '{repository:$repository, release_tag:$release_tag, timestamp:$timestamp, commit_sha:$commit_sha, package_count:$package_count, metadata_count:$metadata_count, database_asset_count:$database_asset_count, checksum_status:$checksum_status, database_status:$database_status, metadata_status:$metadata_status, signing_status:$signing_status, missing_assets:$missing_assets, unexpected_assets:$unexpected_assets, cleanup_proposal:$cleanup_proposal, overall_status:$overall_status}')
 if [[ -n "$JSON_OUT" ]]; then
   printf '%s\n' "$JSON" > "$JSON_OUT"
 else
@@ -424,6 +519,16 @@ if [[ -n "$SUMMARY_OUT" ]]; then
     echo "- signing_status: ${RESULT[signing_status]}"
     echo "- missing_assets: ${RESULT[missing_assets]:-none}"
     echo "- unexpected_assets: ${RESULT[unexpected_assets]:-none}"
+    if (( ${#orphan_proposal[@]} > 0 )); then
+      echo
+      echo "### Orphaned assets (report-only cleanup proposal — nothing deleted)"
+      echo
+      echo "| type | asset | id | size | digest | reason |"
+      echo "|---|---|---|---|---|---|"
+      for rec in "${orphan_proposal[@]}"; do
+        echo "| $(jq -r '.type // "-"' <<<"$rec") | $(jq -r '.name' <<<"$rec") | $(jq -r '.id // "-"' <<<"$rec") | $(jq -r '.size // "-"' <<<"$rec") | $(jq -r '.digest // "-"' <<<"$rec") | $(jq -r '.reason // "-"' <<<"$rec") |"
+      done
+    fi
     if (( ${#PROBLEMS[@]} > 0 )); then
       echo
       echo "### Problems"

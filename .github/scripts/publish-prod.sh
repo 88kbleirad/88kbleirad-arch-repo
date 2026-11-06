@@ -585,20 +585,25 @@ if [[ "$SIGNING_MODE" == "signed" ]]; then
     rm -rf "$MERGE_DIR"
     exit 1
   fi
-  pub_assets=( ${REPO_DB_NAME}.pub.asc )
+  pub_assets=( "${REPO_DB_NAME}.pub.asc" )
 fi
 
-# Ensure the release exists (with retries via the lib)
+# Ensure the release exists (with retries via the lib). In dry-run the
+# release is never created: the mutation is planned and reported only.
 if gh_api_retry "view release (${TAG})" \
     "/repos/${REPO}/releases/tags/${TAG}" >/dev/null 2>&1; then
   echo "Release $TAG exists; merging this run into it."
 else
-  echo "Creating release $TAG."
-  gh_api_retry "create release (${TAG})" \
-    --method POST "/repos/${REPO}/releases" \
-    --field tag_name="$TAG" \
-    --field name="Arch Package Repository" \
-    --field body="Auto-built pacman repository." >/dev/null 2>&1
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "[publish] DRY-RUN: release $TAG does not exist; would create it."
+  else
+    echo "Creating release $TAG."
+    gh_api_retry "create release (${TAG})" \
+      --method POST "/repos/${REPO}/releases" \
+      --field tag_name="$TAG" \
+      --field name="Arch Package Repository" \
+      --field body="Auto-built pacman repository." >/dev/null 2>&1
+  fi
 fi
 
 # Configure preflight conflict/regression guards (runs earlier, before
@@ -703,7 +708,11 @@ fi
 rm -rf "$MERGE_DIR"
 
 if (( ${#stale_assets[@]} > 0 )); then
-  echo "Deleting stale assets that are no longer part of the repository:"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "DRY-RUN: would delete these stale assets (plan-only):"
+  else
+    echo "Deleting stale assets that are no longer part of the repository:"
+  fi
   for stale in "${stale_assets[@]}"; do
     echo "  - $stale"
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -738,10 +747,10 @@ if [[ "$SIGNING_MODE" == "unsigned" ]]; then
     [[ -n "$asset" ]] || continue
     case "$asset" in
       *.pkg.tar.zst.sig|"${REPO_DB_NAME}.db.sig"|"${REPO_DB_NAME}.db.tar.gz.sig"|"${REPO_DB_NAME}.files.sig"|"${REPO_DB_NAME}.files.tar.gz.sig")
-        echo "Deleting superseded signature asset: $asset"
         if [[ "${DRY_RUN:-0}" == "1" ]]; then
           echo "[publish] DRY-RUN: would delete signature asset: $asset"
         else
+          echo "Deleting superseded signature asset: $asset"
           gh_delete_asset "$TAG" "$REPO" "$asset" \
             || echo "::warning::Cannot delete stale signature $asset; the next run will retry."
         fi
