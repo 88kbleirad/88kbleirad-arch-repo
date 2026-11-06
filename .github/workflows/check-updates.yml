@@ -113,7 +113,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: update-report
-          path: "${{ github.workspace }}/lifecycle-report"
+          path: "${{ runner.temp }}/lifecycle-report"
           merge-multiple: true
 
       - name: Generate proposals and open/update PR
@@ -123,7 +123,7 @@ jobs:
           ALLOW_REMOTE_PR: ${{ inputs.allow-remote-pr }}
         run: |
           set -euo pipefail
-          report="$GITHUB_WORKSPACE/lifecycle-report/update-report.json"
+          report="$RUNNER_TEMP/lifecycle-report/update-report.json"
           [[ -s "$report" ]] || { echo "::error::lifecycle report missing"; exit 1; }
           args=(--report "$report" --repo "${{ github.repository }}" --base main --push)
           # OWNER-GATED Phase 5.2 validation: only runs when the owner
