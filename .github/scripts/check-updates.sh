@@ -312,9 +312,21 @@ classify_pkg() {
       result="CHECK_FAILED"; note="git ls-remote failed"; probe_ok="false"
     else
       probe_ok="true"
-      head_sha=$(printf '%s\n' "$heads" | awk '$2=="HEAD"{print $1; exit}')
+      # Parse the ref list in pure Bash (here-string). The previous
+      # `printf | awk '...exit'` pipeline hit SIGPIPE on large ref lists:
+      # awk exits after the first HEAD line while the printf builtin is
+      # still writing, the pipe closes, and under `set -o pipefail` the
+      # failing builtin aborts the whole script (line 315). A here-string
+      # has no producer writing into a pipe that a consumer can close.
+      head_sha=""
+      while IFS=$' \t' read -r _sha _ref || [[ -n "$_sha" ]]; do
+        [[ "$_ref" == "HEAD" ]] && { head_sha="$_sha"; break; }
+      done <<< "$heads"
       if [[ -z "$head_sha" ]]; then
-        head_sha=$(printf '%s\n' "$heads" | awk '$2 ~ /refs\/heads\/master$|refs\/heads\/main$/ {print $1; exit}')
+        while IFS=$' \t' read -r _sha _ref || [[ -n "$_sha" ]]; do
+          [[ "$_ref" == "refs/heads/master" || "$_ref" == "refs/heads/main" ]] \
+            && { head_sha="$_sha"; break; }
+        done <<< "$heads"
       fi
       if [[ "$src_url" == *"#commit="* ]]; then
         local pinned="${src_url##*#commit=}"

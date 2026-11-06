@@ -142,11 +142,13 @@ Test-only environment variables (never set in production workflows):
 
 ## 7. Acceptance / tests
 
-- `test-check-updates.sh` (host): 30 assertions — legacy safety semantics,
+- `test-check-updates.sh` (host): 34 assertions — legacy safety semantics,
   epoch/pkgrel parsing, vercmp non-lexical, missing-vercmp fail-closed
   (rc 2), epoch/pkgver/pkgrel comparison smoke, 404/archived/empty upstream
   classification, VCS pinned-commit states, package type, schema, offline
-  discovery from packages.txt.
+  discovery from packages.txt, and a real `git ls-remote` regression
+  (20k-ref bare repo via a local `file://` remote — reproduces the SIGPIPE
+  broken-pipe failure of the previous `printf | awk 'exit'` parser).
 - `test-propose-updates.sh` (host): 12 assertions — proposal generation for
   verified states only, index separation, deterministic branches, idempotent
   docs, no checksum/PKGBUILD edits, no secrets, no-update report.

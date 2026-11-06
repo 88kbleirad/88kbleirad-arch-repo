@@ -15,7 +15,7 @@ publication, no Pages enablement) — those require owner authorization.
 
 | Suite | Source | Result |
 |---|---|---|
-| lifecycle detection + safety (incl. vercmp provisioning) | `test-check-updates.sh` | 30 PASS |
+| lifecycle detection + safety (incl. vercmp provisioning + SIGPIPE regression) | `test-check-updates.sh` | 34 PASS |
 | update proposals (offline) | `test-propose-updates.sh` | 12 PASS |
 | workflow audit (+ Phase 5.4 gates) | `test-workflow-audit.sh` | 29 PASS |
 | artifact collection (REST retrieval, mock API) | `test-artifact-collection.sh` | 30 PASS |
@@ -37,7 +37,7 @@ publication, no Pages enablement) — those require owner authorization.
 `REPO_ROOT=$PWD RUN_PROD_SCENARIOS=1 bash .github/tests/run-tests.sh`
 runs every existing suite plus the newly registered Phase 5 suites.
 Measured (pinned container): overall `PASS=56 FAIL=0`, `EXIT=0` — 18 suite
-runs, including lifecycle (30), proposals (12), workflow-audit (29),
+runs, including lifecycle (34), proposals (12), workflow-audit (29),
 artifact-collection (30), metrics (13), dashboard (18), and all Phase 1–4
 suites (host + container).
 

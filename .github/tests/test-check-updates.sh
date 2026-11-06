@@ -315,6 +315,95 @@ else
   bad "probe_ok wrong: $(jq -r '.[0].probe_ok' "$WORKDIR/report.json")"
 fi
 
+# ---------------------------------------------------------------------------
+note "lifecycle: large VCS ref list produces no broken pipe (regression)"
+# The previous `printf | awk '...exit'` pipeline died with EPIPE (exit 1)
+# on large ref lists: awk exits after the first HEAD line while printf is
+# still writing, and `set -o pipefail` propagates the failure. The live
+# failure happens with real `git ls-remote` output, which can be far larger
+# than an environment variable can carry — so this regression builds a real
+# local bare repository with tens of thousands of refs and feeds it through
+# the actual git_ls_remote() (no mock, no network, no env-size limit).
+FAKE_REPO="$WORKDIR/fake-git-repo.git"
+git init --bare -q "$FAKE_REPO"
+# build one real commit object (offline; no date/environment dependence)
+BLOB="$(printf 'content' | git -C "$FAKE_REPO" hash-object -w --stdin)"
+TREE="$(printf '100644 blob %s	file
+' "$BLOB" | git -C "$FAKE_REPO" mktree)"
+OBJID="$(printf 'tree %s
+author T <t@t> 0 +0000\ncommitter T <t@t> 0 +0000\n\ninit\n' "$TREE" | git -C "$FAKE_REPO" hash-object -t commit -w --stdin)"
+i=0
+while (( i < 20000 )); do
+  git -C "$FAKE_REPO" update-ref "refs/tags/v1.$(( i / 1000 )).$(( i % 1000 ))" "$OBJID"
+  i=$(( i + 1 ))
+done
+git -C "$FAKE_REPO" symbolic-ref HEAD refs/heads/main
+git -C "$FAKE_REPO" update-ref refs/heads/main "$OBJID"
+REF_COUNT="$(git -C "$FAKE_REPO" show-ref | wc -l)"
+mkdir -p "$WORKDIR/large-vcs-pkg"
+cat > "$WORKDIR/large-vcs-pkg/PKGBUILD" <<PB
+pkgname=large-vcs-pkg
+pkgver=1.0
+pkgrel=1
+url=https://github.com/example/large-vcs-pkg
+source=("git+file://${WORKDIR}/fake-git-repo.git")
+sha256sums=('SKIP')
+PB
+# the heredoc above REQUIRES expansion so the fixture points at the local
+# repository (an unexpanded \${WORKDIR} would silently use a non-existent
+# path and the test would pass for the wrong reason)
+grep -q "file://${WORKDIR}/fake-git-repo.git" "$WORKDIR/large-vcs-pkg/PKGBUILD" \
+  || { echo "FATAL: fixture PKGBUILD was not expanded" >&2; exit 1; }
+rc=$(run_check_mock large-vcs-pkg "$WORKDIR")
+if [[ "$rc" -eq 0 ]]; then
+  ok "large VCS ref list ($REF_COUNT refs) handled without broken pipe (rc=0)"
+else
+  bad "large VCS ref list failed with rc=$rc (broken pipe regression)"
+fi
+if jq -e '.[0].update_type == "SOURCE_CHANGED" and .[0].source_reference != ""' \
+    "$WORKDIR/report.json" >/dev/null 2>&1; then
+  ok "branch HEAD SHA extracted from the large ref list"
+else
+  bad "large ref list misparsed: $(jq -c '.[0] | {u:.update_type, r:.source_reference}' "$WORKDIR/report.json")"
+fi
+
+note "lifecycle: HEAD absent -> master/main fallback still works (large list)"
+# regenerate a fake repo without a symbolic HEAD (only refs/heads/main plus
+# tens of thousands of tags) — exercises the second (fallback) scan
+FAKE_REPO2="$WORKDIR/fake-git-repo2.git"
+git init --bare -q "$FAKE_REPO2"
+BLOB2="$(printf 'content2' | git -C "$FAKE_REPO2" hash-object -w --stdin)"
+TREE2="$(printf '100644 blob %s\tfile\n' "$BLOB2" | git -C "$FAKE_REPO2" mktree)"
+OBJID2="$(printf 'tree %s\nauthor T <t@t> 0 +0000\ncommitter T <t@t> 0 +0000\n\nmain\n' "$TREE2" | git -C "$FAKE_REPO2" hash-object -t commit -w --stdin)"
+i=0
+while (( i < 20000 )); do
+  git -C "$FAKE_REPO2" update-ref "refs/tags/v9.$(( i % 997 ))" "$OBJID2"
+  i=$(( i + 1 ))
+done
+BLOB2="$(printf 'content2' | git -C "$FAKE_REPO2" hash-object -w --stdin)"
+TREE2="$(printf '100644 blob %s	file
+' "$BLOB2" | git -C "$FAKE_REPO2" mktree)"
+MAIN_SHA="$(printf 'tree %s
+author T <t@t> 0 +0000\ncommitter T <t@t> 0 +0000\n\nmain\n' "$TREE2" | git -C "$FAKE_REPO2" hash-object -t commit -w --stdin)"
+git -C "$FAKE_REPO2" update-ref refs/heads/main "$MAIN_SHA"
+sed "s#fake-git-repo.git#fake-git-repo2.git#" \
+  "$WORKDIR/large-vcs-pkg/PKGBUILD" > "$WORKDIR/large-vcs-pkg/PKGBUILD.tmp"
+mv "$WORKDIR/large-vcs-pkg/PKGBUILD.tmp" "$WORKDIR/large-vcs-pkg/PKGBUILD"
+grep -q "file://${WORKDIR}/fake-git-repo2.git" "$WORKDIR/large-vcs-pkg/PKGBUILD" \
+  || { echo "FATAL: fallback fixture PKGBUILD was not rewritten" >&2; exit 1; }
+rc=$(run_check_mock large-vcs-pkg "$WORKDIR")
+if [[ "$rc" -eq 0 ]]; then
+  ok "master/main fallback parsing survives a large ref list"
+else
+  bad "fallback parsing failed rc=$rc"
+fi
+if jq -e ".[0].source_reference == \"$MAIN_SHA\"" \
+    "$WORKDIR/report.json" >/dev/null 2>&1; then
+  ok "main branch SHA extracted from the large list"
+else
+  bad "main SHA not extracted: $(jq -r '.[0].source_reference' "$WORKDIR/report.json")"
+fi
+
 note "lifecycle: discovery from packages.txt (no hardcoded package count)"
 # discovery must read the real packages.txt and include local: entries.
 # Probes are mocked so the check is offline and deterministic.
