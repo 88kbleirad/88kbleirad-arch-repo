@@ -64,6 +64,11 @@ if jq -e '.kpis.total_packages == 2 and .kpis.up_to_date == 1 and .kpis.updates_
 else
   bad "KPI derivation wrong: $(jq -c '.kpis' "$WORKDIR/snapshot.json")"
 fi
+if jq -e '.kpis.build_failures == 0' "$WORKDIR/snapshot.json" >/dev/null 2>&1; then
+  ok "build_failures is a verified zero when CI rows exist"
+else
+  bad "build_failures should be 0 with verified CI rows: $(jq -c '.kpis.build_failures' "$WORKDIR/snapshot.json")"
+fi
 if jq -e '.kpis.production_health == "HEALTHY" and .kpis.staging_health == "HEALTHY"' \
     "$WORKDIR/snapshot.json" >/dev/null 2>&1; then
   ok "health KPIs from newest observation per release"
@@ -118,6 +123,12 @@ if jq -e '.kpis.total_packages == 0 and .kpis.production_health == null and .kpi
   ok "no-source snapshot has null KPIs"
 else
   bad "no-source KPIs fabricated: $(jq -c '.kpis' "$WORKDIR/snapshot3.json")"
+fi
+if jq -e '.kpis.build_failures == null and .kpis.build_success_rate == null' \
+    "$WORKDIR/snapshot3.json" >/dev/null 2>&1; then
+  ok "build KPIs are null (not zero) when no CI source exists"
+else
+  bad "build KPIs fabricated from absent CI: $(jq -c '.kpis | {f:.build_failures,s:.build_success_rate}' "$WORKDIR/snapshot3.json")"
 fi
 
 # ---------------------------------------------------------------------------

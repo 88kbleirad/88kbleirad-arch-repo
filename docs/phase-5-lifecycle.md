@@ -63,6 +63,17 @@ State semantics are independent from repository health verdicts
 Network/probe failures are **never** reported as updates (`CHECK_FAILED` /
 `UPSTREAM_*`). `vercmp` (pacman-contrib) is the only version comparator.
 
+Probe failures are classified (`note` + `probe_error`): `UPSTREAM_UNAVAILABLE`
+for a resolved-but-missing upstream (git repo 404, npm package 404,
+GitHub repo 404), `CHECK_FAILED` with a reason for transient failures
+(rate limit 403/429, registry/server error, timeout, unreachable).
+A GitHub repository **rename** (canonical repo name differs, e.g.
+printcraft → pdfcraft) is `MANUAL_REVIEW` — identity cannot be assumed. A
+pure owner transfer (same repo name) leaves the source URL valid and is
+not flagged. (VCS revisions are compared by abbreviated-prefix against
+upstream HEAD; a full-vs-abbreviated textual difference alone is never a
+source change.)
+
 ## 4. Report schema (`check-updates.sh`)
 
 Per-package object (stable, additive since Phase 4.4):
@@ -83,10 +94,15 @@ Per-package object (stable, additive since Phase 4.4):
   "risk_level": "low",
   "recommended_action": "none",
   "probe_ok": true,
+  "probe_error": "",
   "checked_at": "2026-11-06T00:00:00Z",
   "note": "current matches"
 }
 ```
+
+`probe_error` is `""` when the probe succeeded; otherwise it carries the
+classified failure reason (`missing`, `auth`, `network_error`, `timed_out`
+for git; npm/GitHub failures are described in `note`).
 
 `package_type` is a best-effort classification (stable / vcs / binary /
 local / xlibre) from the package name and `packages.txt` prefixes — it is
@@ -104,11 +120,12 @@ Test-only environment variables (never set in production workflows):
 
 | Variable | Effect |
 |---|---|
-| `MOCK_PROBE_GIT_REFS` | simulated `git ls-remote` output |
+| `MOCK_PROBE_GIT_REFS` | simulated `git ls-remote` output (empty = failed probe) |
+| `MOCK_PROBE_GIT_ERROR` | reason for the empty GIT_REFS mock (`missing`/`auth`/…) |
 | `MOCK_PROBE_GITHUB_JSON` / `MOCK_PROBE_GITHUB_STATUS` | GitHub releases/tags mock body/status |
-| `MOCK_PROBE_GITHUB_REPO_JSON` / `MOCK_PROBE_GITHUB_REPO_STATUS` | GitHub repository metadata mock |
+| `MOCK_PROBE_GITHUB_REPO_JSON` / `MOCK_PROBE_GITHUB_REPO_STATUS` | GitHub repository metadata mock (include `full_name` for rename tests) |
 | `MOCK_PROBE_GITLAB_JSON` | GitLab tags mock |
-| `MOCK_PROBE_NPM_JSON` | npm registry mock |
+| `MOCK_PROBE_NPM_JSON` / `MOCK_PROBE_NPM_STATUS` | npm registry mock body/status (404/403/429/5xx) |
 | `MOCK_PROBE_HTTP_STATUS` | generic HEAD mock |
 
 ## 6. Update proposals (Phase 5.2)
@@ -142,13 +159,18 @@ Test-only environment variables (never set in production workflows):
 
 ## 7. Acceptance / tests
 
-- `test-check-updates.sh` (host): 34 assertions — legacy safety semantics,
+- `test-check-updates.sh` (host): 48 assertions — legacy safety semantics,
   epoch/pkgrel parsing, vercmp non-lexical, missing-vercmp fail-closed
   (rc 2), epoch/pkgver/pkgrel comparison smoke, 404/archived/empty upstream
   classification, VCS pinned-commit states, package type, schema, offline
-  discovery from packages.txt, and a real `git ls-remote` regression
+  discovery from packages.txt, a real `git ls-remote` regression
   (20k-ref bare repo via a local `file://` remote — reproduces the SIGPIPE
-  broken-pipe failure of the previous `printf | awk 'exit'` parser).
+  broken-pipe failure of the previous `printf | awk 'exit'` parser), and
+  accuracy hardening: nested-variable + quoted `git+"URL"` source parsing,
+  `?signed` VCS syntax, git probe failure classification (missing/transient),
+  npm 404/403 classification, GitHub repository rename → MANUAL_REVIEW,
+  abbreviated-pkgver-SHA vs full upstream HEAD comparison (false-positive
+  elimination), unrecoverable pkgver revision → MANUAL_REVIEW.
 - `test-propose-updates.sh` (host): 12 assertions — proposal generation for
   verified states only, index separation, deterministic branches, idempotent
   docs, no checksum/PKGBUILD edits, no secrets, no-update report.

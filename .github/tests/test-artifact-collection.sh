@@ -313,8 +313,9 @@ if jq -e '.kpis.packages_configured == 55 and .kpis.packages_published == 20' "$
 else
   bad "inventory separation broken: $(jq -c '.kpis | {c:.packages_configured,p:.packages_published}' "$SNAP")"
 fi
-if jq -e '.kpis.total_packages == 2 and .kpis.updates_available == 1 and .kpis.up_to_date == 1' "$SNAP" >/dev/null 2>&1; then
-  ok "lifecycle-derived KPIs preserve valid zero (0 failures) and real counts"
+if jq -e '.kpis.total_packages == 2 and .kpis.updates_available == 1 and .kpis.up_to_date == 1
+          and .kpis.source_changes == 0 and .kpis.build_failures == 0' "$SNAP" >/dev/null 2>&1; then
+  ok "lifecycle-derived KPIs separate confirmed updates from source changes"
 else
   bad "lifecycle KPIs wrong: $(jq -c '.kpis' "$SNAP")"
 fi

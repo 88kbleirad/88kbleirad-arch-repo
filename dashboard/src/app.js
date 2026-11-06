@@ -30,7 +30,10 @@
     h += kpi("Total Packages (checked)", d.total_packages, "");
     h += kpi("Up-to-Date", d.up_to_date, "ok");
     h += kpi("Updates Available", d.updates_available, "warn");
-    h += kpi("Build Failures", d.build_failures, d.build_failures > 0 ? "bad" : "ok");
+    h += kpi("Source Changes", d.source_changes, d.source_changes > 0 ? "warn" : "ok");
+    h += kpi("Manual Review", d.manual_review, d.manual_review > 0 ? "warn" : "ok");
+    h += kpi("Check Failed", d.check_failed, d.check_failed > 0 ? "bad" : "ok");
+    h += kpi("Build Failures", d.build_failures, d.build_failures == null ? "na" : (d.build_failures > 0 ? "bad" : "ok"));
     h += kpi("Production Health", d.production_health, healthCls(d.production_health), d.production_health_at || "");
     h += kpi("Staging Health", d.staging_health, healthCls(d.staging_health), d.staging_health_at || "");
     h += kpi("Build Success Rate", d.build_success_rate != null ? d.build_success_rate + "%" : null, rateCls(d.build_success_rate));

@@ -212,8 +212,13 @@ health_rows=$(jq -c '[.[] | select(.state == "HEALTHY" or .state == "DEGRADED" o
 
 total_packages=$(jq 'length' <<<"$packages")
 up_to_date=$(jq '[.[] | select(.update_type == "UP_TO_DATE")] | length' <<<"$packages")
-updates_available=$(jq '[.[] | select(.update_type == "UPDATE_AVAILABLE" or .update_type == "SOURCE_CHANGED" or .update_type == "REBUILD_REQUIRED")] | length' <<<"$packages")
-build_failures=$(jq '[.[] | select(.update_type == "BUILD_FAILED" or .update_type == "VALIDATION_FAILED")] | length' <<<"$packages")
+updates_available=$(jq '[.[] | select(.update_type == "UPDATE_AVAILABLE")] | length' <<<"$packages")
+source_changes=$(jq '[.[] | select(.update_type == "SOURCE_CHANGED")] | length' <<<"$packages")
+manual_review=$(jq '[.[] | select(.update_type == "MANUAL_REVIEW")] | length' <<<"$packages")
+check_failed=$(jq '[.[] | select(.update_type == "CHECK_FAILED" or .update_type == "UPSTREAM_UNAVAILABLE" or .update_type == "UPSTREAM_ARCHIVED")] | length' <<<"$packages")
+# build failures come from verified CI run metrics; when no CI source is
+# available the KPI is null (N/A), never a fabricated zero
+build_failures=$(jq -c 'if length == 0 then null else ([.[] | select(.cache == "FAILED")] | length) end' <<<"$build_rows")
 
 # configured inventory comes from the canonical packages.txt count; the
 # published inventory from the verified production health report / release
@@ -255,6 +260,9 @@ kpis=$(jq -nc \
   --argjson total_packages "$total_packages" \
   --argjson up_to_date "$up_to_date" \
   --argjson updates_available "$updates_available" \
+  --argjson source_changes "$source_changes" \
+  --argjson manual_review "$manual_review" \
+  --argjson check_failed "$check_failed" \
   --argjson build_failures "$build_failures" \
   --argjson production_health "$prod_health" \
   --argjson staging_health "$stage_health" \
@@ -271,6 +279,7 @@ kpis=$(jq -nc \
   --argjson packages_configured "$packages_configured" \
   --argjson packages_published "$packages_published" \
   '{total_packages:$total_packages, up_to_date:$up_to_date, updates_available:$updates_available,
+    source_changes:$source_changes, manual_review:$manual_review, check_failed:$check_failed,
     build_failures:$build_failures, production_health:$production_health, staging_health:$staging_health,
     production_health_at:$production_health_at, staging_health_at:$staging_health_at,
     build_success_rate:$build_success_rate, cache_hit_rate:$cache_hit_rate,

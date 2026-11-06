@@ -100,6 +100,20 @@ Unavailable metrics are `null` → the dashboard renders `N/A`/`UNKNOWN`.
 Never fabricated. `kpis.packages_configured` (packages.txt) and
 `kpis.packages_published` (production release inventory) are distinct.
 
+Lifecycle KPIs are separated by verb:
+
+- `kpis.updates_available` — only `UPDATE_AVAILABLE` (confirmed newer
+  release). `SOURCE_CHANGED` is **not** counted here.
+- `kpis.source_changes` — `SOURCE_CHANGED` (VCS/repo HEAD moved).
+- `kpis.manual_review` — `MANUAL_REVIEW` (ambiguous/unsupported/redirected).
+- `kpis.check_failed` — `CHECK_FAILED` + `UPSTREAM_UNAVAILABLE` +
+  `UPSTREAM_ARCHIVED`.
+
+`kpis.build_failures` and `kpis.build_success_rate` are derived only from
+verified CI run metrics (`run-metrics-*` build-durations/cache-history).
+When no CI source exists they are `null` (dashboard shows `N/A`) — never a
+fabricated zero or success rate.
+
 ### Retention
 
 - `build-metrics.sh` truncates each history series to the newest `--retention`
