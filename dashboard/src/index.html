@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>88kbleirad Arch Repo — Observability</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>88kbleirad Arch Repo</h1>
+  <span class="sub">Observability · GitHub Actions</span>
+  <span class="spacer"></span>
+  <span class="badge">Snapshot <span id="snapshot-at">N/A</span></span>
+</header>
+
+<main class="wrap">
+  <section class="kpis" id="kpis"><!-- KPIs injected --></section>
+
+  <section class="grid2">
+    <div class="panel">
+      <h2>Repository Health History</h2>
+      <div id="chart-health"><div class="empty-chart">No health history recorded</div></div>
+      <div class="legend" id="legend-health"></div>
+    </div>
+    <div class="panel">
+      <h2>Publication Activity</h2>
+      <div id="chart-publish"><div class="empty-chart">No publication activity recorded</div></div>
+      <div class="legend" id="legend-publish"></div>
+    </div>
+    <div class="panel">
+      <h2>Build Performance (duration)</h2>
+      <div id="chart-build"><div class="empty-chart">No build duration data recorded</div></div>
+      <div class="legend" id="legend-build"></div>
+    </div>
+    <div class="panel">
+      <h2>Cache Efficiency</h2>
+      <div id="chart-cache"><div class="empty-chart">No cache data recorded</div></div>
+      <div class="legend" id="legend-cache"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Package Inventory</h2>
+    <div class="toolbar">
+      <input type="search" id="search" placeholder="Search packages…" aria-label="Search packages">
+      <div class="filter-group" id="filters"></div>
+    </div>
+    <div class="table-wrap">
+      <table class="inventory" id="inventory">
+        <thead>
+          <tr>
+            <th data-key="package">Package</th>
+            <th data-key="current_version">Published</th>
+            <th data-key="upstream_version">Upstream</th>
+            <th data-key="update_type">Update Status</th>
+            <th data-key="package_type">Type</th>
+            <th data-key="checked_at">Last Checked</th>
+            <th data-key="note">Note</th>
+          </tr>
+        </thead>
+        <tbody id="inventory-body"><tr><td colspan="7" class="na-cell">No package data</td></tr></tbody>
+      </table>
+    </div>
+    <div class="hint" id="table-count"></div>
+  </section>
+</main>
+
+<footer class="footer">
+  Generated from verified GitHub Actions artifacts · read-only · no credentials embedded ·
+  metric schema: dashboard/docs/metric-schema.md
+</footer>
+
+<script src="metrics.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

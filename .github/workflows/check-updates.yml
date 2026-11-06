@@ -1,10 +1,10 @@
-name: Package Update Detection
+name: Package Lifecycle
 
-# Phase 4.4 — read-only upstream update detection. Never modifies package
-# sources, never pushes to main, never publishes. Produces a JSON report
-# and a Markdown summary; optionally opens (or updates) a reviewable
-# pull request containing ONLY the report + a proposed PKGBUILD patch for
-# human review (the PR branch is merge-guarded by existing review rules).
+# Phase 4.4 + Phase 5.1 — read-only package lifecycle detection. Never
+# modifies package sources, never pushes to main, never publishes. Produces
+# a machine-readable lifecycle JSON report + Markdown summary; optionally
+# opens (or updates) a reviewable update-proposal PR (Phase 5.2) via the
+# `propose-updates` job — never merged automatically.
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ on:
         type: string
         default: ''
       open-pr:
-        description: 'Create/update a reviewable update-proposal PR (report + patches)'
+        description: 'Create/update reviewable update-proposal PRs (Phase 5.2; requires confirmed updates)'
         required: false
         type: boolean
         default: false
@@ -68,28 +68,48 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      - name: Summarize classification counts
+      - name: Summarize lifecycle classification counts
         run: |
           set -euo pipefail
           jq -r 'group_by(.update_type)[] | "\(.[0].update_type): \(length)"' \
             "$GITHUB_WORKSPACE/update-report.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo
+          echo "Packages checked: $(jq 'length' "$GITHUB_WORKSPACE/update-report.json")" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Create reviewable update proposal PR (report only)
-        if: ${{ inputs.open-pr }}
+  # Phase 5.2: propose updates as a reviewable PR. Deterministic branch
+  # (same verified updates => same branch/PR, never duplicated). The PR is
+  # a review proposal only: merging it does NOT publish anything, and the
+  # workflow never merges automatically.
+  propose:
+    needs: detect
+    if: ${{ inputs.open-pr }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Download lifecycle report
+        uses: actions/download-artifact@v8
+        with:
+          name: update-report
+          path: "${{ github.workspace }}/lifecycle-report"
+          merge-multiple: true
+
+      - name: Generate proposals and open/update PR
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          branch="update-proposal/$(date -u +%Y%m%d%H%M%S)"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          mkdir -p docs/update-proposals
-          cp "$GITHUB_WORKSPACE/update-report.json" "docs/update-proposals/update-report-$(date -u +%Y%m%d).json"
-          git add docs/update-proposals
-          git commit -m "docs(updates): update detection report $(date -u +%Y-%m-%d)" || echo "no changes"
-          git push -u origin "$branch"
-          gh pr create \
-            --base main --head "$branch" \
-            --title "Update detection report $(date -u +%Y-%m-%d)" \
-            --body "Read-only upstream update detection (Phase 4.4). See docs/update-proposals/. No package sources modified; no publication triggered." || true
+          report="$GITHUB_WORKSPACE/lifecycle-report/update-report.json"
+          [[ -s "$report" ]] || { echo "::error::lifecycle report missing"; exit 1; }
+          bash "$GITHUB_WORKSPACE/.github/scripts/propose-updates.sh" \
+            --report "$report" \
+            --repo "${{ github.repository }}" \
+            --base main \
+            --push

@@ -87,14 +87,12 @@ note "workflow audit: dry-run boolean input is normalized to 1/0 for scripts"
 # `inputs.dry-run` renders `true`/`false`, but the publish scripts check
 # `DRY_RUN == "1"`; a bare `${{ inputs.dry-run }}` binding would silently
 # execute real mutations. The binding must normalize to '1'/'0'.
-for wf in build-release; do
-  f="$REPO_ROOT/.github/workflows/$wf.yml"
-  if grep -q "DRY_RUN: \${{ inputs.dry-run && '1' || '0' }}" "$f"; then
-    ok "$wf normalizes inputs.dry-run to 1/0"
-  else
-    bad "$wf dry-run binding not normalized to '1'/'0'"
-  fi
-done
+f="$REPO_ROOT/.github/workflows/build-release.yml"
+if grep -q "DRY_RUN: \${{ inputs.dry-run && '1' || '0' }}" "$f"; then
+  ok "build-release normalizes inputs.dry-run to 1/0"
+else
+  bad "build-release dry-run binding not normalized to '1'/'0'"
+fi
 
 # ---------------------------------------------------------------------------
 note "workflow audit: release runs are never cancelled unexpectedly"
@@ -178,6 +176,30 @@ if grep -q 'release-tag: repository' "$REPO_ROOT/.github/workflows/build-release
   ok "production and staging health gate tags are separate"
 else
   bad "release tags in health gates changed"
+fi
+
+# ---------------------------------------------------------------------------
+note "workflow audit: Phase 5 workflows are read-only / gated"
+# observability.yml: read-only, no write permissions, no schedule
+obs=$(parse "$REPO_ROOT/.github/workflows/observability.yml")
+if grep -q 'contents: read' <<<"$obs" && ! grep -q 'contents: write' <<<"$obs"; then
+  ok "observability workflow is read-only"
+else
+  bad "observability workflow permissions widened"
+fi
+if ! grep -q 'schedule' <<<"$obs"; then
+  ok "observability has no schedule trigger"
+else
+  bad "observability introduced a schedule"
+fi
+# check-updates.yml: propose job requires open-pr input (never automatic),
+# and merger writing is isolated from untrusted code (permissions scoped)
+updates=$(parse "$REPO_ROOT/.github/workflows/check-updates.yml")
+if grep -q 'open-pr' <<<"$updates" && grep -q 'if: \${{ inputs.open-pr }}' \
+    "$REPO_ROOT/.github/workflows/check-updates.yml"; then
+  ok "update proposal PR gated behind open-pr input"
+else
+  bad "proposal PR gating changed"
 fi
 
 # ---------------------------------------------------------------------------

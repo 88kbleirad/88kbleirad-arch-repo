@@ -1,0 +1,108 @@
+name: Observability Dashboard
+
+# Phase 5.3 — read-only metrics collection + static dashboard build.
+# Collects verified CI artifacts/reports into a bounded metrics snapshot,
+# renders the static dashboard, and uploads it as a workflow artifact.
+# Optional GitHub Pages deployment is NOT enabled here (owner authorization
+# required); the artifact is the primary delivery.
+#
+# Read-only: contents:read; never modifies release assets or repository
+# state. Downloads only the artifacts named below.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: observability
+  cancel-in-progress: false
+
+env:
+  RETENTION: 200
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+
+      - name: Download metric inputs (health, publish, lifecycle, runs)
+        uses: actions/download-artifact@v8
+        with:
+          path: inputs
+          pattern: |
+            health-report-*
+            update-report
+            publish-summary-*
+            run-metrics-*
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Build metrics snapshot
+        id: metrics
+        run: |
+          set -euo pipefail
+          # health reports live in individual files; the collector handles
+          # both sidecars and health-report-<tag>.json files.
+          bash "$GITHUB_WORKSPACE/.github/scripts/build-metrics.sh" \
+            --health-dir "$GITHUB_WORKSPACE/inputs" \
+            --publish-dir "$GITHUB_WORKSPACE/inputs" \
+            --runs-dir "$GITHUB_WORKSPACE/inputs" \
+            --lifecycle "$GITHUB_WORKSPACE/inputs/update-report.json" \
+            --retention "$RETENTION" \
+            --out "$GITHUB_WORKSPACE/snapshot.json"
+
+      - name: Merge into bounded history
+        id: history
+        run: |
+          set -euo pipefail
+          # bounded history is stored as an artifact; start from empty when
+          # absent (retention bounds growth across runs)
+          bash "$GITHUB_WORKSPACE/.github/scripts/merge-metrics-history.sh" \
+            --history "$GITHUB_WORKSPACE/inputs/metrics-history.jsonl" \
+            --snapshot "$GITHUB_WORKSPACE/snapshot.json" \
+            --retention "$RETENTION" \
+            --out "$GITHUB_WORKSPACE/metrics-history.jsonl"
+
+      - name: Build dashboard
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.github/scripts/build-dashboard.sh" \
+            --metrics "$GITHUB_WORKSPACE/snapshot.json" \
+            --out "$GITHUB_WORKSPACE/dashboard"
+
+      - name: Upload dashboard artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: observability-dashboard
+          path: dashboard
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload metrics snapshot + history artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: metrics-snapshot
+          path: |
+            snapshot.json
+            metrics-history.jsonl
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Summarize
+        run: |
+          set -euo pipefail
+          echo "## Observability snapshot" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"Packages: \(.kpis.total_packages) · Updates: \(.kpis.updates_available) · Prod health: \(.kpis.production_health // "N/A") · Staging health: \(.kpis.staging_health // "N/A") · Cache hit: \(.kpis.cache_hit_rate // "N/A")%"' \
+            "$GITHUB_WORKSPACE/snapshot.json" >> "$GITHUB_STEP_SUMMARY"

@@ -128,6 +128,25 @@ else
   bad "workflow-audit suite"
 fi
 
+note "update-proposal suite (Phase 5.2; offline, deterministic)"
+if bash "$REPO_ROOT/.github/tests/test-propose-updates.sh"; then
+  ok "update-proposal suite"
+else
+  bad "update-proposal suite"
+fi
+
+note "dashboard suite (Phase 5.3; static build + metrics)"
+if bash "$REPO_ROOT/dashboard/tests/test-metrics.sh"; then
+  ok "metrics-builder suite"
+else
+  bad "metrics-builder suite"
+fi
+if bash "$REPO_ROOT/dashboard/tests/test-dashboard.sh"; then
+  ok "dashboard-build suite"
+else
+  bad "dashboard-build suite"
+fi
+
 # -- 4. matrix gate tests ---------------------------------------------------
 note "matrix gate tests (approval / schedule / critical / subset)"
 if bash "$REPO_ROOT/.github/tests/test-matrix.sh"; then
