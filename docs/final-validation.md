@@ -16,10 +16,10 @@ publication, no Pages enablement) — those require owner authorization.
 | Suite | Source | Result |
 |---|---|---|
 | lifecycle detection + safety (incl. vercmp provisioning, SIGPIPE regression, source-parsing + probe-classification accuracy) | `test-check-updates.sh` | 48 PASS |
-| update proposals (offline) | `test-propose-updates.sh` | 12 PASS |
-| workflow audit (+ Phase 5.4 gates) | `test-workflow-audit.sh` | 29 PASS |
+| update proposals (offline) + Phase 5.2 PR validation | `test-propose-updates.sh` | 25 PASS |
+| workflow audit (+ Phase 5.4 gates + PR-validation gates) | `test-workflow-audit.sh` | 34 PASS |
 | artifact collection (REST retrieval, mock API) | `test-artifact-collection.sh` | 30 PASS |
-| metrics builder + history | `dashboard/tests/test-metrics.sh` | 15 PASS |
+| metrics builder + history (incl. strict KPI mapping) | `dashboard/tests/test-metrics.sh` | 24 PASS |
 | dashboard build (incl. incomplete banner) | `dashboard/tests/test-dashboard.sh` | 19 PASS |
 | full harness (Phase 1–4 regressions) | `run-tests.sh` | overall 0 FAIL (see §4) |
 | browser render (headless Chromium) | dashboard with fixture snapshot | KPIs, 4 charts, table/filter/search, completeness banner OK |
@@ -37,9 +37,9 @@ publication, no Pages enablement) — those require owner authorization.
 `REPO_ROOT=$PWD RUN_PROD_SCENARIOS=1 bash .github/tests/run-tests.sh`
 runs every existing suite plus the newly registered Phase 5 suites.
 Measured (pinned container): overall `PASS=56 FAIL=0`, `EXIT=0` — 18 suite
-runs, including lifecycle (48), proposals (12), workflow-audit (29),
-artifact-collection (30), metrics (15), dashboard (19), and all Phase 1–4
-suites (host + container).
+runs, including lifecycle (48), proposals (25), workflow-audit (34),
+artifact-collection (30), metrics (24), dashboard (19), and all Phase 1–4
+suites (host + container). 649 assertions total, 0 failures.
 
 ## 5. Phase 5.4 safety re-verification
 
@@ -70,7 +70,8 @@ suites (host + container).
 | Item | Gate |
 |---|---|
 | Lifecycle workflow run (real upstream probes; vercmp now provisioned) | owner dispatch |
-| Proposal PR creation | owner dispatch with `open-pr=true` |
+| Proposal PR creation (real remote) | owner dispatch with `open-pr=true` |
+| Phase 5.2 PR validation — remote (Mode B) | owner dispatch with `open-pr=true` + `allow-remote-pr=true` |
 | Observability workflow run + cross-run artifact download | owner dispatch |
 | First publish-sidecar uploads (`publish-summary-*`, `run-metrics-*`) | existing production/staging authorization |
 | Optional Pages enablement | owner repo-settings change |
@@ -83,5 +84,21 @@ verified here; those remain `PENDING` until executed by the owner.
 
 The project is **deployment-ready (PARTIALLY READY)** for v1.0: all local
 implementation and regression work is complete, static analysis is clean,
-and no known critical defect remains in the local tree. Final `VERIFIED`
-status for the items in §6 awaits the owner's authorized live runs.
+and no known critical defect remains in the local tree.
+
+Status by criterion:
+
+| Criterion | Status |
+|---|---|
+| Lifecycle detection (probes, parser, classification) | PASS (local + mock) — live workflow PENDING |
+| Proposal generation (deterministic, evidence-only) | PASS (local) |
+| PR creation + idempotency (Mode A mock verified) | PASS (mock) — remote PENDING |
+| Permission preflight / least-privilege | MOCK VERIFIED |
+| No auto-merge / no auto-publication | PASS (workflow audit) |
+| Dashboard KPI accuracy (strict mapping + null semantics) | PASS (local + mock + browser render) |
+| Observability completeness/history | PASS (local) — live workflow PENDING |
+| Production/staging safety invariants | PASS (harness) |
+| v1.0 milestone | PARTIALLY READY — remote PR validation + live workflow runs PENDING owner authorization |
+
+Final `VERIFIED` status for the remote items in §6 awaits the owner's
+authorized live runs.

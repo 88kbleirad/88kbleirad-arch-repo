@@ -145,6 +145,31 @@ Test-only environment variables (never set in production workflows):
   identical update sets reuse the same branch/PR (no duplicates).
 - `--push` requires `GH_TOKEN`, `--repo`, and is only used by the gated
   workflow job. `--dry-run` prints the plan and touches nothing.
+- **Permission preflight**: before any git write, `--push` verifies via
+  `gh api repos/<repo> --jq .permissions.push` that the token actually has
+  `contents: write`; a denial exits 2 with an actionable error and performs
+  zero remote writes.
+- **PR idempotency**: PR discovery uses `gh pr view --state all`; an open
+  PR is updated in place (no duplicate), a closed PR is never silently
+  reopened (a fresh PR is created on the same branch), and a merged PR is
+  never recreated. API errors (403/404/409/422/429) are classified into
+  actionable messages.
+
+### Phase 5.2 PR validation (TEST ONLY)
+
+Two modes, both isolated from genuine proposals:
+
+- **Mode A — local/mocked (default).** `--fixture <id>` generates a
+  documentation-only fixture under `docs/update-proposals/validation/
+  phase5-pr-test-<id>/` with branch `validation/phase5-pr-test-<id>`.
+  `--push` on a validation branch is REFUSED without
+  `--allow-remote-pr`. `test-propose-updates.sh` exercises this with a
+  mock `gh` + a local bare remote — zero remote writes.
+- **Mode B — owner-authorized remote.** The workflow's `allow-remote-pr`
+  input (default `false`) + `open-pr=true` together authorize one remote
+  validation PR: deterministic fixture id derived from the report digest,
+  documentation-only payload, clearly labelled `TEST ONLY — PHASE 5.2 PR
+  VALIDATION`, never merged, never used for publication.
 
 ### Workflow integration (`check-updates.yml`)
 
@@ -153,9 +178,14 @@ Test-only environment variables (never set in production workflows):
 - `propose` job runs only when `open-pr=true` is dispatched by the owner
   (manual). It has scoped `contents: write` + `pull-requests: write`
   permissions and never merges; merging is a human action.
+- Top-level workflow permissions are read-only (`contents: read`); only the
+  `propose` job escalates. No `pull_request_target` path exists (untrusted
+  PR content never gets privileged tokens).
 - The proposal PR is a review proposal only — it never triggers publication.
   Publication remains gated by the existing release workflows and owner
-  authorization.
+  authorization. PRs created with `GITHUB_TOKEN` do not trigger further
+  workflow runs (GitHub does not fire events on token-created PRs), so CI
+  is not re-run by proposal creation — by design.
 
 ## 7. Acceptance / tests
 
@@ -171,12 +201,17 @@ Test-only environment variables (never set in production workflows):
   npm 404/403 classification, GitHub repository rename → MANUAL_REVIEW,
   abbreviated-pkgver-SHA vs full upstream HEAD comparison (false-positive
   elimination), unrecoverable pkgver revision → MANUAL_REVIEW.
-- `test-propose-updates.sh` (host): 12 assertions — proposal generation for
+- `test-propose-updates.sh` (host): 25 assertions — proposal generation for
   verified states only, index separation, deterministic branches, idempotent
-  docs, no checksum/PKGBUILD edits, no secrets, no-update report.
-- `test-workflow-audit.sh` (host): 29 assertions — Phase 5 workflow
+  docs, no checksum/PKGBUILD edits, no secrets, no-update report, and Phase
+  5.2 PR validation (mock gh + local bare remote): fixture isolation,
+  allow-remote-pr gate, dry-run zero remote writes, duplicate-PR
+  prevention, closed/merged PR handling, API error classification,
+  permission preflight (exit 2 + zero remote writes), and deterministic
+  fixture identity.
+- `test-workflow-audit.sh` (host): 34 assertions — Phase 5 workflow
   read-only/gating checks + vercmp provisioning + observability REST
-  retrieval wiring.
+  retrieval wiring + Phase 5.2 owner-gate/least-privilege assertions.
 - `test-metrics.sh` / `test-dashboard.sh` cover report consumers and the
   completeness banner.
 - `test-artifact-collection.sh` (host): 30 assertions — cross-workflow REST

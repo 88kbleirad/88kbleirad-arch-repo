@@ -100,15 +100,23 @@ Unavailable metrics are `null` → the dashboard renders `N/A`/`UNKNOWN`.
 Never fabricated. `kpis.packages_configured` (packages.txt) and
 `kpis.packages_published` (production release inventory) are distinct.
 
-Lifecycle KPIs are separated by verb:
+Lifecycle KPIs follow a strict, mutually exclusive mapping (one count per
+state; archived/unavailable upstreams are NEVER probe failures; source
+changes are NEVER confirmed updates; unknown statuses are preserved via
+`lifecycle_unknown`, never silently dropped):
 
-- `kpis.updates_available` — only `UPDATE_AVAILABLE` (confirmed newer
-  release). `SOURCE_CHANGED` is **not** counted here.
-- `kpis.source_changes` — `SOURCE_CHANGED` (VCS/repo HEAD moved).
-- `kpis.manual_review` — `MANUAL_REVIEW` (ambiguous/unsupported/redirected).
-- `kpis.check_failed` — `CHECK_FAILED` + `UPSTREAM_UNAVAILABLE` +
-  `UPSTREAM_ARCHIVED`.
+- `kpis.updates_available` — `UPDATE_AVAILABLE` only.
+- `kpis.source_changes` — `SOURCE_CHANGED`.
+- `kpis.manual_review` — `MANUAL_REVIEW`.
+- `kpis.check_failed` — `CHECK_FAILED` only.
+- `kpis.upstream_unavailable` — `UPSTREAM_UNAVAILABLE`.
+- `kpis.upstream_archived` — `UPSTREAM_ARCHIVED` (e.g. physlock → 1, not
+  counted in check_failed).
+- `kpis.rebuild_required` — `REBUILD_REQUIRED`.
+- `kpis.lifecycle_unknown` — any unrecognized status.
+- `kpis.up_to_date` — `UP_TO_DATE`.
 
+Sum of the lifecycle KPIs equals the number of classified package records.
 `kpis.build_failures` and `kpis.build_success_rate` are derived only from
 verified CI run metrics (`run-metrics-*` build-durations/cache-history).
 When no CI source exists they are `null` (dashboard shows `N/A`) — never a

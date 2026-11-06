@@ -132,6 +132,111 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "metrics: strict lifecycle KPI mapping (mutually exclusive states)"
+# one record per lifecycle state — every KPI must count exactly its own state
+cat > "$WORKDIR/all-states.json" <<'JSON'
+[
+  {"package":"p1","update_type":"UP_TO_DATE","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p2","update_type":"UPDATE_AVAILABLE","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p3","update_type":"SOURCE_CHANGED","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p4","update_type":"MANUAL_REVIEW","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p5","update_type":"CHECK_FAILED","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p6","update_type":"UPSTREAM_UNAVAILABLE","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p7","update_type":"UPSTREAM_ARCHIVED","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p8","update_type":"REBUILD_REQUIRED","checked_at":"2026-11-06T00:00:00Z","note":""},
+  {"package":"p9","update_type":"UNKNOWN","checked_at":"2026-11-06T00:00:00Z","note":""}
+]
+JSON
+bash "$BUILD" --lifecycle "$WORKDIR/all-states.json" --out "$WORKDIR/snapshot-states.json" > /dev/null 2>&1
+if jq -e '.kpis.up_to_date == 1 and .kpis.updates_available == 1 and .kpis.source_changes == 1
+          and .kpis.manual_review == 1 and .kpis.check_failed == 1
+          and .kpis.upstream_unavailable == 1 and .kpis.upstream_archived == 1' \
+    "$WORKDIR/snapshot-states.json" >/dev/null 2>&1; then
+  ok "every lifecycle state maps to its own KPI"
+else
+  bad "state mapping wrong: $(jq -c '.kpis' "$WORKDIR/snapshot-states.json")"
+fi
+# CHECK_FAILED must NOT count upstream unavailable/archived
+if jq -e '.kpis.check_failed == 1 and .kpis.upstream_unavailable == 1 and .kpis.upstream_archived == 1' \
+    "$WORKDIR/snapshot-states.json" >/dev/null 2>&1; then
+  ok "check_failed excludes upstream unavailable/archived"
+else
+  bad "conflation still present: $(jq -c '.kpis | {c:.check_failed,u:.upstream_unavailable,a:.upstream_archived}' "$WORKDIR/snapshot-states.json")"
+fi
+# unknown statuses are preserved, never silently dropped
+if jq -e '.kpis.lifecycle_unknown == 1 and .kpis.total_packages == 9' \
+    "$WORKDIR/snapshot-states.json" >/dev/null 2>&1; then
+  ok "unknown lifecycle status preserved (lifecycle_unknown=1)"
+else
+  bad "unknown status dropped: $(jq -c '.kpis' "$WORKDIR/snapshot-states.json")"
+fi
+# sum of mutually exclusive lifecycle KPIs == classified records
+SUM=$(jq '.kpis.up_to_date + .kpis.updates_available + .kpis.source_changes + .kpis.manual_review + .kpis.check_failed + .kpis.upstream_unavailable + .kpis.upstream_archived + .kpis.rebuild_required + .kpis.lifecycle_unknown' "$WORKDIR/snapshot-states.json")
+if [[ "$SUM" -eq 9 ]]; then
+  ok "mutually exclusive lifecycle KPIs sum to classified records"
+else
+  bad "KPI sum mismatch: $SUM != 9"
+fi
+if jq -e '.kpis.rebuild_required == 1' "$WORKDIR/snapshot-states.json" >/dev/null 2>&1; then
+  ok "REBUILD_REQUIRED maps to its own KPI"
+else
+  bad "rebuild_required missing: $(jq -c '.kpis.rebuild_required' "$WORKDIR/snapshot-states.json")"
+fi
+
+# archived-only inventory
+cat > "$WORKDIR/archived-only.json" <<'JSON'
+[
+  {"package":"physlock","update_type":"UPSTREAM_ARCHIVED","checked_at":"2026-11-06T00:00:00Z","note":"archived"}
+]
+JSON
+bash "$BUILD" --lifecycle "$WORKDIR/archived-only.json" --out "$WORKDIR/snapshot-arch.json" > /dev/null 2>&1
+if jq -e '.kpis.upstream_archived == 1 and .kpis.check_failed == 0' \
+    "$WORKDIR/snapshot-arch.json" >/dev/null 2>&1; then
+  ok "archived-only inventory -> upstream_archived=1, check_failed=0"
+else
+  bad "archived conflation: $(jq -c '.kpis | {a:.upstream_archived,c:.check_failed}' "$WORKDIR/snapshot-arch.json")"
+fi
+
+# upstream-unavailable-only inventory
+cat > "$WORKDIR/unavailable-only.json" <<'JSON'
+[
+  {"package":"gone","update_type":"UPSTREAM_UNAVAILABLE","checked_at":"2026-11-06T00:00:00Z","note":"404"}
+]
+JSON
+bash "$BUILD" --lifecycle "$WORKDIR/unavailable-only.json" --out "$WORKDIR/snapshot-unav.json" > /dev/null 2>&1
+if jq -e '.kpis.upstream_unavailable == 1 and .kpis.check_failed == 0' \
+    "$WORKDIR/snapshot-unav.json" >/dev/null 2>&1; then
+  ok "unavailable-only inventory -> upstream_unavailable=1, check_failed=0"
+else
+  bad "unavailable conflation: $(jq -c '.kpis | {u:.upstream_unavailable,c:.check_failed}' "$WORKDIR/snapshot-unav.json")"
+fi
+
+# probe-failure-only inventory
+cat > "$WORKDIR/failed-only.json" <<'JSON'
+[
+  {"package":"flaky","update_type":"CHECK_FAILED","checked_at":"2026-11-06T00:00:00Z","note":"timeout"}
+]
+JSON
+bash "$BUILD" --lifecycle "$WORKDIR/failed-only.json" --out "$WORKDIR/snapshot-fail.json" > /dev/null 2>&1
+if jq -e '.kpis.check_failed == 1 and .kpis.upstream_unavailable == 0 and .kpis.upstream_archived == 0' \
+    "$WORKDIR/snapshot-fail.json" >/dev/null 2>&1; then
+  ok "probe-failure-only inventory -> check_failed=1 only"
+else
+  bad "failure classification wrong: $(jq -c '.kpis' "$WORKDIR/snapshot-fail.json")"
+fi
+
+# corrupted lifecycle data is rejected by the collector; build-metrics treats
+# a non-array as empty (never fabricates)
+printf 'this is not json' > "$WORKDIR/corrupt.json"
+bash "$BUILD" --lifecycle "$WORKDIR/corrupt.json" --out "$WORKDIR/snapshot-corrupt.json" > /dev/null 2>&1
+if jq -e '.kpis.total_packages == 0 and .kpis.up_to_date == 0' \
+    "$WORKDIR/snapshot-corrupt.json" >/dev/null 2>&1; then
+  ok "corrupted lifecycle data -> empty KPIs (no fabrication)"
+else
+  bad "corrupt lifecycle fabricated values: $(jq -c '.kpis' "$WORKDIR/snapshot-corrupt.json")"
+fi
+
+# ---------------------------------------------------------------------------
 note "metrics: read-only, never mutates input fixtures"
 before=$(find "$WORKDIR/health" "$WORKDIR/publish" "$WORKDIR/runs" -type f | sort | xargs md5sum)
 bash "$BUILD" --health-dir "$WORKDIR/health" --publish-dir "$WORKDIR/publish" --runs-dir "$WORKDIR/runs" \

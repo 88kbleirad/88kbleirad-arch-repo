@@ -36,6 +36,13 @@ bash $REPO_ROOT/.github/scripts/check-updates.sh \
 bash $REPO_ROOT/.github/scripts/propose-updates.sh \
   --report /tmp/update-report.json --outdir /tmp/proposals
 
+# Phase 5.2 PR validation — LOCAL/mocked (Mode A, no remote writes)
+bash $REPO_ROOT/.github/tests/test-propose-updates.sh
+
+# Phase 5.2 PR validation — REMOTE (Mode B, OWNER-AUTHORIZED ONLY):
+# creates a documentation-only fixture PR under validation/phase5-pr-test-<id>
+gh workflow run check-updates.yml -f open-pr=true -f allow-remote-pr=true
+
 # repository health (read-only)
 bash $REPO_ROOT/.github/scripts/repo-health.sh repository \
   88kbleirad/88kbleirad-arch-repo \
@@ -50,6 +57,30 @@ gh workflow run build-release.yml \
 bash $REPO_ROOT/.github/scripts/build-dashboard.sh \
   --metrics /tmp/snapshot.json --out /tmp/dashboard
 ```
+
+## 3b. Phase 5.2 PR validation & cleanup
+
+- **Fixture identity**: validation branches are always
+  `validation/phase5-pr-test-<id>` (deterministic id derived from the report
+  digest). Reruns reuse the same branch/PR — never a duplicate.
+- **Behavior**: an open PR is updated in place; a closed PR is not silently
+  reopened (a fresh PR is created on the same branch); a merged PR is never
+  recreated. Merging a validation PR is forbidden and does not publish.
+- **Record for audit**: PR number, branch, commit SHA, result. Example:
+
+  ```fish
+  gh pr list --head validation/phase5-pr-test-owner-<id> --state all --json number,url,headRefName,mergeCommit
+  ```
+
+- **Cleanup (owner-only, targeted)**: close the validation PR and delete
+  only its branch. Never use wildcard cleanup.
+
+  ```fish
+  # capture the PR number from the list above
+  set -x PR_N 12345
+  gh pr close $PR_N --repo 88kbleirad/88kbleirad-arch-repo
+  git push origin --delete validation/phase5-pr-test-owner-<id>
+  ```
 
 ## 4. Publication procedures
 

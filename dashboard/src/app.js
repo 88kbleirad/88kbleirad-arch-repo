@@ -33,6 +33,8 @@
     h += kpi("Source Changes", d.source_changes, d.source_changes > 0 ? "warn" : "ok");
     h += kpi("Manual Review", d.manual_review, d.manual_review > 0 ? "warn" : "ok");
     h += kpi("Check Failed", d.check_failed, d.check_failed > 0 ? "bad" : "ok");
+    h += kpi("Upstream Unavailable", d.upstream_unavailable, d.upstream_unavailable > 0 ? "warn" : "ok");
+    h += kpi("Upstream Archived", d.upstream_archived, d.upstream_archived > 0 ? "warn" : "ok");
     h += kpi("Build Failures", d.build_failures, d.build_failures == null ? "na" : (d.build_failures > 0 ? "bad" : "ok"));
     h += kpi("Production Health", d.production_health, healthCls(d.production_health), d.production_health_at || "");
     h += kpi("Staging Health", d.staging_health, healthCls(d.staging_health), d.staging_health_at || "");

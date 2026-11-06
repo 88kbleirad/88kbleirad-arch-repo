@@ -210,12 +210,20 @@ cache_rows=$(jq -c --argjson n "$RETENTION" 'sort_by(.timestamp) | if length > $
 # dropped (never silently reported as HEALTHY)
 health_rows=$(jq -c '[.[] | select(.state == "HEALTHY" or .state == "DEGRADED" or .state == "FAILED")]' <<<"$health_rows")
 
+# Strict lifecycle KPI mapping — every state is a mutually exclusive count.
+# Archived/unavailable upstreams are NOT probe failures; source changes are
+# NOT confirmed updates. Unknown statuses are never dropped: they surface
+# through `lifecycle_unknown` and the completeness/inventory machinery.
 total_packages=$(jq 'length' <<<"$packages")
 up_to_date=$(jq '[.[] | select(.update_type == "UP_TO_DATE")] | length' <<<"$packages")
 updates_available=$(jq '[.[] | select(.update_type == "UPDATE_AVAILABLE")] | length' <<<"$packages")
 source_changes=$(jq '[.[] | select(.update_type == "SOURCE_CHANGED")] | length' <<<"$packages")
 manual_review=$(jq '[.[] | select(.update_type == "MANUAL_REVIEW")] | length' <<<"$packages")
-check_failed=$(jq '[.[] | select(.update_type == "CHECK_FAILED" or .update_type == "UPSTREAM_UNAVAILABLE" or .update_type == "UPSTREAM_ARCHIVED")] | length' <<<"$packages")
+check_failed=$(jq '[.[] | select(.update_type == "CHECK_FAILED")] | length' <<<"$packages")
+upstream_unavailable=$(jq '[.[] | select(.update_type == "UPSTREAM_UNAVAILABLE")] | length' <<<"$packages")
+upstream_archived=$(jq '[.[] | select(.update_type == "UPSTREAM_ARCHIVED")] | length' <<<"$packages")
+rebuild_required=$(jq '[.[] | select(.update_type == "REBUILD_REQUIRED")] | length' <<<"$packages")
+lifecycle_unknown=$(jq '[.[] | select(.update_type != "UP_TO_DATE" and .update_type != "UPDATE_AVAILABLE" and .update_type != "SOURCE_CHANGED" and .update_type != "REBUILD_REQUIRED" and .update_type != "MANUAL_REVIEW" and .update_type != "CHECK_FAILED" and .update_type != "UPSTREAM_UNAVAILABLE" and .update_type != "UPSTREAM_ARCHIVED")] | length' <<<"$packages")
 # build failures come from verified CI run metrics; when no CI source is
 # available the KPI is null (N/A), never a fabricated zero
 build_failures=$(jq -c 'if length == 0 then null else ([.[] | select(.cache == "FAILED")] | length) end' <<<"$build_rows")
@@ -263,6 +271,10 @@ kpis=$(jq -nc \
   --argjson source_changes "$source_changes" \
   --argjson manual_review "$manual_review" \
   --argjson check_failed "$check_failed" \
+  --argjson upstream_unavailable "$upstream_unavailable" \
+  --argjson upstream_archived "$upstream_archived" \
+  --argjson rebuild_required "$rebuild_required" \
+  --argjson lifecycle_unknown "$lifecycle_unknown" \
   --argjson build_failures "$build_failures" \
   --argjson production_health "$prod_health" \
   --argjson staging_health "$stage_health" \
@@ -280,6 +292,8 @@ kpis=$(jq -nc \
   --argjson packages_published "$packages_published" \
   '{total_packages:$total_packages, up_to_date:$up_to_date, updates_available:$updates_available,
     source_changes:$source_changes, manual_review:$manual_review, check_failed:$check_failed,
+    upstream_unavailable:$upstream_unavailable, upstream_archived:$upstream_archived,
+    rebuild_required:$rebuild_required, lifecycle_unknown:$lifecycle_unknown,
     build_failures:$build_failures, production_health:$production_health, staging_health:$staging_health,
     production_health_at:$production_health_at, staging_health_at:$staging_health_at,
     build_success_rate:$build_success_rate, cache_hit_rate:$cache_hit_rate,

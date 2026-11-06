@@ -202,6 +202,40 @@ else
   bad "proposal PR gating changed"
 fi
 
+# Phase 5.2 PR validation gates (owner-authorized, isolated):
+# - allow-remote-pr input exists and is default-off
+# - the propose job only gains write permissions (contents:write +
+#   pull-requests:write), never the detect job
+upd_wf_cl="$REPO_ROOT/.github/workflows/check-updates.yml"
+if grep -q 'allow-remote-pr' "$upd_wf_cl" && grep -q 'default: false' "$upd_wf_cl"; then
+  ok "allow-remote-pr owner gate exists and defaults to off"
+else
+  bad "allow-remote-pr owner gate missing"
+fi
+if grep -q '^permissions:' "$upd_wf_cl" \
+    && grep -q 'contents: read' "$upd_wf_cl" \
+    && [[ "$(grep -c 'contents: write' "$upd_wf_cl")" -eq 1 ]] \
+    && [[ "$(grep -c 'pull-requests: write' "$upd_wf_cl")" -eq 1 ]]; then
+  ok "global permissions read-only; only propose job escalates to write"
+else
+  bad "write permission scoping changed (global or job-level)"
+fi
+if ! grep -q 'pull_request_target' "$upd_wf_cl"; then
+  ok "no pull_request_target execution path (untrusted content never privileged)"
+else
+  bad "pull_request_target introduced"
+fi
+if grep -qF -- '--push' "$upd_wf_cl"; then
+  ok "propose job pushes via --push only under open-pr gate"
+else
+  bad "propose push invocation changed"
+fi
+if grep -q 'fixture' "$upd_wf_cl" && grep -q 'allow-remote-pr' "$upd_wf_cl"; then
+  ok "remote PR validation is wired to the validation fixture path only"
+else
+  bad "remote PR validation wiring missing"
+fi
+
 # ---------------------------------------------------------------------------
 note "workflow audit: vercmp provisioning on the check-updates runner"
 # Ubuntu 24.04 ships vercmp in the `makepkg` binary package (NOT in a

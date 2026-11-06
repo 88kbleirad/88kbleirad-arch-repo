@@ -19,10 +19,14 @@ on:
         required: false
         type: boolean
         default: false
+      allow-remote-pr:
+        description: 'OWNER-GATED: authorize remote PR write for the Phase 5.2 validation fixture only (docs/update-proposals/validation/). Never used for real proposals.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: update-detection
@@ -116,12 +120,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ALLOW_REMOTE_PR: ${{ inputs.allow-remote-pr }}
         run: |
           set -euo pipefail
           report="$GITHUB_WORKSPACE/lifecycle-report/update-report.json"
           [[ -s "$report" ]] || { echo "::error::lifecycle report missing"; exit 1; }
-          bash "$GITHUB_WORKSPACE/.github/scripts/propose-updates.sh" \
-            --report "$report" \
-            --repo "${{ github.repository }}" \
-            --base main \
-            --push
+          args=(--report "$report" --repo "${{ github.repository }}" --base main --push)
+          # OWNER-GATED Phase 5.2 validation: only runs when the owner
+          # dispatches with BOTH open-pr=true and allow-remote-pr=true.
+          # It creates a documentation-only fixture branch/PR under
+          # validation/phase5-pr-test-<id> — never real proposals.
+          # The id is deterministic (report digest) so reruns are
+          # idempotent: same branch, same PR, never duplicated.
+          if [[ "${ALLOW_REMOTE_PR}" == "true" ]]; then
+            fixture_id="$(jq -r 'map(.package) | sort | join(",") | @base64' "$report" | tr -d '=' | head -c 12)"
+            args+=(--fixture "owner-${fixture_id}" --allow-remote-pr)
+          fi
+          bash "$GITHUB_WORKSPACE/.github/scripts/propose-updates.sh" "${args[@]}"
