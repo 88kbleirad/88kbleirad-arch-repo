@@ -179,7 +179,7 @@ case "$1" in
         if [[ -f "${MOCK_PERM_FILE:-}" ]]; then
           body="$(cat "$MOCK_PERM_FILE")"
         else
-          body='{"permissions":{"push":true}}'
+          body='{"full_name":"mock/repo","permissions":{"push":true}}'
         fi
         if [[ -n "$jq_filter" ]]; then
           printf '%s' "$body" | jq -r "$jq_filter"
@@ -187,7 +187,7 @@ case "$1" in
           printf '%s' "$body"
         fi
         ;;
-      *) echo '{"permissions":{"push":true}}' ;;
+      *) echo '{"full_name":"mock/repo","permissions":{"push":true}}' ;;
     esac
     ;;
   pr)
@@ -237,6 +237,16 @@ run_push_mock() { # [env=val...] -- [args...] -> rc
     if (( in_args )); then args+=("$a"); else extra_env+=("$a"); fi
   done
   local rc
+  # start from a clean, per-test-isolated state:
+  #  - wipe the fake remote (so stale branches from earlier tests cannot
+  #    be "found" by the idempotent fetch),
+  #  - recreate the worktree clone from it,
+  #  - remove local untracked fixtures.
+  rm -rf "$FAKE_REMOTE" "$WORKDIR/wt"
+  git clone -q --bare "$REPO_ROOT" "$FAKE_REMOTE"
+  git clone -q "$FAKE_REMOTE" "$WORKDIR/wt"
+  git -C "$WORKDIR/wt" config user.name "test"
+  git -C "$WORKDIR/wt" config user.email "test@example.com"
   set +e
   ( cd "$WORKDIR/wt" \
     && PATH="$WORKDIR:$PATH" \
@@ -323,68 +333,142 @@ else
   bad "PR create failure not classified (rc=$rc): $(tail -2 "$WORKDIR/push.log")"
 fi
 
-note "PR validation: permission preflight fails safely on non-writable token"
+note "PR validation: repo metadata push=false is NOT treated as a gate failure"
+# GitHub Actions job-scoped contents:write does NOT show up as
+# repo .permissions.push=true (installation token has no user role). A
+# false push value must not abort the run — the real capability check is
+# the push/PR operation itself.
 rm -f "$WORKDIR/events5" "$WORKDIR/perm-deny"
-printf '%s' '{"permissions":{"push":false}}' > "$WORKDIR/perm-deny"
+printf '%s' '{"full_name":"mock/repo","permissions":{"push":false}}' > "$WORKDIR/perm-deny"
 rc=0
 run_push_mock PR_STATE_FILE="$WORKDIR/events5" MOCK_PERM_FILE="$WORKDIR/perm-deny" \
     -- --report "$WORKDIR/fixture-report.json" --fixture t07 --repo mock/repo --base main --push --allow-remote-pr || rc=$?
-if [[ "$rc" -eq 2 ]] && grep -q "contents:write" "$WORKDIR/push.log"; then
-  ok "insufficient permissions produce actionable error before any write (rc=2)"
+if [[ "$rc" -eq 0 ]] && grep -q 'pr view' "$WORKDIR/events5"; then
+  ok "push=false repo metadata does not abort the run (job scoped permissions govern)"
 else
-  bad "permission denial not caught: rc=$rc ($(tail -2 "$WORKDIR/push.log"))"
+  bad "run aborted by misleading repo metadata (rc=$rc): $(tail -3 "$WORKDIR/push.log")"
 fi
-# permission denial must prevent ALL remote writes (no branch push, no PR)
-PUSHED_REF="$(git -C "$FAKE_REMOTE" for-each-ref --format='%(refname)' refs/heads 2>/dev/null | grep -c 'validation/phase5-pr-test-t07' || true)"
-PR_CALLS="$(grep -cE '^gh pr (create|edit)' "$WORKDIR/events5" 2>/dev/null || true)"
-if [[ "$PUSHED_REF" -eq 0 && "$PR_CALLS" -eq 0 ]]; then
-  ok "permission denial prevented all remote writes (no branch, no PR)"
-else
-  bad "remote write attempted after permission denial (refs=$PUSHED_REF pr_calls=$PR_CALLS)"
-fi
-# the mock GitHub API must actually have been consulted (preflight ran)
+# mock API was consulted for diagnostics (not as a gate)
 if grep -q 'gh api repos/mock/repo' "$WORKDIR/push.log" "$WORKDIR/events5" 2>/dev/null; then
-  ok "mock GitHub API preflight invoked"
+  ok "mock GitHub API diagnostic probe invoked"
 else
-  bad "preflight did not consult GitHub API: $(cat "$WORKDIR/push.log" 2>/dev/null | tr '\n' '|')"
+  bad "diagnostic probe missing: $(cat "$WORKDIR/push.log" 2>/dev/null | tr '\n' '|')"
 fi
 
-note "PR validation: idempotency — same fixture twice yields identical branch identity"
+note "PR validation: actual git push denial is classified and fails closed"
+# simulate a real push denial: replace git push with a failing stub
+cat > "$WORKDIR/git" <<'GIT'
+#!/usr/bin/env bash
+if [[ "$1" == "push" ]]; then
+  echo "remote: Permission to mock/repo.git denied to github-actions[bot]." >&2
+  echo "fatal: unable to access 'https://github.com/mock/repo.git/': The requested URL returned error: 403" >&2
+  exit 1
+fi
+exec /usr/bin/git "$@"
+GIT
+chmod +x "$WORKDIR/git"
+rm -f "$WORKDIR/events6"
+rc=0
+( cd "$WORKDIR/wt" \
+  && PATH="$WORKDIR:$PATH" \
+  GH_TOKEN=fake-token GITHUB_REPOSITORY=mock/repo GITHUB_WORKSPACE="$WORKDIR/wt" \
+  PR_STATE_FILE="$WORKDIR/events6" MOCK_PERM_FILE="$WORKDIR/perm-deny" \
+  bash "$REPO_ROOT/.github/scripts/propose-updates.sh" \
+    --report "$WORKDIR/fixture-report.json" --fixture t08 --repo mock/repo --base main --push --allow-remote-pr \
+    > "$WORKDIR/push-deny.log" 2>&1 ) || rc=$?
+if [[ "$rc" -eq 2 ]] && grep -q '::error::git push DENIED' "$WORKDIR/push-deny.log"; then
+  ok "git push 403 classified as permission denial (rc=2)"
+else
+  bad "push denial not classified: rc=$rc ($(tail -3 "$WORKDIR/push-deny.log"))"
+fi
+# zero remote writes: no validation branch may exist in the fake remote
+PUSHED_REF="$(git -C "$FAKE_REMOTE" for-each-ref --format='%(refname)' refs/heads 2>/dev/null | grep -c 'validation/phase5-pr-test-t08' || true)"
+if [[ "$PUSHED_REF" -eq 0 ]]; then
+  ok "real push denial left zero remote branches"
+else
+  bad "branch existed despite push denial (refs=$PUSHED_REF)"
+fi
+
+note "PR validation: idempotency — same fixture content yields identical branch identity"
+# calculate the SHA-256 fixture digest exactly as the workflow does
+fixture_digest() { # <report> -> 16-hex digest
+  jq -r \
+    'map({p:.package, t:.update_type, u:(.upstream_version // ""), r:(.source_reference // "")}) | sort | tostring | @base64' "$1" \
+    | tr -d '\n' | sha256sum | cut -c1-16
+}
+DIG_A="$(fixture_digest "$WORKDIR/fixture-report.json")"
 OUT_A="$WORKDIR/outA"
 OUT_B="$WORKDIR/outB"
 bash "$REPO_ROOT/.github/scripts/propose-updates.sh" \
-  --report "$WORKDIR/fixture-report.json" --fixture idem --outdir "$OUT_A" --base main >/dev/null 2>&1
+  --report "$WORKDIR/fixture-report.json" --fixture "$DIG_A" --outdir "$OUT_A" --base main >/dev/null 2>&1
 bash "$REPO_ROOT/.github/scripts/propose-updates.sh" \
-  --report "$WORKDIR/fixture-report.json" --fixture idem --outdir "$OUT_B" --base main >/dev/null 2>&1
-BR_A=$(jq -r '.branch' "$OUT_A/validation/phase5-pr-test-idem/proposal-plan.json")
-BR_B=$(jq -r '.branch' "$OUT_B/validation/phase5-pr-test-idem/proposal-plan.json")
-if [[ "$BR_A" == "$BR_B" && "$BR_A" == "validation/phase5-pr-test-idem" ]]; then
-  ok "same fixture -> deterministic branch identity"
+  --report "$WORKDIR/fixture-report.json" --fixture "$DIG_A" --outdir "$OUT_B" --base main >/dev/null 2>&1
+BR_A=$(jq -r '.branch' "$OUT_A/validation/phase5-pr-test-$DIG_A/fixture-plan.json")
+BR_B=$(jq -r '.branch' "$OUT_B/validation/phase5-pr-test-$DIG_A/fixture-plan.json")
+if [[ "$BR_A" == "$BR_B" && "$BR_A" == "validation/phase5-pr-test-$DIG_A" ]] \
+    && [[ "$DIG_A" =~ ^[0-9a-f]{16}$ ]]; then
+  ok "identical fixture content -> identical SHA-256 branch identity"
 else
-  bad "branch identity not deterministic: $BR_A vs $BR_B"
+  bad "identity not deterministic: $BR_A vs $BR_B (digest=$DIG_A)"
 fi
-if diff -r "$OUT_A/validation/phase5-pr-test-idem" "$OUT_B/validation/phase5-pr-test-idem" >/dev/null 2>&1; then
-  ok "fixture documents byte-identical across runs"
+if diff -r "$OUT_A/validation/phase5-pr-test-$DIG_A" "$OUT_B/validation/phase5-pr-test-$DIG_A" >/dev/null 2>&1; then
+  ok "fixture documents byte-identical across runs (modulo timestamp)"
 else
   bad "fixture documents differ across runs"
 fi
 
-note "PR validation: modified fixture produces new identity only when justified"
-OUT_C="$WORKDIR/outC"
+note "PR validation: different fixture content produces a different identity"
 cat > "$WORKDIR/fixture-report2.json" <<'JSON'
 [
   {"package":"fixture-a","current_version":"1.0.0","current_epoch":"","current_release":"1","upstream_version":"1.3.0","upstream_url":"https://github.com/example/fixture-a","update_type":"UPDATE_AVAILABLE","package_type":"stable","source_kind":"github","source_reference":"v1.3.0","rebuild_required":true,"risk_level":"medium","recommended_action":"review PR proposal","probe_ok":true,"checked_at":"2026-11-06T00:00:00Z","note":"fixture"}
 ]
 JSON
-# note: validation branch name is derived from --fixture id, NOT report content;
-# content changes on the SAME fixture branch are an update (PR refresh), not a new branch
-bash "$REPO_ROOT/.github/scripts/propose-updates.sh" \
-  --report "$WORKDIR/fixture-report2.json" --fixture idem --outdir "$OUT_C" --base main >/dev/null 2>&1
-BR_C=$(jq -r '.branch' "$OUT_C/validation/phase5-pr-test-idem/proposal-plan.json")
-if [[ "$BR_C" == "validation/phase5-pr-test-idem" ]]; then
-  ok "same fixture id remains same branch (document update, not new PR)"
+DIG_B="$(fixture_digest "$WORKDIR/fixture-report2.json")"
+if [[ "$DIG_B" != "$DIG_A" && "$DIG_B" =~ ^[0-9a-f]{16}$ ]]; then
+  ok "changed fixture content -> new SHA-256 identity"
 else
-  bad "branch changed unexpectedly: $BR_C"
+  bad "collision or invalid digest: $DIG_A vs $DIG_B"
+fi
+OUT_C="$WORKDIR/outC"
+bash "$REPO_ROOT/.github/scripts/propose-updates.sh" \
+  --report "$WORKDIR/fixture-report2.json" --fixture "$DIG_B" --outdir "$OUT_C" --base main >/dev/null 2>&1
+BR_C=$(jq -r '.branch' "$OUT_C/validation/phase5-pr-test-$DIG_B/fixture-plan.json")
+if [[ "$BR_C" == "validation/phase5-pr-test-$DIG_B" ]]; then
+  ok "changed content targets a distinct branch"
+else
+  bad "branch for changed content wrong: $BR_C"
+fi
+
+note "PR validation: fixture staging contains ONLY validation files"
+# allowed: README.md (manifest) + fixture-plan.json (identity). Anything
+# else (per-package proposal .md files, real index) is a violation.
+FIX_DIR="$OUT_A/validation/phase5-pr-test-$DIG_A"
+FIX_FILES="$(find "$FIX_DIR" -type f | sed "s#^$FIX_DIR/##" | sort)"
+if [[ "$FIX_FILES" == "$(printf 'fixture-plan.json\nREADME.md\n')" ]] \
+    && ! grep -q '## Automatic proposals' "$FIX_DIR/README.md"; then
+  ok "fixture payload is exactly manifest + identity plan (no real proposals)"
+else
+  bad "fixture payload polluted: $(echo "$FIX_FILES" | tr '\n' ' ')"
+fi
+if [[ "$(find "$OUT_A" -path '*/fixture-a.md' -o -path '*/fixture-b.md' | wc -l)" -eq 0 ]]; then
+  ok "no per-package proposal files staged in fixture"
+else
+  bad "fixture contains proposal files"
+fi
+if jq -e '.kind == "validation-fixture" and (.proposals == null)' "$FIX_DIR/fixture-plan.json" >/dev/null 2>&1; then
+  ok "fixture plan carries identity only, never proposal rows"
+else
+  bad "fixture plan embeds proposals: $(cat "$FIX_DIR/fixture-plan.json")"
+fi
+# staged paths are restricted to docs/update-proposals/validation/ (checked
+# inside the push path; here we confirm the fixture output does not contain
+# a top-level README or proposal files outside the validation namespace)
+if [[ ! -f "$OUT_C/docs/update-proposals/README.md" ]] \
+    && [[ ! -f "$OUT_C/docs/update-proposals/validation/phase5-pr-test-$DIG_B/fixture-a.md" ]] \
+    && [[ ! -f "$OUT_C/docs/update-proposals/validation/phase5-pr-test-$DIG_B/fixture-b.md" ]]; then
+  ok "no non-validation files created outside the validation namespace"
+else
+  bad "non-validation files leaked into docs/"
 fi
 
 # ---------------------------------------------------------------------------

@@ -145,10 +145,17 @@ Test-only environment variables (never set in production workflows):
   identical update sets reuse the same branch/PR (no duplicates).
 - `--push` requires `GH_TOKEN`, `--repo`, and is only used by the gated
   workflow job. `--dry-run` prints the plan and touches nothing.
-- **Permission preflight**: before any git write, `--push` verifies via
-  `gh api repos/<repo> --jq .permissions.push` that the token actually has
-  `contents: write`; a denial exits 2 with an actionable error and performs
-  zero remote writes.
+- **Permission model**: the real capability check is the operation itself
+  (`git push`, `gh pr create`) — the job-scoped `contents: write` /
+  `pull-requests: write` permissions are authoritative. The script no
+  longer treats the repository metadata `permissions.push` value as a gate:
+  for an installation token (GITHUB_TOKEN) it reports `false` even when the
+  job has write permissions (there is no authenticated user role). A
+  read-only API probe is retained for diagnostics only, and real push/PR
+  failures are classified (403 → job permission or repository "Allow
+  GitHub Actions to create and approve pull requests" setting; 404/409/
+  422/429 → precise actionable messages). The script fails closed on real
+  permission failures and never retries with another credential.
 - **PR idempotency**: PR discovery uses `gh pr view --state all`; an open
   PR is updated in place (no duplicate), a closed PR is never silently
   reopened (a fresh PR is created on the same branch), and a merged PR is
@@ -167,9 +174,14 @@ Two modes, both isolated from genuine proposals:
   mock `gh` + a local bare remote — zero remote writes.
 - **Mode B — owner-authorized remote.** The workflow's `allow-remote-pr`
   input (default `false`) + `open-pr=true` together authorize one remote
-  validation PR: deterministic fixture id derived from the report digest,
-  documentation-only payload, clearly labelled `TEST ONLY — PHASE 5.2 PR
-  VALIDATION`, never merged, never used for publication.
+  validation PR. The fixture identity is the first 16 hex chars of a
+  SHA-256 digest over the canonical normalized fixture content (sorted
+  package/update_type/upstream_version/source_reference tuples) — no
+  timestamps/nondeterminism. Identical reruns target the same branch/PR;
+  changed content produces a new identity. The branch suffix is validated
+  as hex-only. The payload is documentation-only (manifest + identity
+  plan), clearly labelled `TEST ONLY — PHASE 5.2 PR VALIDATION`, never
+  merged, never used for publication.
 
 ### Workflow integration (`check-updates.yml`)
 
@@ -201,17 +213,19 @@ Two modes, both isolated from genuine proposals:
   npm 404/403 classification, GitHub repository rename → MANUAL_REVIEW,
   abbreviated-pkgver-SHA vs full upstream HEAD comparison (false-positive
   elimination), unrecoverable pkgver revision → MANUAL_REVIEW.
-- `test-propose-updates.sh` (host): 25 assertions — proposal generation for
+- `test-propose-updates.sh` (host): 31 assertions — proposal generation for
   verified states only, index separation, deterministic branches, idempotent
   docs, no checksum/PKGBUILD edits, no secrets, no-update report, and Phase
   5.2 PR validation (mock gh + local bare remote): fixture isolation,
   allow-remote-pr gate, dry-run zero remote writes, duplicate-PR
   prevention, closed/merged PR handling, API error classification,
-  permission preflight (exit 2 + zero remote writes), and deterministic
-  fixture identity.
-- `test-workflow-audit.sh` (host): 34 assertions — Phase 5 workflow
+  repo-metadata-push=false NOT gating, real git-push-denial classification
+  (exit 2 + zero remote writes), SHA-256 fixture identity (same/different
+  content), and validation-only staging contents.
+- `test-workflow-audit.sh` (host): 36 assertions — Phase 5 workflow
   read-only/gating checks + vercmp provisioning + observability REST
-  retrieval wiring + Phase 5.2 owner-gate/least-privilege assertions.
+  retrieval wiring + Phase 5.2 owner-gate/least-privilege + fixture-digest
+  assertions.
 - `test-metrics.sh` / `test-dashboard.sh` cover report consumers and the
   completeness banner.
 - `test-artifact-collection.sh` (host): 30 assertions — cross-workflow REST
@@ -231,4 +245,37 @@ bash $REPO_ROOT/.github/scripts/check-updates.sh \
 # proposal preview (no git/GitHub side effects)
 bash $REPO_ROOT/.github/scripts/propose-updates.sh \
   --report /tmp/update-report.json --outdir /tmp/proposals
+
+# Phase 5.2 PR validation — LOCAL/mocked (Mode A; zero remote writes)
+bash $REPO_ROOT/.github/tests/test-propose-updates.sh
+
+# Phase 5.2 PR validation — REMOTE (Mode B; OWNER-AUTHORIZED ONLY)
+# first run: creates validation/phase5-pr-test-<sha256-16> + a labelled PR
+gh workflow run check-updates.yml -f open-pr=true -f allow-remote-pr=true
+gh run watch --exit-status (gh run list --workflow=check-updates.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+
+# second run (same dispatch): must REUSE the same branch + PR (no duplicate)
+gh workflow run check-updates.yml -f open-pr=true -f allow-remote-pr=true
+
+# audit the validation PR
+gh pr list --head validation/phase5-pr-test-owner-<digest> --state all --json number,url,headRefName,state,mergeCommit
+
+# cleanup (owner-only, targeted)
+gh pr close <PR_N> --repo 88kbleirad/88kbleirad-arch-repo
+git push origin --delete validation/phase5-pr-test-owner-<digest>
 ```
+
+Expected behavior:
+
+- **First run**: creates the validation branch (documentation-only payload:
+  `README.md` + `fixture-plan.json`), pushes it, opens one PR titled
+  `[TEST] PR validation fixture: <id>`. PR state `OPEN`.
+- **Second run (identical fixture)**: the digest is identical → same
+  branch → the existing OPEN PR is updated in place. No second PR.
+- **Changed fixture content**: new digest → new branch → new PR (only when
+  the fixture identity genuinely changed).
+- **Closed PR**: not silently reopened; a fresh PR is created on the same
+  branch. **Merged PR**: never recreated (idempotent skip).
+- **Denied push / PR 403**: exit 2 with an actionable diagnostic (job
+  permission or repo "Allow GitHub Actions to create and approve pull
+  requests" setting); zero remote writes on a push denial.

@@ -130,10 +130,17 @@ jobs:
           # dispatches with BOTH open-pr=true and allow-remote-pr=true.
           # It creates a documentation-only fixture branch/PR under
           # validation/phase5-pr-test-<id> — never real proposals.
-          # The id is deterministic (report digest) so reruns are
-          # idempotent: same branch, same PR, never duplicated.
+          # The id is a SHA-256 digest (first 16 hex chars) of the
+          # canonical fixture content — the sorted list of (package,
+          # update_type, upstream_version, source_reference) tuples —
+          # excluding timestamps/nondeterminism. Identical reruns get the
+          # same id (same PR); changed content gets a new id.
           if [[ "${ALLOW_REMOTE_PR}" == "true" ]]; then
-            fixture_id="$(jq -r 'map(.package) | sort | join(",") | @base64' "$report" | tr -d '=' | head -c 12)"
-            args+=(--fixture "owner-${fixture_id}" --allow-remote-pr)
+            fixture_digest="$(jq -r \
+              'map({p:.package, t:.update_type, u:(.upstream_version // ""), r:(.source_reference // "")}) | sort | tostring | @base64' "$report" \
+              | tr -d '\n' | sha256sum | cut -c1-16)"
+            # restricted, validated branch-name suffix (hex only)
+            [[ "$fixture_digest" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::fixture digest invalid"; exit 1; }
+            args+=(--fixture "owner-${fixture_digest}" --allow-remote-pr)
           fi
           bash "$GITHUB_WORKSPACE/.github/scripts/propose-updates.sh" "${args[@]}"

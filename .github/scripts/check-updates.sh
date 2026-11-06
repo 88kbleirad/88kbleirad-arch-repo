@@ -674,6 +674,9 @@ if (( ${#PKGS[@]} == 0 )); then
   done < "$REPO_ROOT/packages.txt"
 fi
 
+RAW_JSON="${TMPDIR:-/tmp}/check-updates-raw.$$.json"
+trap 'rm -f "$RAW_JSON"' EXIT
+
 {
   echo '['
   first=1
@@ -685,12 +688,12 @@ fi
   done
   echo
   echo ']'
-} > /tmp/check-updates-raw.json
+} > "$RAW_JSON"
 
 if [[ -n "$JSON_OUT" ]]; then
-  jq -s 'flatten' /tmp/check-updates-raw.json > "$JSON_OUT"
+  jq -s 'flatten' "$RAW_JSON" > "$JSON_OUT"
 else
-  jq -s 'flatten' /tmp/check-updates-raw.json
+  jq -s 'flatten' "$RAW_JSON"
 fi
 
 if [[ -n "$SUMMARY_OUT" ]]; then
@@ -700,13 +703,11 @@ if [[ -n "$SUMMARY_OUT" ]]; then
     echo "### Classification counts"
     echo
     jq -s -r 'flatten | group_by(.update_type) | sort_by(.[0].update_type)[] | "- \(.[0].update_type): \(length)"' \
-      /tmp/check-updates-raw.json
+      "$RAW_JSON"
     echo
     echo "| package | current | upstream | type | pkg-type | risk | recommendation |"
     echo "|---|---|---|---|---|---|---|"
     jq -s -r 'flatten[] | "| \(.package) | \(.current_version // "-") | \(.upstream_version // "-") | \(.update_type) | \(.package_type // "-") | \(.risk_level) | \(.recommended_action) |"' \
-      /tmp/check-updates-raw.json
+      "$RAW_JSON"
   } > "$SUMMARY_OUT"
 fi
-
-rm -f /tmp/check-updates-raw.json

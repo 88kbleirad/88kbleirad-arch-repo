@@ -53,7 +53,7 @@ PUSH=0
 DRY=0
 FIXTURE=""
 ALLOW_REMOTE_PR=0
-perms=""
+rel_outdir=""
 TMPDIR="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "$TMPDIR/propose.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -113,19 +113,47 @@ mkdir -p "$OUTDIR" "$STAGE"
 # is resolved — avoids untracked-file conflicts when updating an existing
 # proposal branch)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# FIXTURE MODE: emit ONLY the validation manifest under the validation
+# namespace. Genuine per-package proposals (which are derived from the
+# report's decision set) are NEVER generated in fixture mode — a
+# validation-only PR must never carry real proposal content.
+# ---------------------------------------------------------------------------
 INDEX="$STAGE/README.md"
+if [[ -n "${FIXTURE_MARK:-}" ]]; then
+  {
+    echo "# Phase 5.2 PR Validation Fixture"
+    echo
+    echo "> **$FIXTURE_MARK**"
+    echo
+    echo "This file exists solely to validate the Phase 5.2 pull-request"
+    echo "workflow (branch creation, PR creation, idempotent reruns)."
+    echo
+    echo "- **fixture id**: \`$FIXTURE\`"
+    echo "- **branch**: \`$BRANCH\`"
+    echo "- **payload**: documentation only — no PKGBUILD, no package"
+    echo "  sources, no release assets, no production changes."
+    echo "- **do not merge**; merging publishes nothing."
+    echo
+    echo "## Content digest (fixture identity)"
+    echo
+    echo '```'
+    echo "packages_checked=$(jq 'length' "$REPORT")"
+    echo "decision_count=$DECISION_COUNT"
+    echo "update_count=$UPDATE_COUNT"
+    echo '```'
+    echo
+    echo "The branch suffix is a SHA-256 digest of the canonical fixture"
+    echo "content (sorted package/state/version tuples). Identical content"
+    echo "always yields the same branch and PR; changed content yields a new"
+    echo "one."
+  } > "$INDEX"
+fi
+
+if [[ -z "${FIXTURE_MARK:-}" ]]; then
 {
   echo "# Update Proposals (Phase 5.2)"
   echo
-  if [[ -n "${FIXTURE_MARK:-}" ]]; then
-    echo "> **$FIXTURE_MARK**"
-    echo
-    echo "This branch is a controlled validation fixture. It contains"
-    echo "documentation only — no PKGBUILD or package changes. It is"
-    echo "isolated from genuine update proposals and must never be merged"
-    echo "or used as a base for publication."
-    echo
-  fi
   echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo
   echo "Base branch: \`$BASE\`"
@@ -149,11 +177,14 @@ INDEX="$STAGE/README.md"
   jq -r '.[] | "- \(.package): \(.update_type) — \(.note // "")"' "$REPORT" \
     | grep -vE 'UPDATE_AVAILABLE|SOURCE_CHANGED|REBUILD_REQUIRED' || echo "- (none)"
 } > "$INDEX"
+fi
 
-# per-package proposal files — deterministic, evidence-only
+# per-package proposal files — deterministic, evidence-only (NEVER in
+# fixture mode: validation PRs carry only the manifest above)
 N=0
 while IFS= read -r rec; do
   [[ -n "$rec" ]] || continue
+  [[ -n "${FIXTURE_MARK:-}" ]] && continue
   N=$((N+1))
   pkg=$(jq -r '.package' <<<"$rec")
   state=$(jq -r '.update_type' <<<"$rec")
@@ -205,12 +236,27 @@ while IFS= read -r rec; do
 done < <(jq -c '.[]' <<<"$DECISIONS")
 
 # summaries (machine-readable plan)
-PLAN="$STAGE/proposal-plan.json"
-jq -n \
-  --arg branch "$BRANCH" \
-  --argjson proposals "$DECISIONS" \
-  --argjson update_count "$UPDATE_COUNT" \
-  '{branch:$branch, proposals:$proposals, update_count:$update_count}' > "$PLAN"
+# - proposal mode: full deterministic plan (branch + proposals + count)
+# - fixture mode:  fixture identity ONLY — never the real decision set
+#   (a validation PR must not embed genuine proposal content)
+if [[ -n "${FIXTURE_MARK:-}" ]]; then
+  PLAN="$STAGE/fixture-plan.json"
+  jq -n \
+    --arg branch "$BRANCH" \
+    --arg fixture "$FIXTURE" \
+    --argjson packages_checked "$(jq 'length' "$REPORT")" \
+    --argjson decision_count "$DECISION_COUNT" \
+    --argjson update_count "$UPDATE_COUNT" \
+    '{branch:$branch, fixture:$fixture, kind:"validation-fixture", packages_checked:$packages_checked,
+      decision_count:$decision_count, update_count:$update_count}' > "$PLAN"
+else
+  PLAN="$STAGE/proposal-plan.json"
+  jq -n \
+    --arg branch "$BRANCH" \
+    --argjson proposals "$DECISIONS" \
+    --argjson update_count "$UPDATE_COUNT" \
+    '{branch:$branch, proposals:$proposals, update_count:$update_count}' > "$PLAN"
+fi
 
 echo "[propose] generated $N proposal document(s) (staged)"
 echo "[propose] deterministic branch: $BRANCH"
@@ -237,14 +283,18 @@ if [[ "$PUSH" -eq 1 ]]; then
     fi
   fi
 
-  # permission preflight: verify the token actually has write scopes before
-  # any git write (fails fast with a clear, actionable error). The API
-  # response value is inspected (not just the call exit status): gh exits 0
-  # even when `permissions.push` is false.
-  perms="$(GH_TOKEN="$GH_TOKEN" gh api "repos/$REPO" --jq '.permissions.push' 2>/dev/null)" || perms=""
-  if [[ "$perms" != "true" ]]; then
-    echo "::error::GitHub token lacks contents:write for $REPO (PR branch push will fail; API reported permissions.push=$perms). Grant contents:write to the workflow token or use PAT with repo scope." >&2
-    exit 2
+  # Token/repo access probe — DIAGNOSTIC ONLY, never a gate.
+  #
+  # `GET /repos/{repo}.permissions.push` reports the *authenticated user's*
+  # repo role. For an installation token (GITHUB_TOKEN) there is no user
+  # role, so it returns `false` even when the job has `contents: write` —
+  # treating it as authoritative produced a false negative and aborted a
+  # correctly-authorized run. The real capability check is the operation
+  # itself (git push / gh pr create); those failures are classified below.
+  if GH_TOKEN="$GH_TOKEN" gh api "repos/$REPO" --jq '.full_name' >/dev/null 2>&1; then
+    echo "[propose] token can read $REPO (effective write scope is enforced by the operations below)"
+  else
+    echo "[propose] warning: token cannot read $REPO metadata; remote operations will likely fail" >&2
   fi
 
   # branch exists? (idempotent: reuse/update, never duplicate)
@@ -261,10 +311,49 @@ if [[ "$PUSH" -eq 1 ]]; then
   cp -r "$STAGE/." "$OUTDIR/"
   git config user.name "github-actions[bot]"
   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-  git add "$OUTDIR"
+  # STRICT STAGING PATHSPEC: in fixture mode ONLY the validation namespace
+  # may be staged; in proposal mode ONLY docs/update-proposals/. Nothing
+  # else (no PKGBUILDs, packages.txt, workflows) can ever enter a commit.
+  if [[ -n "${FIXTURE_MARK:-}" ]]; then
+    # validation branch: the ONLY allowed path is the validation dir
+    # (git ls-files emits repo-root-relative paths; normalize OUTDIR to
+    # relative and add a trailing slash for the prefix match)
+    rel_outdir="${OUTDIR#"$REPO_ROOT"/}"
+    if git ls-files --others --exclude-standard | grep -vE "^${rel_outdir}/" | grep -q .; then
+      echo "::error::fixture stage contains files outside $rel_outdir; refusing to commit" >&2
+      git ls-files --others --exclude-standard | grep -vE "^${rel_outdir}/" >&2
+      exit 2
+    fi
+    git add -- "${rel_outdir}"
+  else
+    git add -- "${OUTDIR}"
+  fi
+  # verify the staged diff touches only the intended root before committing
+  staged_files="$(git diff --cached --name-only)"
+  if [[ -z "$staged_files" ]]; then
+    echo "[propose] no changes to commit (idempotent no-op)"
+    exit 0
+  fi
+  if ! grep -qE "^docs/update-proposals/" <<<"$staged_files"; then
+    echo "::error::staged files are outside docs/update-proposals/; refusing to commit" >&2
+    echo "$staged_files" >&2
+    exit 2
+  fi
   git commit -q -m "docs(updates): update proposals for $DECISION_COUNT package(s)" || true
   if ! git push -q -u origin "$BRANCH" 2>"$WORKDIR/push.err"; then
-    echo "::error::git push failed for $BRANCH: $(cat "$WORKDIR/push.err")" >&2
+    push_err="$(cat "$WORKDIR/push.err" 2>/dev/null)"
+    case "$push_err" in
+      *"403"*|*"forbidden"*|*"not authorized"*|*"Permission denied"*)
+        echo "::error::git push DENIED for $BRANCH (HTTP 403). The workflow job lacks contents:write, or repository settings disallow the token. Job permissions must include contents: write; verify 'Allow GitHub Actions to create and approve pull requests' is enabled for the repository." >&2 ;;
+      *"protected branch"*|*"pre-receive hook"*|*"refusing"*)
+        echo "::error::git push REJECTED for $BRANCH (branch protection / pre-receive hook). Review branch protection rules for the validation namespace." >&2 ;;
+      *"repository not found"*|*404*)
+        echo "::error::git push failed: remote repository or remote missing — verify origin and --repo." >&2 ;;
+      *"unable to access"*|*"Could not resolve host"*|*"Connection refused"*|*"Operation timed out"*)
+        echo "::error::git push failed: network error reaching GitHub. Retry later; no credential fallback is attempted." >&2 ;;
+      *)
+        echo "::error::git push failed for $BRANCH: $push_err" >&2 ;;
+    esac
     exit 2
   fi
 
@@ -310,7 +399,7 @@ if [[ "$PUSH" -eq 1 ]]; then
       # classify the failure for a clear, actionable error
       case "$(tail -1 "$WORKDIR/prcreate.log")" in
         *"Bad credentials"*|*403*)
-          echo "::error::PR creation failed: token lacks pull-requests:write for $REPO. Grant pull-requests:write to the workflow job." >&2 ;;
+          echo "::error::PR creation denied (HTTP 403). Either the workflow job lacks pull-requests:write, or repository settings disallow GitHub Actions from creating PRs. Check: job permissions include pull-requests: write; repo Settings → Actions → General → Workflow permissions → 'Allow GitHub Actions to create and approve pull requests' is enabled." >&2 ;;
         *404*)
           echo "::error::PR creation failed: base branch $BASE or head branch $BRANCH not found on $REPO." >&2 ;;
         *409*|*"reference already exists"*)

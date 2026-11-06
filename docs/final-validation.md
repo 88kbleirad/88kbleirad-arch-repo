@@ -16,8 +16,8 @@ publication, no Pages enablement) — those require owner authorization.
 | Suite | Source | Result |
 |---|---|---|
 | lifecycle detection + safety (incl. vercmp provisioning, SIGPIPE regression, source-parsing + probe-classification accuracy) | `test-check-updates.sh` | 48 PASS |
-| update proposals (offline) + Phase 5.2 PR validation | `test-propose-updates.sh` | 25 PASS |
-| workflow audit (+ Phase 5.4 gates + PR-validation gates) | `test-workflow-audit.sh` | 34 PASS |
+| update proposals (offline) + Phase 5.2 PR validation | `test-propose-updates.sh` | 31 PASS |
+| workflow audit (+ Phase 5.4 gates + PR-validation gates) | `test-workflow-audit.sh` | 36 PASS |
 | artifact collection (REST retrieval, mock API) | `test-artifact-collection.sh` | 30 PASS |
 | metrics builder + history (incl. strict KPI mapping) | `dashboard/tests/test-metrics.sh` | 24 PASS |
 | dashboard build (incl. incomplete banner) | `dashboard/tests/test-dashboard.sh` | 19 PASS |
@@ -37,9 +37,9 @@ publication, no Pages enablement) — those require owner authorization.
 `REPO_ROOT=$PWD RUN_PROD_SCENARIOS=1 bash .github/tests/run-tests.sh`
 runs every existing suite plus the newly registered Phase 5 suites.
 Measured (pinned container): overall `PASS=56 FAIL=0`, `EXIT=0` — 18 suite
-runs, including lifecycle (48), proposals (25), workflow-audit (34),
+runs, including lifecycle (48), proposals (31), workflow-audit (36),
 artifact-collection (30), metrics (24), dashboard (19), and all Phase 1–4
-suites (host + container). 649 assertions total, 0 failures.
+suites (host + container). 657 assertions total, 0 failures.
 
 ## 5. Phase 5.4 safety re-verification
 
@@ -79,6 +79,29 @@ suites (host + container). 649 assertions total, 0 failures.
 
 No acceptance criterion that requires a live GitHub run is claimed as
 verified here; those remain `PENDING` until executed by the owner.
+
+### Required repository settings (owner check before remote PR runs)
+
+The workflow needs the standard `GITHUB_TOKEN` job permissions
+(`contents: write`, `pull-requests: write` on the `propose` job only).
+Before a remote validation run, verify:
+
+1. **Settings → Actions → General → Workflow permissions**: the repository
+   allows GitHub Actions to create/approve pull requests (toggle **Allow
+   GitHub Actions to create and approve pull requests** must be ON). If it
+   is OFF, `gh pr create` returns 403 and the script emits the specific
+   diagnostic (job permission OR this setting).
+2. The `propose` job's `permissions:` block retains exactly
+   `contents: write` + `pull-requests: write`; the top-level workflow
+   permissions stay read-only (`contents: read`).
+3. Validation branches (`validation/phase5-pr-test-*`) are not protected by
+   branch rules that would reject pushes from the workflow token (if they
+   are, the push returns 403 and is reported as a permission denial).
+4. No PAT is required for the standard flow; a PAT is only justified if a
+   documented repository restriction blocks the workflow token (e.g.
+   repository-level "require approval for workflow runs" or branch
+   protection requiring a user token) — the script never substitutes or
+   recommends a credential automatically.
 
 ## 7. Verdict
 

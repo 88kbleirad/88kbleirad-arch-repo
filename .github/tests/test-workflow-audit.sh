@@ -235,6 +235,16 @@ if grep -q 'fixture' "$upd_wf_cl" && grep -q 'allow-remote-pr' "$upd_wf_cl"; the
 else
   bad "remote PR validation wiring missing"
 fi
+if grep -q 'sha256sum' "$upd_wf_cl" && grep -q 'cut -c1-16' "$upd_wf_cl"; then
+  ok "fixture identity uses a SHA-256 digest (16 hex chars)"
+else
+  bad "fixture identity is not a cryptographic digest"
+fi
+if grep -qE '\^\[0-9a-f\]\{16\}\$' "$upd_wf_cl"; then
+  ok "fixture branch suffix is validated as hex-only"
+else
+  bad "fixture branch suffix not restricted"
+fi
 
 # ---------------------------------------------------------------------------
 note "workflow audit: vercmp provisioning on the check-updates runner"
