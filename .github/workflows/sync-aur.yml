@@ -198,8 +198,10 @@ jobs:
           find . -mindepth 2 -name ".git" -exec rm -rf {} +
           rm -rf "$STATUS_DIR" "$AUR_TMP" "$LOG_DIR" "$CACHYOS_TMP"
 
-          echo "synced=${SYNCED[*]:-}" >> "$GITHUB_OUTPUT"
-          echo "failed=${FAILED[*]:-}" >> "$GITHUB_OUTPUT"
+          {
+            echo "synced=${SYNCED[*]:-}"
+            echo "failed=${FAILED[*]:-}"
+          } >> "$GITHUB_OUTPUT"
 
           # Definition validation: every enabled entry in packages.txt must now
           # have a PKGBUILD (or the sync of that package failed).
@@ -220,10 +222,12 @@ jobs:
           fi
           echo "removed=${REMOVED[*]:-}" >> "$GITHUB_OUTPUT"
 
-          echo "### Sync summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Synced: ${SYNCED[*]:-none}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Failed: ${FAILED[*]:-none}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Removed: ${REMOVED[*]:-none}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Sync summary"
+            echo "- Synced: ${SYNCED[*]:-none}"
+            echo "- Failed: ${FAILED[*]:-none}"
+            echo "- Removed: ${REMOVED[*]:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or update aggregated pull request
         uses: peter-evans/create-pull-request@v8

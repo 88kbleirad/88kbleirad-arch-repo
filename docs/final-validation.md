@@ -15,13 +15,14 @@ publication, no Pages enablement) — those require owner authorization.
 
 | Suite | Source | Result |
 |---|---|---|
-| lifecycle detection + safety | `test-check-updates.sh` | 24 PASS |
+| lifecycle detection + safety (incl. vercmp provisioning) | `test-check-updates.sh` | 30 PASS |
 | update proposals (offline) | `test-propose-updates.sh` | 12 PASS |
-| workflow audit (+ Phase 5 gates) | `test-workflow-audit.sh` | 23 PASS |
+| workflow audit (+ Phase 5.4 gates) | `test-workflow-audit.sh` | 29 PASS |
+| artifact collection (REST retrieval, mock API) | `test-artifact-collection.sh` | 30 PASS |
 | metrics builder + history | `dashboard/tests/test-metrics.sh` | 13 PASS |
-| dashboard build | `dashboard/tests/test-dashboard.sh` | 15 PASS |
+| dashboard build (incl. incomplete banner) | `dashboard/tests/test-dashboard.sh` | 18 PASS |
 | full harness (Phase 1–4 regressions) | `run-tests.sh` | overall 0 FAIL (see §4) |
-| browser render (headless Chromium) | dashboard with fixture snapshot | 12 KPIs, 4 charts, table/filter/search OK |
+| browser render (headless Chromium) | dashboard with fixture snapshot | KPIs, 4 charts, table/filter/search, completeness banner OK |
 
 ## 3. Static analysis
 
@@ -35,9 +36,10 @@ publication, no Pages enablement) — those require owner authorization.
 
 `REPO_ROOT=$PWD RUN_PROD_SCENARIOS=1 bash .github/tests/run-tests.sh`
 runs every existing suite plus the newly registered Phase 5 suites.
-Measured (pinned container): overall `PASS=52 FAIL=0`, `EXIT=0` — 17 suite
-runs, including lifecycle (24), proposals (12), workflow-audit (23), metrics
-(13), dashboard (15), and all Phase 1–4 suites (host + container).
+Measured (pinned container): overall `PASS=56 FAIL=0`, `EXIT=0` — 18 suite
+runs, including lifecycle (30), proposals (12), workflow-audit (29),
+artifact-collection (30), metrics (13), dashboard (18), and all Phase 1–4
+suites (host + container).
 
 ## 5. Phase 5.4 safety re-verification
 
@@ -55,15 +57,22 @@ runs, including lifecycle (24), proposals (12), workflow-audit (23), metrics
 - Proposal PRs are gated behind `open-pr` and cannot publish (no merge
   automation; publication path is separate + owner-authorized).
 - Dashboard + lifecycle detection use read-only permissions; observability
-  workflow is `contents: read`.
+  workflow is `contents: read` + `actions: read` (artifact API only, GETs
+  only) and never ingests its own run's artifacts.
+- The observability workflow fails on `NO_DATA` (explicitly labelled
+  incomplete dashboard) and never claims a populated dashboard without
+  verified sources.
+- Public/configured inventory (`packages.txt`) is kept separate from the
+  published package count (production health report) — nothing is hardcoded.
 
 ## 6. Live validation required (PENDING, owner-authorized)
 
 | Item | Gate |
 |---|---|
-| Lifecycle workflow run (real upstream probes) | owner dispatch |
+| Lifecycle workflow run (real upstream probes; vercmp now provisioned) | owner dispatch |
 | Proposal PR creation | owner dispatch with `open-pr=true` |
-| Observability workflow run + artifact download | owner dispatch |
+| Observability workflow run + cross-run artifact download | owner dispatch |
+| First publish-sidecar uploads (`publish-summary-*`, `run-metrics-*`) | existing production/staging authorization |
 | Optional Pages enablement | owner repo-settings change |
 | Production/staging publication | existing manual authorization |
 

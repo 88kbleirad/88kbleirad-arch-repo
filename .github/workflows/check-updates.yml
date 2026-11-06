@@ -41,7 +41,19 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq curl git
+          # vercmp is provided by the `makepkg` package on Ubuntu/Debian
+          # (the `pacman-contrib` package does not exist in the Ubuntu
+          # archive). The detector refuses to run without vercmp.
+          sudo apt-get install -y -qq jq curl git makepkg
+
+      - name: Verify vercmp availability
+        run: |
+          set -euo pipefail
+          if ! command -v vercmp >/dev/null 2>&1; then
+            echo "::error::dependency provisioning failed: vercmp not found after installing makepkg. Install the 'makepkg' package (provides vercmp) and re-run."
+            exit 1
+          fi
+          echo "::notice::vercmp available: $(command -v vercmp) ($(vercmp --version 2>/dev/null | head -1 || true))"
 
       - name: Run update detection (read-only)
         id: detect

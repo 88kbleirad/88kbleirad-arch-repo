@@ -144,6 +144,14 @@ jobs:
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
 
+      - name: Upload publish summary (observability sidecar)
+        uses: actions/upload-artifact@v7
+        with:
+          name: publish-summary-repository-v4-test
+          path: publish-summary.json
+          if-no-files-found: warn
+          retention-days: 14
+
   # Phase 4.1/4.5: post-publication health gate for the signed staging
   # release (read-only).
   health-check:

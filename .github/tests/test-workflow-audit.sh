@@ -203,6 +203,57 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "workflow audit: vercmp provisioning on the check-updates runner"
+# Ubuntu 24.04 ships vercmp in the `makepkg` binary package (NOT in a
+# `pacman-contrib` package, which does not exist in Ubuntu). The workflow
+# must install makepkg and verify `command -v vercmp` before the detector
+# runs — the detector itself fails closed (exit 2) without vercmp.
+upd_wf="$REPO_ROOT/.github/workflows/check-updates.yml"
+if grep -q 'makepkg' "$upd_wf" \
+    && grep -q 'command -v vercmp' "$upd_wf" \
+    && grep -q '::error::dependency provisioning failed' "$upd_wf"; then
+  ok "check-updates provisions the Ubuntu vercmp provider and verifies it"
+else
+  bad "check-updates vercmp provisioning missing/changed"
+fi
+if grep -q 'vercmp required' "$REPO_ROOT/.github/scripts/check-updates.sh"; then
+  ok "detector fails closed without vercmp"
+else
+  bad "detector vercmp guard changed"
+fi
+
+# ---------------------------------------------------------------------------
+note "workflow audit: observability uses REST API artifact retrieval"
+# The old design downloaded from the CURRENT run with a multiline pattern
+# (never matches) and silently produced empty dashboards. The corrected
+# workflow retrieves cross-run artifacts via the read-only collector with
+# an explicit run-id, requires `actions: read` for the REST API, and never
+# depends on the current run's own artifacts.
+obs=$(parse "$REPO_ROOT/.github/workflows/observability.yml")
+if grep -q 'actions: read' <<<"$obs"; then
+  ok "observability grants actions:read for artifact API"
+else
+  bad "observability missing actions:read permission"
+fi
+if grep -q 'collect-artifacts.sh' "$REPO_ROOT/.github/workflows/observability.yml" \
+    && grep -q -- '--run-id "\${{ github.run_id }}"' "$REPO_ROOT/.github/workflows/observability.yml"; then
+  ok "observability uses the cross-run collector with recursion guard"
+else
+  bad "observability collector wiring changed"
+fi
+# the old broken pattern block must be gone
+if grep -q 'pattern: |' "$REPO_ROOT/.github/workflows/observability.yml"; then
+  bad "observability still uses a multiline download-artifact pattern"
+else
+  ok "multiline artifact pattern removed (single-glob download by run)"
+fi
+if grep -q 'actions/download-artifact' "$REPO_ROOT/.github/workflows/observability.yml"; then
+  bad "observability still downloads artifacts from the current run"
+else
+  ok "current-run download-artifact removed"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

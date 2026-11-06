@@ -641,6 +641,24 @@ fi
 
 echo "[publish] SUMMARY unchanged=${PUBLISH_COUNTERS[unchanged]} uploaded=${PUBLISH_COUNTERS[uploaded]} replaced=${PUBLISH_COUNTERS[replaced]} failed=${PUBLISH_COUNTERS[failed]} api_requests=${PUBLISH_COUNTERS[api_requests]}"
 
+# -- publish summary sidecar (publication metrics for observability) ----------
+# Pure local artifact; uploaded by the workflow as publish-summary-<tag>.
+# Never pushed, never part of the release.
+if [[ -n "${GITHUB_WORKSPACE:-}" && -d "$GITHUB_WORKSPACE" ]]; then
+  printf '%s\n' "$(jq -nc \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg tag "$TAG" \
+    --arg release "$REPO" \
+    --argjson unchanged "${PUBLISH_COUNTERS[unchanged]}" \
+    --argjson uploaded "${PUBLISH_COUNTERS[uploaded]}" \
+    --argjson replaced "${PUBLISH_COUNTERS[replaced]}" \
+    --argjson failed "${PUBLISH_COUNTERS[failed]}" \
+    --argjson api_requests "${PUBLISH_COUNTERS[api_requests]}" \
+    '{timestamp:$ts, release:$release, release_tag:$tag, unchanged:$unchanged,
+      uploaded:$uploaded, replaced:$replaced, failed:$failed, api_requests:$api_requests}')" \
+    > "$GITHUB_WORKSPACE/publish-summary.json"
+fi
+
 # -- recovery: record the pre-mutation remote asset manifest ----------------
 # Local artifact (never uploaded): captures exactly what the release looked
 # like before this run's mutations. Used to reconcile interrupted publishes

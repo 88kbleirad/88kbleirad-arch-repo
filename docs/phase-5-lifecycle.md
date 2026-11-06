@@ -142,15 +142,23 @@ Test-only environment variables (never set in production workflows):
 
 ## 7. Acceptance / tests
 
-- `test-check-updates.sh` (host): 24 assertions — legacy safety semantics,
-  epoch/pkgrel parsing, vercmp non-lexical, 404/archived/empty upstream
+- `test-check-updates.sh` (host): 30 assertions — legacy safety semantics,
+  epoch/pkgrel parsing, vercmp non-lexical, missing-vercmp fail-closed
+  (rc 2), epoch/pkgver/pkgrel comparison smoke, 404/archived/empty upstream
   classification, VCS pinned-commit states, package type, schema, offline
   discovery from packages.txt.
 - `test-propose-updates.sh` (host): 12 assertions — proposal generation for
   verified states only, index separation, deterministic branches, idempotent
   docs, no checksum/PKGBUILD edits, no secrets, no-update report.
-- `test-workflow-audit.sh` (host): Phase 5 workflow read-only/gating checks.
-- `test-metrics.sh` / `test-dashboard.sh` cover report consumers.
+- `test-workflow-audit.sh` (host): 29 assertions — Phase 5 workflow
+  read-only/gating checks + vercmp provisioning + observability REST
+  retrieval wiring.
+- `test-metrics.sh` / `test-dashboard.sh` cover report consumers and the
+  completeness banner.
+- `test-artifact-collection.sh` (host): 30 assertions — cross-workflow REST
+  retrieval, source-run selection, expiration/missing/failed/corrupt
+  sources, prod/staging separation, history persistence, completeness
+  classification, no accidental API writes.
 
 ## 8. Manual verification (fish shell)
 

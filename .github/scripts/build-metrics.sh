@@ -11,6 +11,7 @@
 #   --publish-dir <dir>    directory of publish-summary*.json / *.txt
 #   --lifecycle <file>     package lifecycle report (check-updates.sh)
 #   --runs-dir <dir>       directory of workflow-run metrics JSON
+#   --inventory <file>     source-artifact inventory (collect-artifacts.sh)
 #   --retention <n>        max history points kept per series (default 50)
 #
 # Output (stdout or --out): a metrics snapshot with a stable schema:
@@ -18,6 +19,9 @@
 #     "schema": "repo-metrics/v1",
 #     "generated_at": ISO8601,
 #     "retention": N,
+#     "completeness": "COMPLETE|PARTIAL|NO_DATA" | null,
+#     "inventory": { ... } | null,
+#     "source_summary": {"health_production":{...}, ...},
 #     "kpis": {...},
 #     "health_history": [ {timestamp, release, state} ],
 #     "publish_history": [ {timestamp, release, unchanged, uploaded, replaced, failed, api_requests} ],
@@ -25,6 +29,13 @@
 #     "cache_history": [ {timestamp, run, hits, misses, hit_rate} ],
 #     "packages": [ <lifecycle rows> ]
 #   }
+#
+# Source policy (Phase 5.4): the snapshot transparently records where each
+# series came from. Missing sources yield null KPIs — never fabricated
+# values. The `completeness` verdict is authoritative: NO_DATA means no
+# verified core source (health production, health staging, lifecycle) was
+# available, and the dashboard/report must present this as an incomplete
+# state, not a populated observability dashboard.
 #
 # Retention: each history array is sorted by timestamp and truncated to the
 # newest `retention` points (bounded growth; the dashboard downsamples
@@ -37,11 +48,14 @@ HEALTH_DIR=""
 PUBLISH_DIR=""
 LIFECYCLE=""
 RUNS_DIR=""
+INVENTORY=""
 RETENTION="${METRICS_RETENTION:-50}"
 OUT=""
 BUILD_PROFILE="${BUILD_PROFILE:-x86-64-v4}"
 RELEASE_TAG="${RELEASE_TAG:-repository}"
 NOW="${METRICS_NOW:-}"
+PACKAGES_FILE="${PACKAGES_FILE:-}"
+PUBLISHED_COUNT="${PUBLISHED_COUNT:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -49,6 +63,8 @@ while [[ $# -gt 0 ]]; do
     --publish-dir) PUBLISH_DIR="${2:-}"; shift 2 ;;
     --lifecycle) LIFECYCLE="${2:-}"; shift 2 ;;
     --runs-dir) RUNS_DIR="${2:-}"; shift 2 ;;
+    --inventory) INVENTORY="${2:-}"; shift 2 ;;
+    --packages-file) PACKAGES_FILE="${2:-}"; shift 2 ;;
     --retention) RETENTION="${2:-}"; shift 2 ;;
     --out) OUT="${2:-}"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -68,43 +84,115 @@ build_rows="[]"
 cache_rows="[]"
 packages="[]"
 
-# -- health reports: prefer an explicit event sidecar (health-history.jsonl)
-if [[ -n "$HEALTH_DIR" && -d "$HEALTH_DIR" ]]; then
-  # sidecar lines: {"timestamp":...,"release":...,"state":...}
-  if [[ -f "$HEALTH_DIR/health-history.jsonl" ]]; then
-    health_rows=$(jq -s -c 'map(select(.state != null))' "$HEALTH_DIR/health-history.jsonl" 2>/dev/null || echo '[]')
+# ---------------------------------------------------------------------------
+# source resolution: when an inventory (collect-artifacts.sh) is provided,
+# only the inventory-blessed, schema-validated files are consumed — never
+# an ad-hoc scan of the input directory. Without an inventory (offline
+# tests), the legacy directory scans are used.
+# ---------------------------------------------------------------------------
+INVENTORY_JSON=""
+INVENTORY_OK=0
+if [[ -n "$INVENTORY" && -f "$INVENTORY" ]]; then
+  if jq -e '.schema == "repo-artifact-inventory/v1"' "$INVENTORY" >/dev/null 2>&1; then
+    INVENTORY_OK=1
+    INVENTORY_JSON="$(cat "$INVENTORY")"
+  else
+    echo "::error::inventory file is invalid (expected repo-artifact-inventory/v1); refusing to build metrics from unknown sources" >&2
+    exit 2
   fi
-  # individual reports (health-report*.json) also contribute one point each
+fi
+
+src_for() { # <slot> -> prints the inventory-resolved "file|dir" (empty if not ok)
+  [[ $INVENTORY_OK -eq 1 ]] || return 1
+  local slot="$1" st f
+  st="$(jq -r --arg s "$slot" '.sources[$s].status // ""' <<<"$INVENTORY_JSON")"
+  [[ "$st" == "ok" ]] || return 1
+  f="$(jq -r --arg s "$slot" '.sources[$s].file // ""' <<<"$INVENTORY_JSON")"
+  [[ -n "$f" && -e "$f" ]] || return 1
+  printf '%s' "$f"
+}
+
+health_rows="[]"
+publish_rows="[]"
+build_rows="[]"
+cache_rows="[]"
+packages="[]"
+PUBLISHED_PACKAGES=""
+
+if (( INVENTORY_OK )); then
+  # -- health reports (production + staging, independently resolved) --------
+  local_hp="" local_hs=""
+  src_for health_production >/dev/null 2>&1 && local_hp="$(src_for health_production)" || true
+  src_for health_staging >/dev/null 2>&1 && local_hs="$(src_for health_staging)" || true
   extra="[]"
-  if shopt -s nullglob 2>/dev/null; then
-    extra=$(for f in "$HEALTH_DIR"/health-report*.json; do
-      jq -c --arg rel "$RELEASE_TAG" \
-        '{timestamp:(.timestamp // null), release:$rel, state:(.overall_status // "UNKNOWN")}' "$f" 2>/dev/null || true
-    done | jq -s -c 'map(select(.timestamp != null))' 2>/dev/null || echo '[]')
+  for f in "$local_hp" "$local_hs"; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    extra="$(jq -n -c --argjson e "$extra" \
+      --arg ts "$(jq -r '.timestamp // ""' "$f")" \
+      --arg rel "$(jq -r '.release_tag // ""' "$f")" \
+      --arg st "$(jq -r '.overall_status // "UNKNOWN"' "$f")" \
+      '$e + [{timestamp:$ts, release:$rel, state:$st}]')"
+  done
+  health_rows="$extra"
+  # published package count (production release inventory — distinct from the
+  # configured/checked package count reported by the lifecycle report)
+  if [[ -n "$local_hp" ]]; then
+    PUBLISHED_PACKAGES="$(jq -r '.package_count // ""' "$local_hp")"
   fi
-  health_rows=$(jq -nc --argjson a "$health_rows" --argjson b "$extra" '$a + $b' 2>/dev/null || echo "$health_rows")
-fi
 
-# -- publish summaries: sidecar lines with counters
-if [[ -n "$PUBLISH_DIR" && -d "$PUBLISH_DIR" ]]; then
-  if [[ -f "$PUBLISH_DIR/publish-history.jsonl" ]]; then
-    publish_rows=$(jq -s -c 'map(select(.timestamp != null))' "$PUBLISH_DIR/publish-history.jsonl" 2>/dev/null || echo '[]')
+  # -- publish / build / cache sidecars from the collector's slot dirs ------
+  local_pub="" local_ci=""
+  src_for publish >/dev/null 2>&1 && local_pub="$(src_for publish)" || true
+  src_for ci >/dev/null 2>&1 && local_ci="$(src_for ci)" || true
+  if [[ -n "$local_pub" && -f "$local_pub/publish-history.jsonl" ]]; then
+    publish_rows="$(jq -s -c 'map(select(.timestamp != null))' "$local_pub/publish-history.jsonl" 2>/dev/null || echo '[]')"
   fi
-fi
+  if [[ -n "$local_ci" ]]; then
+    if [[ -f "$local_ci/build-durations.jsonl" ]]; then
+      build_rows="$(jq -s -c 'map(select(.timestamp != null))' "$local_ci/build-durations.jsonl" 2>/dev/null || echo '[]')"
+    fi
+    if [[ -f "$local_ci/cache-history.jsonl" ]]; then
+      cache_rows="$(jq -s -c 'map(select(.timestamp != null))' "$local_ci/cache-history.jsonl" 2>/dev/null || echo '[]')"
+    fi
+  fi
 
-# -- build/cache metrics: sidecar lines
-if [[ -n "$RUNS_DIR" && -d "$RUNS_DIR" ]]; then
-  if [[ -f "$RUNS_DIR/build-durations.jsonl" ]]; then
-    build_rows=$(jq -s -c 'map(select(.timestamp != null))' "$RUNS_DIR/build-durations.jsonl" 2>/dev/null || echo '[]')
+  # -- lifecycle report (inventory-blessed) ---------------------------------
+  local_lc=""
+  src_for lifecycle >/dev/null 2>&1 && local_lc="$(src_for lifecycle)" || true
+  if [[ -n "$local_lc" ]]; then
+    packages="$(jq -c 'if type=="array" then . else [] end' "$local_lc" 2>/dev/null || echo '[]')"
   fi
-  if [[ -f "$RUNS_DIR/cache-history.jsonl" ]]; then
-    cache_rows=$(jq -s -c 'map(select(.timestamp != null))' "$RUNS_DIR/cache-history.jsonl" 2>/dev/null || echo '[]')
+else
+  # -- legacy directory scans (offline tests; health tag from the report) ---
+  if [[ -n "$HEALTH_DIR" && -d "$HEALTH_DIR" ]]; then
+    if [[ -f "$HEALTH_DIR/health-history.jsonl" ]]; then
+      health_rows=$(jq -s -c 'map(select(.state != null))' "$HEALTH_DIR/health-history.jsonl" 2>/dev/null || echo '[]')
+    fi
+    extra="[]"
+    if shopt -s nullglob 2>/dev/null; then
+      extra=$(for f in "$HEALTH_DIR"/health-report*.json; do
+        jq -c --arg rel "$(jq -r '.release_tag // empty' "$f" 2>/dev/null)" \
+          '{timestamp:(.timestamp // null), release:$rel, state:(.overall_status // "UNKNOWN")}' "$f" 2>/dev/null || true
+      done | jq -s -c 'map(select(.timestamp != null))' 2>/dev/null || echo '[]')
+    fi
+    health_rows=$(jq -nc --argjson a "$health_rows" --argjson b "$extra" '$a + $b' 2>/dev/null || echo "$health_rows")
   fi
-fi
-
-# -- lifecycle packages
-if [[ -n "$LIFECYCLE" && -f "$LIFECYCLE" ]]; then
-  packages=$(jq -c 'if type=="array" then . else [] end' "$LIFECYCLE" 2>/dev/null || echo '[]')
+  if [[ -n "$PUBLISH_DIR" && -d "$PUBLISH_DIR" ]]; then
+    if [[ -f "$PUBLISH_DIR/publish-history.jsonl" ]]; then
+      publish_rows=$(jq -s -c 'map(select(.timestamp != null))' "$PUBLISH_DIR/publish-history.jsonl" 2>/dev/null || echo '[]')
+    fi
+  fi
+  if [[ -n "$RUNS_DIR" && -d "$RUNS_DIR" ]]; then
+    if [[ -f "$RUNS_DIR/build-durations.jsonl" ]]; then
+      build_rows=$(jq -s -c 'map(select(.timestamp != null))' "$RUNS_DIR/build-durations.jsonl" 2>/dev/null || echo '[]')
+    fi
+    if [[ -f "$RUNS_DIR/cache-history.jsonl" ]]; then
+      cache_rows=$(jq -s -c 'map(select(.timestamp != null))' "$RUNS_DIR/cache-history.jsonl" 2>/dev/null || echo '[]')
+    fi
+  fi
+  if [[ -n "$LIFECYCLE" && -f "$LIFECYCLE" ]]; then
+    packages=$(jq -c 'if type=="array" then . else [] end' "$LIFECYCLE" 2>/dev/null || echo '[]')
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -118,13 +206,36 @@ cache_rows=$(jq -c --argjson n "$RETENTION" 'sort_by(.timestamp) | if length > $
 # ---------------------------------------------------------------------------
 # KPIs — every value derived or null (never fabricated)
 # ---------------------------------------------------------------------------
+# only a schema-validated state may drive a health KPI: an unknown state is
+# dropped (never silently reported as HEALTHY)
+health_rows=$(jq -c '[.[] | select(.state == "HEALTHY" or .state == "DEGRADED" or .state == "FAILED")]' <<<"$health_rows")
+
 total_packages=$(jq 'length' <<<"$packages")
 up_to_date=$(jq '[.[] | select(.update_type == "UP_TO_DATE")] | length' <<<"$packages")
 updates_available=$(jq '[.[] | select(.update_type == "UPDATE_AVAILABLE" or .update_type == "SOURCE_CHANGED" or .update_type == "REBUILD_REQUIRED")] | length' <<<"$packages")
 build_failures=$(jq '[.[] | select(.update_type == "BUILD_FAILED" or .update_type == "VALIDATION_FAILED")] | length' <<<"$packages")
 
+# configured inventory comes from the canonical packages.txt count; the
+# published inventory from the verified production health report / release
+# inventory. They are deliberately DIFFERENT numbers: configured may exceed
+# published (the production release carries an operator-chosen subset).
+packages_configured=""
+if [[ -n "$PACKAGES_FILE" && -f "$PACKAGES_FILE" ]]; then
+  packages_configured="$(awk 'NF && $0 !~ /^[[:space:]]*#/' "$PACKAGES_FILE" | wc -l | tr -d ' ')"
+fi
+[[ -n "$packages_configured" ]] || packages_configured="$total_packages"
+packages_published=""
+if [[ -n "$PUBLISHED_COUNT" ]]; then
+  packages_published="$PUBLISHED_COUNT"
+elif [[ -n "$PUBLISHED_PACKAGES" ]]; then
+  packages_published="$PUBLISHED_PACKAGES"
+fi
+[[ "$packages_published" =~ ^[0-9]+$ ]] || packages_published="null"
+
 prod_health=$(jq -c '[.[] | select(.release == "repository")] | if length == 0 then null else (last | .state) end' <<<"$health_rows")
 stage_health=$(jq -c '[.[] | select(.release == "repository-v4-test")] | if length == 0 then null else (last | .state) end' <<<"$health_rows")
+prod_health_at=$(jq -c '[.[] | select(.release == "repository")] | if length == 0 then null else (last | .timestamp) end' <<<"$health_rows")
+stage_health_at=$(jq -c '[.[] | select(.release == "repository-v4-test")] | if length == 0 then null else (last | .timestamp) end' <<<"$health_rows")
 
 # cache hit rate from the newest cache observation
 cache_hit_rate=$(jq -c 'if length == 0 then null else (last | if (.hits + .misses) > 0 then (((.hits / (.hits + .misses)) * 1000 | round) / 10) else null end) end' <<<"$cache_rows")
@@ -147,6 +258,8 @@ kpis=$(jq -nc \
   --argjson build_failures "$build_failures" \
   --argjson production_health "$prod_health" \
   --argjson staging_health "$stage_health" \
+  --argjson production_health_at "$prod_health_at" \
+  --argjson staging_health_at "$stage_health_at" \
   --argjson build_success_rate "$build_success_rate" \
   --argjson cache_hit_rate "$cache_hit_rate" \
   --argjson avg_build_duration "$avg_build_duration" \
@@ -155,18 +268,37 @@ kpis=$(jq -nc \
   --argjson last_successful_publish "$last_publish" \
   --arg snapshot_at "$NOW" \
   --argjson packages_checked "$total_packages" \
+  --argjson packages_configured "$packages_configured" \
+  --argjson packages_published "$packages_published" \
   '{total_packages:$total_packages, up_to_date:$up_to_date, updates_available:$updates_available,
     build_failures:$build_failures, production_health:$production_health, staging_health:$staging_health,
+    production_health_at:$production_health_at, staging_health_at:$staging_health_at,
     build_success_rate:$build_success_rate, cache_hit_rate:$cache_hit_rate,
     avg_build_duration:$avg_build_duration, publication_duration:$publication_duration,
     api_requests:$api_requests, last_successful_publish:$last_successful_publish,
-    snapshot_at:$snapshot_at, packages_checked:$packages_checked}')
+    snapshot_at:$snapshot_at, packages_checked:$packages_checked,
+    packages_configured:$packages_configured, packages_published:$packages_published}')
+
+# ---------------------------------------------------------------------------
+# completeness verdict + source summary
+# ---------------------------------------------------------------------------
+COMPLETENESS="null"
+SOURCE_SUMMARY="null"
+if (( INVENTORY_OK )); then
+  COMPLETENESS="$(jq -r '.completeness // ""' <<<"$INVENTORY_JSON")"
+  [[ "$COMPLETENESS" =~ ^(COMPLETE|PARTIAL|NO_DATA)$ ]] || COMPLETENESS="null"
+  # summarize each known slot; the snapshot carries the raw inventory
+  # (sources/rejected/warnings) so consumers can render the incomplete state
+  SOURCE_SUMMARY="$(jq -c '{completeness, sources, missing, unavailable, rejected, warnings}' <<<"$INVENTORY_JSON")"
+fi
 
 SNAPSHOT=$(jq -nc \
   --arg schema "repo-metrics/v1" \
   --arg generated_at "$NOW" \
   --argjson retention "$RETENTION" \
   --arg build_profile "$BUILD_PROFILE" \
+  --arg completeness "$COMPLETENESS" \
+  --argjson source_summary "$SOURCE_SUMMARY" \
   --argjson kpis "$kpis" \
   --argjson health_history "$health_rows" \
   --argjson publish_history "$publish_rows" \
@@ -174,12 +306,13 @@ SNAPSHOT=$(jq -nc \
   --argjson cache_history "$cache_rows" \
   --argjson packages "$packages" \
   '{schema:$schema, generated_at:$generated_at, retention:$retention, build_profile:$build_profile,
+    completeness:$completeness, source_summary:$source_summary,
     kpis:$kpis, health_history:$health_history, publish_history:$publish_history,
     build_durations:$build_durations, cache_history:$cache_history, packages:$packages}')
 
 if [[ -n "$OUT" ]]; then
   printf '%s\n' "$SNAPSHOT" > "$OUT"
-  echo "[metrics] wrote $OUT (packages=$total_packages health=$(( $(jq 'length' <<<"$health_rows") )) publish=$(( $(jq 'length' <<<"$publish_rows") )))" >&2
+  echo "[metrics] wrote $OUT (packages=$total_packages health=$(( $(jq 'length' <<<"$health_rows") )) publish=$(( $(jq 'length' <<<"$publish_rows") )) completeness=${COMPLETENESS:-null})" >&2
 else
   printf '%s\n' "$SNAPSHOT"
 fi

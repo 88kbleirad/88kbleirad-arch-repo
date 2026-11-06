@@ -304,3 +304,17 @@ if ! bash "$GITHUB_WORKSPACE/.github/scripts/verify-remote-release.sh" \
   exit 1
 fi
 echo "== Staging remote verification passed =="
+
+# -- publish summary sidecar (publication metrics for observability) ----------
+# Pure local artifact; the staging workflow uploads it as
+# publish-summary-repository-v4-test. Only metrics that are actually known
+# are recorded (legacy staging path has no per-asset retry counters).
+if [[ -n "${GITHUB_WORKSPACE:-}" && -d "$GITHUB_WORKSPACE" ]]; then
+  printf '%s\n' "$(jq -nc \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg tag "$TAG" \
+    --arg release "$REPO" \
+    --argjson uploaded "$(( ${#pkg_assets[@]} + ${#db_assets[@]} + ${#meta_assets[@]} + ${#pub_assets[@]} ))" \
+    '{timestamp:$ts, release:$release, release_tag:$tag, uploaded:$uploaded}')" \
+    > "$GITHUB_WORKSPACE/publish-summary.json"
+fi

@@ -1,19 +1,23 @@
 name: Observability Dashboard
 
-# Phase 5.3 — read-only metrics collection + static dashboard build.
-# Collects verified CI artifacts/reports into a bounded metrics snapshot,
-# renders the static dashboard, and uploads it as a workflow artifact.
-# Optional GitHub Pages deployment is NOT enabled here (owner authorization
-# required); the artifact is the primary delivery.
+# Phase 5.3/5.4 — read-only metrics collection + static dashboard build.
+# Collects verified CI artifacts/reports from OTHER workflow runs (health
+# reports, lifecycle report, previous metrics history) via the GitHub
+# Actions REST API, renders the static dashboard, and uploads it as a
+# workflow artifact. Optional GitHub Pages deployment is NOT enabled here
+# (owner authorization required); the artifact is the primary delivery.
 #
 # Read-only: contents:read; never modifies release assets or repository
-# state. Downloads only the artifacts named below.
+# state. Artifact retrieval is performed by collect-artifacts.sh, which
+# only issues HTTP GETs and validates every downloaded report against its
+# schema (malformed data is rejected, never rendered as healthy).
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: observability
@@ -35,31 +39,49 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq
+          sudo apt-get install -y -qq jq unzip gh
 
-      - name: Download metric inputs (health, publish, lifecycle, runs)
-        uses: actions/download-artifact@v8
-        with:
-          path: inputs
-          pattern: |
-            health-report-*
-            update-report
-            publish-summary-*
-            run-metrics-*
-          merge-multiple: true
-        continue-on-error: true
+      # Cross-workflow artifact retrieval. The dashboard's inputs are
+      # produced by OTHER workflows; the GitHub-hosted `download-artifact`
+      # action without an explicit run-id only sees the CURRENT run's
+      # artifacts (which is exactly the "Found 0 artifact(s)" failure) and
+      # its `pattern` is a single glob. The collector instead:
+      #   - enumerates repository artifacts via the REST API (paginated),
+      #   - requires a completed + successful owning workflow run,
+      #   - honours artifact expiry, skips THIS run (recursion guard),
+      #   - downloads each artifact into its own directory (artifact names
+      #     collide: every health report ships `health-report.json`),
+      #   - validates reports against their schema and rejects malformed
+      #     data,
+      #   - retrieves the previous metrics-history artifact so history
+      #     persists across runs (bounded by retention + dedupe).
+      - name: Collect source artifacts (REST API, read-only)
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.github/scripts/collect-artifacts.sh" \
+            --repo "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --out "$GITHUB_WORKSPACE/inputs" \
+            --inventory "$GITHUB_WORKSPACE/source-inventory.json" \
+            --history-out "$GITHUB_WORKSPACE/previous-history.jsonl" \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --prod-release repository \
+            --staging-release repository-v4-test
 
       - name: Build metrics snapshot
         id: metrics
         run: |
           set -euo pipefail
-          # health reports live in individual files; the collector handles
-          # both sidecars and health-report-<tag>.json files.
           bash "$GITHUB_WORKSPACE/.github/scripts/build-metrics.sh" \
+            --inventory "$GITHUB_WORKSPACE/source-inventory.json" \
             --health-dir "$GITHUB_WORKSPACE/inputs" \
             --publish-dir "$GITHUB_WORKSPACE/inputs" \
             --runs-dir "$GITHUB_WORKSPACE/inputs" \
-            --lifecycle "$GITHUB_WORKSPACE/inputs/update-report.json" \
+            --lifecycle "$GITHUB_WORKSPACE/inputs/lifecycle/update-report.json" \
+            --packages-file "$GITHUB_WORKSPACE/packages.txt" \
             --retention "$RETENTION" \
             --out "$GITHUB_WORKSPACE/snapshot.json"
 
@@ -67,11 +89,15 @@ jobs:
         id: history
         run: |
           set -euo pipefail
-          # bounded history is stored as an artifact; start from empty when
-          # absent (retention bounds growth across runs)
+          # bounded history is stored as an artifact; when the previous
+          # history is absent (first run / expired / invalid) the merge
+          # starts from this snapshot (retention bounds growth across runs)
+          args=(--snapshot "$GITHUB_WORKSPACE/snapshot.json")
+          if [[ -s "$GITHUB_WORKSPACE/previous-history.jsonl" ]]; then
+            args+=(--history "$GITHUB_WORKSPACE/previous-history.jsonl")
+          fi
           bash "$GITHUB_WORKSPACE/.github/scripts/merge-metrics-history.sh" \
-            --history "$GITHUB_WORKSPACE/inputs/metrics-history.jsonl" \
-            --snapshot "$GITHUB_WORKSPACE/snapshot.json" \
+            "${args[@]}" \
             --retention "$RETENTION" \
             --out "$GITHUB_WORKSPACE/metrics-history.jsonl"
 
@@ -100,9 +126,38 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # Data-integrity gate: the snapshot must flag the retrieval verdict
+      # and must never present an empty/unknown set as a populated
+      # dashboard. NO_DATA fails the run AFTER the explicitly-labelled
+      # incomplete dashboard has been uploaded.
+      - name: Verify snapshot completeness
+        run: |
+          set -euo pipefail
+          cc=$(jq -r '.completeness // "missing"' "$GITHUB_WORKSPACE/snapshot.json")
+          case "$cc" in
+            COMPLETE)
+              echo "::notice::Observability data COMPLETE (all verified core sources retrieved)."
+              ;;
+            PARTIAL)
+              echo "::warning::Observability data PARTIAL — the following core sources are missing or invalid:"
+              jq -r '.source_summary.missing[]? | "  - \(.)"' "$GITHUB_WORKSPACE/snapshot.json"
+              echo "::notice::Dashboard rendered with an explicit incomplete-data banner."
+              ;;
+            *)
+              echo "::error::Observability data NO_DATA — no verified source reports were available (health production/staging and lifecycle). The dashboard artifact is labelled incomplete; a populated dashboard cannot be claimed."
+              exit 1
+              ;;
+          esac
+
       - name: Summarize
         run: |
           set -euo pipefail
           echo "## Observability snapshot" >> "$GITHUB_STEP_SUMMARY"
-          jq -r '"Packages: \(.kpis.total_packages) · Updates: \(.kpis.updates_available) · Prod health: \(.kpis.production_health // "N/A") · Staging health: \(.kpis.staging_health // "N/A") · Cache hit: \(.kpis.cache_hit_rate // "N/A")%"' \
+          jq -r '"Completeness: \(.completeness) · Configured packages: \(.kpis.packages_configured) · Published packages: \(.kpis.packages_published) · Updates: \(.kpis.updates_available) · Prod health: \(.kpis.production_health // "N/A") · Staging health: \(.kpis.staging_health // "N/A") · Cache hit: \(.kpis.cache_hit_rate // "N/A")%"' \
             "$GITHUB_WORKSPACE/snapshot.json" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$(jq -r '.completeness' "$GITHUB_WORKSPACE/snapshot.json")" != "COMPLETE" ]]; then
+            echo
+            echo "**This is an explicitly labelled incomplete observability state — source data is missing/invalid.**" >> "$GITHUB_STEP_SUMMARY"
+            jq -r '.source_summary.missing[]? | "⚠ core source: \(.)"' \
+              "$GITHUB_WORKSPACE/snapshot.json" >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -154,6 +154,46 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+note "dashboard: completeness banner markup present + verdict conveyed"
+if grep -q 'id="completeness" class="status-banner"' "$WORKDIR/dist1/index.html"; then
+  ok "completeness banner element present"
+else
+  bad "completeness banner element missing"
+fi
+if grep -q 'completenessBanner(DATA.completeness' "$WORKDIR/dist1/app.js"; then
+  ok "app.js renders the verdict banner"
+else
+  bad "app.js missing banner logic"
+fi
+
+# ---------------------------------------------------------------------------
+note "dashboard: NO_DATA snapshot renders an explicit incomplete banner"
+cat > "$WORKDIR/no_data.json" <<'JSON'
+{
+  "schema": "repo-metrics/v1",
+  "generated_at": "2026-11-06T00:00:00Z",
+  "retention": 50,
+  "completeness": "NO_DATA",
+  "source_summary": {"completeness":"NO_DATA","missing":["health_production","health_staging","lifecycle"]},
+  "kpis": {"total_packages": 0, "production_health": null, "staging_health": null},
+  "health_history": [], "publish_history": [], "build_durations": [],
+  "cache_history": [], "packages": []
+}
+JSON
+bash "$BUILD" --metrics "$WORKDIR/no_data.json" --out "$WORKDIR/dist-nodata" > /dev/null 2>&1
+if grep -q '"completeness":"NO_DATA"' "$WORKDIR/dist-nodata/metrics.json"; then
+  ok "NO_DATA snapshot verbatim in output"
+else
+  bad "NO_DATA verdict missing from output"
+fi
+if grep -q 'NO source data available' "$WORKDIR/dist-nodata/app.js" \
+    && grep -q 'status-banner.nodata' "$WORKDIR/dist-nodata/style.css"; then
+  ok "NO_DATA banner styling + text present"
+else
+  bad "NO_DATA banner assets missing"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "summary: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

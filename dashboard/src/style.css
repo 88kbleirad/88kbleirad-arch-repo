@@ -251,6 +251,18 @@ table.inventory td.mono { font-family: var(--mono); font-size: 12px; }
   background: var(--panel);
 }
 
+/* completeness verdict banner */
+.status-banner {
+  margin: 0 16px;
+  padding: 8px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  display: none;
+}
+.status-banner.complete { display: block; color: var(--green); border-color: var(--green); background: var(--base); }
+.status-banner.partial { display: block; color: var(--yellow); border-color: var(--yellow); background: var(--base); }
+.status-banner.nodata  { display: block; color: var(--red); border-color: var(--red); background: var(--base); font-weight: 600; }
+
 /* responsive */
 @media (max-width: 900px) {
   .grid2 { grid-template-columns: 1fr; }

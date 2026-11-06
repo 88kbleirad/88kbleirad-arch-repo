@@ -307,6 +307,7 @@ done
 
 cat <<JSON
 {
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "expected": ${#expected_names[@]},
   "validated": $(( ${#expected_names[@]} - missing )),
   "hits": $hits,
@@ -319,6 +320,27 @@ cat <<JSON
   "mode": "$MODE"
 }
 JSON
+
+# ---- cache-history sidecar (CI performance metrics) --------------------------
+# One line per run for observability: timestamp, run id (when present), and
+# cache counters. Written only when the run has a workspace to write to; this
+# is a pure local artifact, never uploaded by this script.
+if [[ -n "${GITHUB_WORKSPACE:-}" && -d "$GITHUB_WORKSPACE" ]]; then
+  run_id="${GITHUB_RUN_ID:-}"
+  printf '%s\n' "$(jq -nc \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg run "$run_id" \
+    --argjson hits "$hits" \
+    --argjson misses "$misses" \
+    --argjson invalid "$invalid" \
+    --argjson failed "$failed" \
+    --argjson excluded "$excluded" \
+    --argjson missing "$missing" \
+    '{timestamp:$ts, run:$run, hits:$hits, misses:$misses, invalid:$invalid,
+      failed:$failed, excluded:$excluded, missing:$missing,
+      hit_rate:(if ($hits + $misses) > 0 then (($hits * 1000 / ($hits + $misses)) | round / 10) else null end)}')" \
+    > "$GITHUB_WORKSPACE/cache-history.jsonl"
+fi
 
 # ---- human-readable table ---------------------------------------------------
 printf '%-32s %-20s %s\n' "Package" "Cache Status" "Artifact"

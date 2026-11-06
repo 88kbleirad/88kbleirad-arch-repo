@@ -109,6 +109,54 @@ else
   bad "vercmp semantics unavailable/wrong"
 fi
 
+# ---------------------------------------------------------------------------
+note "update detection: missing vercmp dependency fails closed with rc 2"
+# The detector MUST refuse to run when vercmp is unavailable (this is the
+# live runner failure mode on Ubuntu hosts without the `makepkg` package).
+NOBIN="$WORKDIR/nobin"
+mkdir -p "$NOBIN"
+BASH_BIN="$(command -v bash)"
+rc=0
+# PATH contains only an empty directory: vercmp (and every other external
+# tool) is unreachable, which is exactly the missing-dependency case.
+env -i PATH="$NOBIN" HOME="$HOME" GITHUB_WORKSPACE="$WORKDIR" \
+  "$BASH_BIN" "$REPO_ROOT/.github/scripts/check-updates.sh" epoch-pkg \
+  --json "$WORKDIR/nover-report.json" --timeout 2 \
+  > "$WORKDIR/nover.log" 2>&1 || rc=$?
+if [[ "$rc" -eq 2 ]]; then
+  ok "checker exits 2 when vercmp is missing"
+else
+  bad "expected rc 2 without vercmp, got $rc"
+fi
+if [[ ! -s "$WORKDIR/nover-report.json" ]]; then
+  ok "no report is produced without vercmp"
+else
+  bad "report was produced without vercmp"
+fi
+
+note "update detection: full vercmp comparison smoke (epoch/pkgver/pkgrel)"
+# Arch semantics: epoch dominates, then pkgver, then pkgrel — never lexical.
+if [[ "$(vercmp 2:3.0.5-2 1:4.0.0-1)" == "1" ]]; then
+  ok "epoch dominates comparison"
+else
+  bad "epoch comparison failed"
+fi
+if [[ "$(vercmp 1:1.0.0-10 1:1.0.0-2)" == "1" ]]; then
+  ok "pkgrel compares numerically"
+else
+  bad "pkgrel comparison failed"
+fi
+if [[ "$(vercmp 1:1.0rc1-1 1:1.0.0-1)" == "-1" ]]; then
+  ok "prerelease < release (non-lexical)"
+else
+  bad "prerelease comparison failed"
+fi
+if [[ "$(vercmp 1:20240101-1 1:2024.01-1)" == "1" ]]; then
+  ok "numeric forms compare by value"
+else
+  bad "numeric form comparison failed"
+fi
+
 # ===========================================================================
 # Phase 5.1 — lifecycle fields, mock probes, package typing
 # ===========================================================================

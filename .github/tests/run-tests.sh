@@ -128,6 +128,13 @@ else
   bad "workflow-audit suite"
 fi
 
+note "artifact-collection suite (Phase 5.4; cross-run REST retrieval)"
+if bash "$REPO_ROOT/.github/tests/test-artifact-collection.sh"; then
+  ok "artifact-collection suite"
+else
+  bad "artifact-collection suite"
+fi
+
 note "update-proposal suite (Phase 5.2; offline, deterministic)"
 if bash "$REPO_ROOT/.github/tests/test-propose-updates.sh"; then
   ok "update-proposal suite"

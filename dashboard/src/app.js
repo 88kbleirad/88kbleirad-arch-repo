@@ -25,12 +25,14 @@
   function renderKpis() {
     var d = DATA.kpis || {};
     var h = "";
-    h += kpi("Total Packages", d.total_packages, "", d.packages_checked ? "checked" : "");
+    h += kpi("Configured Packages", d.packages_configured, "");
+    h += kpi("Published Packages", d.packages_published, "");
+    h += kpi("Total Packages (checked)", d.total_packages, "");
     h += kpi("Up-to-Date", d.up_to_date, "ok");
     h += kpi("Updates Available", d.updates_available, "warn");
     h += kpi("Build Failures", d.build_failures, d.build_failures > 0 ? "bad" : "ok");
-    h += kpi("Production Health", d.production_health, healthCls(d.production_health));
-    h += kpi("Staging Health", d.staging_health, healthCls(d.staging_health));
+    h += kpi("Production Health", d.production_health, healthCls(d.production_health), d.production_health_at || "");
+    h += kpi("Staging Health", d.staging_health, healthCls(d.staging_health), d.staging_health_at || "");
     h += kpi("Build Success Rate", d.build_success_rate != null ? d.build_success_rate + "%" : null, rateCls(d.build_success_rate));
     h += kpi("Cache Hit Rate", d.cache_hit_rate != null ? d.cache_hit_rate + "%" : null, rateCls(d.cache_hit_rate));
     h += kpi("Avg Build Duration", d.avg_build_duration, "", "s");
@@ -39,6 +41,24 @@
     h += kpi("Last Successful Publish", d.last_successful_publish, "");
     document.getElementById("kpis").innerHTML = h;
     txt("snapshot-at", d.snapshot_at || "N/A");
+    completenessBanner(DATA.completeness, (DATA.source_summary || {}).missing || []);
+  }
+  function completenessBanner(c, missing) {
+    var el = document.getElementById("completeness");
+    if (!el) return;
+    if (c === "COMPLETE") {
+      el.className = "status-banner complete";
+      el.textContent = "Source data COMPLETE — all verified core reports retrieved.";
+      return;
+    }
+    if (c === "PARTIAL") {
+      el.className = "status-banner partial";
+      el.textContent = "Incomplete source data (PARTIAL): missing source(s) — " +
+        (missing.length ? missing.join(", ") : "unknown") + ".";
+      return;
+    }
+    el.className = "status-banner nodata";
+    el.textContent = "NO source data available — this dashboard is incomplete, it is NOT a populated observability view.";
   }
   function healthCls(v) {
     if (v === "HEALTHY") return "ok";

@@ -61,7 +61,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-command -v vercmp >/dev/null 2>&1 || { echo "vercmp required (pacman-contrib)" >&2; exit 2; }
+command -v vercmp >/dev/null 2>&1 \
+  || { echo "vercmp required (pacman-contrib on Arch Linux; makepkg on Ubuntu/Debian)" >&2; exit 2; }
 
 # ---------------------------------------------------------------------------
 # helpers

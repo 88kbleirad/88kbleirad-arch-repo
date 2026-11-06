@@ -209,6 +209,14 @@ jobs:
             --expected "$EXPECTED_PACKAGES" \
             --results-dir output \
             "${excluded_args[@]}"
+
+      - name: Upload CI cache metrics (observability sidecar)
+        uses: actions/upload-artifact@v7
+        with:
+          name: run-metrics-${{ github.run_id }}
+          path: cache-history.jsonl
+          if-no-files-found: warn
+          retention-days: 14
   # Unsigned production publish (default). No GPG, no protected
   # environment; runs with contents:write only.
   publish:
@@ -241,6 +249,15 @@ jobs:
           EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
+
+      - name: Upload publish summary (observability sidecar)
+        if: ${{ !inputs.dry-run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: publish-summary-repository
+          path: publish-summary.json
+          if-no-files-found: warn
+          retention-days: 14
 
   # Signed production publish: enters the protected environment, requires
   # the signing secret, and never silently downgrades on signing failure.
@@ -296,6 +313,15 @@ jobs:
           EXPECTED_PACKAGES: ${{ needs.prepare.outputs.matrix }}
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/publish-in-docker.sh"
+
+      - name: Upload publish summary (observability sidecar)
+        if: ${{ !inputs.dry-run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: publish-summary-repository
+          path: publish-summary.json
+          if-no-files-found: warn
+          retention-days: 14
 
   # Phase 4.1/4.5: post-publication repository health gate. Runs after a
   # real (non-dry) publish. Read-only; fails the overall workflow if the
