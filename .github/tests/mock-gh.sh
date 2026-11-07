@@ -153,6 +153,17 @@ inject_fault() { # name
     printf '{"message":"Too Many Requests"}\n'
     exit 0
   fi
+  if [[ "${FAIL_429_ONCE:-}" == "$name" ]]; then
+    local marker429="$FAKE_RELEASE_DIR/.fail_once_429_$name"
+    if [[ ! -f "$marker429" ]]; then
+      touch "$marker429"
+      printf 'HTTP/2 429\n'
+      printf 'retry-after: 1\n'
+      printf 'content-type: application/json\n\n'
+      printf '{"message":"Too Many Requests"}\n'
+      exit 0
+    fi
+  fi
   if [[ "${PERMANENT_ON:-}" == "$name" ]]; then
     api_error 400 "Bad Request"; exit 0
   fi

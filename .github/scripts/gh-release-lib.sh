@@ -165,6 +165,18 @@ gh_delete_asset() {
     gh_log "delete '${name}': already absent (nothing to do)"
     return 0
   fi
+  # Destructive guard (opt-in via GH_REQUIRE_RECOVERY_SNAPSHOT=1):
+  # replacing (delete + re-upload) an EXISTING asset is only allowed once a
+  # verified pre-mutation recovery snapshot exists. GitHub Releases have no
+  # atomic same-name replace, so a failed upload after this delete would
+  # leave the previous asset missing; the snapshot is the only way back.
+  # Publish entrypoints set this after capturing+validating the snapshot.
+  # Legacy call paths (tests, tools) that do not set it keep the previous
+  # behavior.
+  if [[ "${GH_REQUIRE_RECOVERY_SNAPSHOT:-0}" == "1" && "${RECOVERY_SNAPSHOT_OK:-0}" != "1" ]]; then
+    gh_err "delete '${name}': refusing to remove an existing release asset without a verified pre-mutation recovery snapshot (GH_REQUIRE_RECOVERY_SNAPSHOT=1 but RECOVERY_SNAPSHOT_OK != 1). Capture the release snapshot first."
+    return 1
+  fi
   gh_log "delete '${name}' (id=${id})"
   gh_api_retry "delete asset (${name})" \
     --method DELETE "/repos/${repo}/releases/assets/${id}" >/dev/null 2>&1
@@ -210,10 +222,21 @@ gh_upload_asset() {
 
     # Ambiguous outcome: an upload may have actually landed before the
     # error. Reconcile the remote state before deciding what to do.
+    # Filename presence is NOT sufficient proof of correct content: the
+    # remote asset must carry a trustworthy SHA-256 digest that matches
+    # the local file before we treat the upload as successful.
     if [[ -n "$(gh_asset_id "$tag" "$repo" "$name")" ]]; then
-      if [[ "$(printf '%s' "$GH_LAST_RAW" | wc -c)" -gt 0 && "$code" =~ ^5 ]]; then
-        gh_log "reconcile '${name}': asset now present on the server; treating as uploaded after all"
-        return 0
+      if { [[ "$code" =~ ^5 ]] || [[ -z "$code" ]]; }; then
+        local remote_digest local_digest
+        remote_digest="$(gh_asset_digest "$tag" "$repo" "$name")" || remote_digest=""
+        local_digest="$(sha256_hex "$file")"
+        if [[ -n "$remote_digest" && -n "$local_digest" && "$remote_digest" == "$local_digest" ]]; then
+          gh_log "reconcile '${name}': remote asset digest matches local content; treating as uploaded after all"
+          return 0
+        fi
+        # No trustworthy digest (or mismatch): do NOT treat as success.
+        # Fall through to retry / permanent-failure handling below.
+        gh_log "reconcile '${name}': remote asset present but digest unavailable/mismatch (remote=${remote_digest:-<none>} local=${local_digest:-<none>}); refusing to claim success"
       fi
     fi
 
