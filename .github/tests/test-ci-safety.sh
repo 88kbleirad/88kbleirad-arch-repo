@@ -121,6 +121,92 @@ else
   bad "REPO_ROOT not set in regression job"
 fi
 
+# ---------------------------------------------------------------------------
+# Phase 8.1.1 regression-fix invariants (live PR #9 failures)
+# ---------------------------------------------------------------------------
+
+note "fixA: regression job installs vercmp provider and verifies semantics"
+if grep -q "makepkg" "$WF" && grep -q "vercmp" "$WF"; then
+  ok "vercmp provider (makepkg) installed + verified"
+else
+  bad "vercmp provider not wired in ci-validation.yml"
+fi
+if grep -q 'vercmp 1.10.0 1.9.0' "$WF"; then
+  ok "vercmp semantic probes present"
+else
+  bad "vercmp semantic probes missing"
+fi
+
+note "fixB: propose-updates fixture is self-contained (no origin/main dependency)"
+if grep -q "prepare_fake_remote" "$REPO_ROOT/.github/tests/test-propose-updates.sh" \
+   && grep -q "refs/remotes/origin/main" "$REPO_ROOT/.github/tests/test-propose-updates.sh"; then
+  ok "fake remote materializes origin/main in detached/shallow checkouts"
+else
+  bad "propose-updates fake remote not hardened"
+fi
+
+note "fixC: container test uses container-aware workspace removal"
+if grep -q "ws_rm" "$REPO_ROOT/.github/tests/run-container-tests.sh"; then
+  ok "ws_rm helper present for root-owned workspace cleanup"
+else
+  bad "ws_rm helper missing"
+fi
+
+note "fixD: regression step preserves true exit status to job env"
+if grep -q 'PIPESTATUS\[0\]' "$WF" && grep -q "regression_exit" "$WF"; then
+  ok "PIPESTATUS captured before pipefail exit"
+else
+  bad "regression status capture not found"
+fi
+if grep -q 'INCOMPLETE' "$WF"; then
+  ok "summary never defaults missing status to PASS"
+else
+  bad "summary may default unknown status to PASS"
+fi
+
+note "fixE: whitespace step fetches base SHA and fails when unavailable"
+if grep -q 'git fetch --no-tags --depth=1 origin "$base_sha"' "$WF"; then
+  ok "whitespace step fetches PR base SHA"
+else
+  bad "whitespace base fetch missing"
+fi
+if grep -q 'could not fetch PR base' "$WF"; then
+  ok "unfetchable base fails the step"
+else
+  bad "missing-base case not handled"
+fi
+
+# -- local simulation of the status-propagation fix --------------------------
+note "fixD negative: failed pipeline still writes env + exits nonzero"
+SIM="$WORKDIR/sim-regression"
+mkdir -p "$SIM"
+cat > "$SIM/run.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+out="__SIM__/out.log"
+envf="__SIM__/env"
+set +e
+bash -c 'echo partial; exit 7' 2>&1 | tee "$out"
+status=${PIPESTATUS[0]}
+set -e
+echo "regression_exit=$status" > "$envf"
+exit "$status"
+EOF
+sed -i "s|__SIM__|$SIM|g" "$SIM/run.sh"
+chmod +x "$SIM/run.sh"
+rc=0
+bash "$SIM/run.sh" || rc=$?
+if [[ "$rc" -eq 7 ]] && grep -q "regression_exit=7" "$SIM/env"; then
+  ok "failed pipeline: status 7 recorded and propagated"
+else
+  bad "failed pipeline propagation broken (rc=$rc, env=$(cat "$SIM/env" 2>/dev/null))"
+fi
+if grep -q "partial" "$SIM/out.log"; then
+  ok "log preserved despite failure"
+else
+  bad "log lost on failure"
+fi
+
 echo
 echo "ci-safety: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -110,16 +110,24 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
-            # PR context: diff against the merge-base commit provided by the
-            # event (no extra fetch required with fetch-depth 1).
+            # PR context: compare against the PR base commit. The shallow
+            # checkout (fetch-depth 1) does not contain the base object, so
+            # fetch it explicitly before diffing. If the base cannot be
+            # fetched, FAIL (never silently skip the check).
             base_sha="${{ github.event.pull_request.base.sha }}"
-            if git diff --check "$base_sha...HEAD" | grep -v '^$'; then
+            if ! git cat-file -e "$base_sha^{commit}" 2>/dev/null; then
+              GIT_TERMINAL_PROMPT=0 git fetch --no-tags --depth=1 origin "$base_sha" || {
+                echo "::error::could not fetch PR base $base_sha for whitespace check"
+                exit 1
+              }
+            fi
+            if ! git diff --check "$base_sha...HEAD"; then
               echo "::error::git diff --check reported whitespace errors"
               exit 1
             fi
           else
             # Manual dispatch: no base to compare; only check the working tree.
-            if git diff --check | grep -v '^$'; then
+            if ! git diff --check; then
               echo "::error::git diff --check reported whitespace errors"
               exit 1
             fi
@@ -157,19 +165,41 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-yaml jq zstd libarchive-tools
+          # makepkg (Ubuntu/Debian) provides vercmp; pacman-contrib is
+          # Arch-only. Explicit install so update-detection tests run.
+          sudo apt-get install -y -qq python3-yaml jq zstd libarchive-tools makepkg
           docker --version
           echo "host deps installed"
+
+      - name: Verify vercmp availability + semantics
+        run: |
+          set -euo pipefail
+          command -v vercmp || { echo "::error::vercmp not found (makepkg failed to install?)"; exit 1; }
+          # Semantic checks (pacman vercmp exits: 1 if >, -1 if <, 0 if =)
+          test "$(vercmp 1.10.0 1.9.0)" = "1"
+          test "$(vercmp 1.9.0 1.10.0)" = "-1"
+          test "$(vercmp 1.10.0 1.10.0)" = "0"
+          # epoch+Averse smoke
+          test "$(vercmp 2:1.0 1:9.9)" = "1"
+          echo "vercmp semantics OK"
 
       - name: Run full regression suite
         env:
           REPO_ROOT: ${{ github.workspace }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Capture the true runner exit code; `set -e` is disabled around
+          # the pipeline so PIPESTATUS is recorded even on failure.
+          set +e
           bash "$REPO_ROOT/.github/tests/run-tests.sh" 2>&1 | tee /tmp/regression.log
-          # tee changes pipe exit status; preserve the runner's verdict
           status=${PIPESTATUS[0]}
+          set -e
           echo "regression_exit=$status" >> "$GITHUB_ENV"
+          # Parse final PASS/FAIL counts from the runner log (best effort).
+          pass=$(grep -oE 'overall: PASS=[0-9]+' /tmp/regression.log | tail -1 | grep -oE '[0-9]+' || echo "")
+          fail=$(grep -oE 'FAIL=[0-9]+' /tmp/regression.log | tail -1 | grep -oE '[0-9]+' || echo "")
+          echo "regression_pass=$pass" >> "$GITHUB_ENV"
+          echo "regression_fail=$fail" >> "$GITHUB_ENV"
           exit "$status"
 
       - name: Upload regression log
@@ -187,7 +217,14 @@ jobs:
           {
             echo "## CI — Regression Tests"
             echo ""
-            echo "- Exit code: ${{ env.regression_exit == '0' && '0 (PASS)' || env.regression_exit || 'not run' }}"
+            if [[ "${REGRESSION_EXIT:-}" == "0" ]]; then
+              echo "- Status: **PASS**"
+            elif [[ -n "${REGRESSION_EXIT:-}" ]]; then
+              echo "- Status: **FAIL** (exit ${REGRESSION_EXIT})"
+            else
+              echo "- Status: **INCOMPLETE** (no exit status recorded)"
+            fi
+            echo "- overall pass/fail: ${{ env.regression_pass || 'UNKNOWN' }} / ${{ env.regression_fail || 'UNKNOWN' }}"
             echo "- Full log: artifact \`ci-regression-log\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
