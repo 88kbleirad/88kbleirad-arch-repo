@@ -37,6 +37,14 @@ Verified production release inventory (2026-11-07): 23 package archives +
 23 detached signatures + signed database; no duplicates.
 See `docs/final-validation.md` → Phase 6 for the full evidence trail.
 
+## Batch 3 audit status (2026-11-07)
+
+| Package | Status | Evidence |
+|---|---|---|
+| `hw-probe` | READY_FOR_STAGING (arch=any) | AUR 1.6.6-3 maintained; all deps official; source sha256 verified; default probe offline; LGPL-2.1-or-later OR BSD-4-Clause |
+| `neofetch` | LEGACY_HOLD | upstream archived; pinned 2020 commit + PGP key; active AUR maintainer; arch=any shell script; `extra/fastfetch` available but not substituted |
+| `proton-authenticator` | NEEDS_MANUAL_REVIEW | AUR source tag `proton-authenticator@1.1.6` 404 on GitHub; unbuildable until upstream/AUR fixed |
+
 The historical snapshot in `docs/inventory/omp-package-inventory.csv` and
 the audit workbook are preserved unchanged (installed-version snapshots and
 review categories are historical records); this page is the current-status
