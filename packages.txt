@@ -69,3 +69,6 @@ vpcs
 # Onboarding batch 2 (VCS variants; staging first)
 fzf-git
 swaync-git
+
+# Onboarding batch 3 (hw-probe; staging first)
+hw-probe

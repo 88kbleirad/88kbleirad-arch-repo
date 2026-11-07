@@ -52,16 +52,25 @@ exactly one status.
 
 ## Identified build blockers (evidence)
 
-1. swaync-git PKGBUILD calls `arch-meson` — not in official, AUR, or
-   CachyOS. Dependency gate passes (makedepends are official) but build()
-   will fail with `arch-meson: command not found` unless patched.
+1. swaync-git PKGBUILD calls `arch-meson` — resolved: it ships in
+   `extra/meson` (`/usr/bin/arch-meson`), all official. Batch 2 built
+   and published (fzf-git, swaync-git in production since 2026-11-07).
 2. fzf-git conflicts/provides `fzf` — official Arch has `extra/fzf`
-   (0.74.5). On a machine with official fzf installed, `pacman -S
-   fzf-git` would replace it (conflict resolution). This is a deliberate
-   choice (VCS variant) and is fine for this repo's matrix, but the
-   README should note the conflict.
+   (0.74.5). Installing `fzf-git` replaces official `fzf` via conflict
+   resolution; documented, intended VCS-variant behavior.
 3. fzf-git epoch=2: handled by the generalized epoch filename machinery.
 4. swaync-git depends on gtk4-layer-shell>=1.0.4 (official 1.3.0), and
    provides notification-daemon — may conflict with other
    notification-daemon providers on the target machine; no repo-internal
    conflict.
+5. proton-authenticator (Batch 3 candidate): AUR source tag
+   `proton-authenticator@1.1.6` returns 404 on GitHub (no such tag in
+   ProtonMail/WebClients). Currently unbuildable → NEEDS_MANUAL_REVIEW
+   until upstream tags/releases the archive again or the AUR package is
+   updated.
+6. neofetch: upstream repo archived (since 2024); pinned commit from 2020
+   + valid PGP key; active AUR maintainer (Muflone) keeps pkgrel patched.
+   Classified LEGACY_HOLD (shell script, arch=any, no v4 value; functional
+   alternative `extra/fastfetch` exists but is not a silent substitute).
+7. hw-probe: all official deps; no AUR-only chain; source verified; default
+   probe is offline (upload only with explicit `-upload`); arch=any.
