@@ -259,6 +259,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Recovery manifest: persist the pre-mutation release snapshot as a
+      # restricted workflow artifact even if a later mutation step fails.
+      # Never uploaded to the release itself; contains no secrets.
+      - name: Upload recovery manifest (pre-mutation release snapshot)
+        if: ${{ !inputs.dry-run && always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: publish-recovery-manifest-repository
+          path: publish-manifest-repository.json
+          if-no-files-found: warn
+          retention-days: 30
+
   # Signed production publish: enters the protected environment, requires
   # the signing secret, and never silently downgrades on signing failure.
   publish-signed:
@@ -322,6 +334,18 @@ jobs:
           path: publish-summary.json
           if-no-files-found: warn
           retention-days: 14
+
+      # Recovery manifest: persist the pre-mutation release snapshot as a
+      # restricted workflow artifact even if a later mutation step fails.
+      # Never uploaded to the release itself; contains no secrets.
+      - name: Upload recovery manifest (pre-mutation release snapshot)
+        if: ${{ !inputs.dry-run && always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: publish-recovery-manifest-repository
+          path: publish-manifest-repository.json
+          if-no-files-found: warn
+          retention-days: 30
 
   # Phase 4.1/4.5: post-publication repository health gate. Runs after a
   # real (non-dry) publish. Read-only; fails the overall workflow if the

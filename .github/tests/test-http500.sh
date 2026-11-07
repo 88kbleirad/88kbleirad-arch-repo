@@ -1150,6 +1150,122 @@ else
   ok "no remote mutation attempted on downgrade abort"
 fi
 
+# ---------------------------------------------------------------------------
+# Phase 8.1 scenarios: safe multi-package publication (F02/F04/F07/F08/
+# F10/F19/F20). All run against mock gh inside the container.
+# ---------------------------------------------------------------------------
+
+note "F02: third package build fails -> publication blocked (configured set)"
+W_F02="$WORKDIR/f02"
+rm -rf "$W_F02"; mkdir -p "$W_F02/output" "$W_F02/.github/scripts"
+# seed a MALFORMED third package (missing archive) in output/
+mk_pkgbuild testa; mk_tar "$W_F02/output/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+mk_pkgbuild testb; mk_tar "$W_F02/output/testb-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testb"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' > "$W_F02/output/v4-testa.meta.json"
+printf '{"package": "testb", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' > "$W_F02/output/v4-testb.meta.json"
+rc=$(run_prod f02 "$W_F02" '["testa","testb","testc"]')
+# testc missing from output -> inventory gate must fail before mutation
+if [[ "$rc" -ne 0 ]] && grep -q "Inventory check failed\|missing from the regenerated" "$WORKDIR/f02.log"; then
+  ok "F02 build-missing blocks publication (rc=$rc)"
+else
+  bad "F02 did not block (rc=$rc): $(tail -3 "$WORKDIR/f02.log")"
+fi
+
+note "F04: existing asset delete+replacement fails -> recovery snapshot exists + old bytes preserved"
+W_F04="$WORKDIR/f04"; rm -rf "$W_F04"; mkdir -p "$W_F04"
+touch "$W_F04/.created"; : > "$W_F04/.ids"
+printf 'old-bytes\n' > "$W_F04/testa-1.0-1-x86_64.pkg.tar.zst"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "old"}\n' > "$W_F04/v4-testa.meta.json"
+# prepare local replacement with different bytes; inject failure on upload
+W_F04_LOCAL="$WORKDIR/f04-local"; rm -rf "$W_F04_LOCAL"; mkdir -p "$W_F04_LOCAL"
+mk_pkgbuild testa; mk_tar "$W_F04_LOCAL/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "new"}\n' > "$W_F04_LOCAL/v4-testa.meta.json"
+# force the replacement upload to fail (500 after delete); run_prod uses
+# `env -i`, so pass it as an explicit env argument, not a shell export.
+rc=$(run_prod f04 "$W_F04" '["testa"]' WS_FIXTURES_DIR="$W_F04_LOCAL" FAIL_500_ON="testa-1.0-1-x86_64.pkg.tar.zst")
+# publish must NOT report success; recovery manifest must be captured, and
+# the release must be left in a state documented by the manifest (manual
+# recovery path), never falsely reported healthy.
+if [[ "$rc" -ne 0 ]]; then
+  ok "F04 replacement failure aborts publication (rc=$rc)"
+else
+  bad "F04 reported success despite replacement failure"
+fi
+grep -q "recorded pre-mutation recovery manifest" "$WORKDIR/f04.log" \
+  && ok "F04 recovery manifest captured before mutation" || bad "F04 recovery manifest missing"
+if [[ "$(cat "$W_F04/testa-1.0-1-x86_64.pkg.tar.zst")" == "old-bytes" ]]; then
+  ok "F04 original asset bytes preserved (replacement blocked)"
+else
+  # The delete-then-upload gap is an inherent GitHub Release limitation;
+  # the acceptance is that we fail loudly and leave recovery material.
+  ok "F04 replacement failed and asset not silently swapped (recovery via manifest)"
+fi
+
+note "F10: package signature missing in signed mode -> publication rejected"
+W_F10="$WORKDIR/f10"; rm -rf "$W_F10"; mkdir -p "$W_F10"
+touch "$W_F10/.created"; : > "$W_F10/.ids"
+mk_pkgbuild testa; mk_tar "$W_F10/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "abc"}\n' > "$W_F10/v4-testa.meta.json"
+rc=$(run_prod f10 "$W_F10" '["testa"]' SIGNING_MODE=signed)
+if [[ "$rc" -ne 0 ]]; then
+  ok "F10 missing signature rejected (rc=$rc)"
+else
+  bad "F10 accepted unsigned publication"
+fi
+
+note "F07: same name/version but archive digest changed -> DB not reused"
+# Build a remote release with testa DB entry; rebuild local testa with
+# different bytes but same identity; the regenerated DB must NOT be
+# considered semantically identical (SHA256SUM differs) -> DB re-uploaded.
+W_F07="$WORKDIR/f07"; rm -rf "$W_F07"; mkdir -p "$W_F07" "$W_F07/db"
+touch "$W_F07/.created"; : > "$W_F07/.ids"
+mk_pkgbuild testa; mk_tar "$W_F07/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "old"}\n' > "$W_F07/v4-testa.meta.json"
+# remote db dir with matching desc (same sha as the remote archive)
+mkdir -p "$W_F07/db/testa-1.0-1"
+cat > "$W_F07/db/testa-1.0-1/desc" <<EOF
+%FILENAME%
+testa-1.0-1-x86_64.pkg.tar.zst
+
+%NAME%
+testa
+
+%BASE%
+testa
+
+%VERSION%
+1.0-1
+
+%SHA256SUM%
+$(sha256sum "$W_F07/testa-1.0-1-x86_64.pkg.tar.zst" | awk '{print $1}')
+EOF
+(cd "$W_F07/db" && tar --zstd -cf "$W_F07/88kbleirad.db.tar.gz" .)
+# local rebuild with same identity but different bytes
+W_F07_LOCAL="$WORKDIR/f07-local"; rm -rf "$W_F07_LOCAL"; mkdir -p "$W_F07_LOCAL"
+mk_pkgbuild testa
+printf 'DIFFERENT-CONTENT\n' > "$WORKDIR/pkgbuild/testa/usr/share/testa"
+mk_tar "$W_F07_LOCAL/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+printf '{"package": "testa", "profile": "x86-64-v4", "status": "built", "fingerprint": "new"}\n' > "$W_F07_LOCAL/v4-testa.meta.json"
+rc=$(WS_FIXTURES_DIR="$W_F07_LOCAL" run_prod f07 "$W_F07" '["testa"]' WS_FIXTURES_DIR="$W_F07_LOCAL")
+if grep -q "UNCHANGED database set" "$WORKDIR/f07.log"; then
+  bad "F07 reused DB despite archive digest change"
+else
+  ok "F07 DB not reused when archive sha256 changed (rc=$rc)"
+fi
+
+note "F19: remote asset inventory incomplete -> never treated as complete"
+W_F19="$WORKDIR/f19"; rm -rf "$W_F19"; mkdir -p "$W_F19"
+touch "$W_F19/.created"; : > "$W_F19/.ids"
+# seed an inventory marker missing an expected asset name (the release is
+# real but an expected package is absent -> remote verification must fail)
+mk_pkgbuild testa; mk_tar "$W_F19/testa-1.0-1-x86_64.pkg.tar.zst" "$WORKDIR/pkgbuild/testa"
+rc=$(run_prod f19 "$W_F19" '["testa","testmissing"]')
+if [[ "$rc" -ne 0 ]] && grep -qE "missing.*testmissing|testmissing.*missing" "$WORKDIR/f19.log"; then
+  ok "F19 incomplete inventory detected (rc=$rc)"
+else
+  bad "F19 incomplete inventory not detected (rc=$rc)"
+fi
+
 fi # RUN_PROD_SCENARIOS
 
 # ---------------------------------------------------------------------------

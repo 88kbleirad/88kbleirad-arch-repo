@@ -93,6 +93,13 @@ else
   bad "content-aware publishing suite"
 fi
 
+note "release-safety fault-injection suite (Phase 8.1)"
+if bash "$REPO_ROOT/.github/tests/test-release-safety.sh"; then
+  ok "release-safety fault-injection suite"
+else
+  bad "release-safety fault-injection suite"
+fi
+
 note "build-cache verification suite"
 if bash "$REPO_ROOT/.github/tests/test-build-cache.sh"; then
   ok "build-cache verification suite"

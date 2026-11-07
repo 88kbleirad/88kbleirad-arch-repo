@@ -32,6 +32,7 @@ pacman -Syu --noconfirm --needed \
 # signatures are created and verified below; any failure aborts the run
 # before anything is uploaded.
 . "$GITHUB_WORKSPACE/.github/scripts/sign-helpers.sh"
+. "$GITHUB_WORKSPACE/.github/scripts/gh-release-lib.sh"
 gpg_init_homedir
 if ! gpg_import_signing_key; then
   echo "::error::No signing key available; aborting publication."
@@ -282,6 +283,7 @@ if ! export_public_key; then
 fi
 pub_assets=( "${REPO_DB_NAME}.pub.asc" )
 
+# Ensure the staging release exists before capturing its snapshot.
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "Staging release $TAG exists; merging this run into it."
 else
@@ -290,8 +292,90 @@ else
     --title "Staging repository (v4 test)" \
     --notes "Staging buildup: $(date -u '+%Y-%m-%d %H:%M UTC') — x86-64-v4"
 fi
-gh release upload "$TAG" "${pkg_assets[@]}" "${db_assets[@]}" "${meta_assets[@]}" "${pub_assets[@]}" \
-  --repo "$REPO" --clobber
+
+# -- recovery: capture the pre-mutation remote asset manifest FIRST -------
+# Mandatory before the first remote mutation (same invariant as production).
+# The staging workflow persists it as a restricted artifact so it survives
+# a failed job.
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+  MANIFEST_FILE="$PWD/publish-manifest-${TAG}.json"
+  MANIFEST_OK=0
+  {
+    echo "{"
+    echo "  \"schema\": \"publish-recovery-manifest/v1\","
+    echo "  \"repository\": $(printf '%s' "$REPO" | jq -R .),"
+    echo "  \"release_tag\": $(printf '%s' "$TAG" | jq -R .),"
+    echo "  \"workflow_run\": $(printf '%s' "${GITHUB_RUN_ID:-unknown}" | jq -R .),"
+    echo "  \"source_commit\": $(printf '%s' "${GITHUB_SHA:-unknown}" | jq -R .),"
+    echo "  \"signing_mode\": \"signed\","
+    echo "  \"recorded_at\": $(date -u +%Y-%m-%dT%H:%M:%SZ | jq -R .),"
+    echo "  \"assets\": ["
+    first=1
+    asset_count=0
+    while IFS='|' read -r name id digest; do
+      [[ -n "$name" ]] || continue
+      [[ $first -eq 0 ]] && echo ","
+      kind="other"
+      case "$name" in
+        *.pkg.tar.zst) kind="package" ;;
+        *.pkg.tar.zst.sig) kind="package-signature" ;;
+        v4-*.meta.json) kind="metadata" ;;
+        "${REPO_DB_NAME}".db|"${REPO_DB_NAME}".db.tar.gz|"${REPO_DB_NAME}".files|"${REPO_DB_NAME}".files.tar.gz) kind="database" ;;
+        "${REPO_DB_NAME}".db.sig|"${REPO_DB_NAME}".db.tar.gz.sig|"${REPO_DB_NAME}".files.sig|"${REPO_DB_NAME}".files.tar.gz.sig) kind="database-signature" ;;
+        "${REPO_DB_NAME}".pub.asc) kind="public-key" ;;
+      esac
+      printf '    {"name": %s, "id": %s, "digest": %s, "kind": %s}' \
+        "$(printf '%s' "$name" | jq -R .)" "$(printf '%s' "$id" | jq -R .)" \
+        "$(printf '%s' "$digest" | jq -R .)" "$(printf '%s' "$kind" | jq -R .)"
+      first=0
+      asset_count=$(( asset_count + 1 ))
+    done < <(gh_api_retry "list assets (${TAG})" \
+        "/repos/${REPO}/releases/tags/${TAG}" \
+        --jq '.assets[] | "\(.name)|\(.id)|\(.digest // "")"' 2>/dev/null)
+    echo
+    echo "  ],"
+    echo "  \"asset_count\": $asset_count"
+    echo "}"
+  } > "$MANIFEST_FILE"
+
+  if MANIFEST_JSON="$(jq -e . "$MANIFEST_FILE" 2>/dev/null)" \
+      && jq -e '.schema == "publish-recovery-manifest/v1"' >/dev/null <<<"$MANIFEST_JSON"; then
+    if (( asset_count == 0 )); then
+      if gh_api_retry "view release (${TAG})" \
+          "/repos/${REPO}/releases/tags/${TAG}" \
+          --jq '.assets | length' 2>/dev/null | grep -qx "0"; then
+        MANIFEST_OK=1
+      else
+        gh_err "staging recovery snapshot: asset inventory query produced 0 assets but the release reports assets; snapshot incomplete."
+      fi
+    else
+      MANIFEST_OK=1
+    fi
+  else
+    gh_err "staging recovery snapshot is not valid JSON or has an unsupported schema."
+  fi
+
+  if [[ "$MANIFEST_OK" != "1" ]]; then
+    echo "::error::Staging pre-mutation recovery snapshot could not be captured/validated. Failing before any remote mutation."
+    exit 1
+  fi
+  echo "[publish] recorded pre-mutation recovery manifest: $MANIFEST_FILE (assets=$asset_count, schema=v1)"
+  export RECOVERY_SNAPSHOT_OK=1
+  export GH_REQUIRE_RECOVERY_SNAPSHOT=1
+fi
+
+# Publish through the SAME content-aware, digest-verifying, recovery-gated
+# helpers as production (packages → metadata → public key → database).
+# A single failure aborts before further mutations; remote state is
+# reconciled by content digest, not filename.
+declare -A PUBLISH_COUNTERS=( [unchanged]=0 [uploaded]=0 [replaced]=0 [failed]=0 )
+
+publish_assets_loop "$TAG" "$REPO" "$PWD" "package" "${pkg_assets[@]}" || exit 1
+publish_assets_loop "$TAG" "$REPO" "$PWD" "metadata" "${meta_assets[@]}" || exit 1
+publish_assets_loop "$TAG" "$REPO" "$PWD" "public-key" "${pub_assets[@]}" || exit 1
+publish_assets_loop "$TAG" "$REPO" "$PWD" "database" "${db_assets[@]}" || exit 1
+
+echo "[publish] SUMMARY unchanged=${PUBLISH_COUNTERS[unchanged]} uploaded=${PUBLISH_COUNTERS[uploaded]} replaced=${PUBLISH_COUNTERS[replaced]} failed=${PUBLISH_COUNTERS[failed]}"
 echo "Published staging release: $REPO/releases/tag/$TAG"
 
 # -- mandatory remote post-publish verification ----------------------------

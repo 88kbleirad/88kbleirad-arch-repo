@@ -473,14 +473,14 @@ if [[ -f "$MERGE_DIR/${REPO_DB_NAME}.db.tar.gz" ]]; then
     local_db_keys=""
     for desc in "$MERGE_DIR/db-new"/*/desc; do
       [[ -f "$desc" ]] || continue
-      local_db_keys+="$(awk '/^%FILENAME%/{getline; print; next} /^%NAME%/{getline; print; next} /^%BASE%/{getline; print; next} /^%VERSION%/{getline; print; next}' "$desc" | tr '\n' '|')"
+      local_db_keys+="$(awk '/^%FILENAME%/{getline; print; next} /^%NAME%/{getline; print; next} /^%BASE%/{getline; print; next} /^%VERSION%/{getline; print; next} /^%SHA256SUM%/{getline; print; next}' "$desc" | tr '\n' '|')"
       local_db_keys+=$'\n'
     done
     local_db_keys="$(printf '%s' "$local_db_keys" | sort)"
     remote_db_keys=""
     for desc in "$MERGE_DIR/db"/*/desc; do
       [[ -f "$desc" ]] || continue
-      remote_db_keys+="$(awk '/^%FILENAME%/{getline; print; next} /^%NAME%/{getline; print; next} /^%BASE%/{getline; print; next} /^%VERSION%/{getline; print; next}' "$desc" | tr '\n' '|')"
+      remote_db_keys+="$(awk '/^%FILENAME%/{getline; print; next} /^%NAME%/{getline; print; next} /^%BASE%/{getline; print; next} /^%VERSION%/{getline; print; next} /^%SHA256SUM%/{getline; print; next}' "$desc" | tr '\n' '|')"
       remote_db_keys+=$'\n'
     done
     remote_db_keys="$(printf '%s' "$remote_db_keys" | sort)"
@@ -611,6 +611,89 @@ fi
 # BEFORE any mutation. The per-asset gate in gh_publish_asset remains as a
 # second line of defense.
 
+# -- recovery: capture the pre-mutation remote asset manifest FIRST -------
+# Mandatory before the first remote mutation. Never valid after assets
+# have started changing. Local artifact (never uploaded as a release
+# asset): captures exactly what the release looked like before this run's
+# mutations; used to reconcile interrupted publishes and to plan recovery.
+# The workflow additionally persists it as a restricted artifact (see
+# build-release.yml / build-staging.yml) so it survives job failure.
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+  MANIFEST_FILE="$PWD/publish-manifest-${TAG}.json"
+  MANIFEST_OK=0
+  {
+    echo "{"
+    echo "  \"schema\": \"publish-recovery-manifest/v1\","
+    echo "  \"repository\": $(printf '%s' "$REPO" | jq -R .),"
+    echo "  \"release_tag\": $(printf '%s' "$TAG" | jq -R .),"
+    echo "  \"workflow_run\": $(printf '%s' "${GITHUB_RUN_ID:-unknown}" | jq -R .),"
+    echo "  \"source_commit\": $(printf '%s' "${GITHUB_SHA:-unknown}" | jq -R .),"
+    echo "  \"signing_mode\": $(printf '%s' "${SIGNING_MODE:-unknown}" | jq -R .),"
+    echo "  \"recorded_at\": $(date -u +%Y-%m-%dT%H:%M:%SZ | jq -R .),"
+    echo "  \"assets\": ["
+    first=1
+    asset_count=0
+    while IFS='|' read -r name id digest; do
+      [[ -n "$name" ]] || continue
+      [[ $first -eq 0 ]] && echo ","
+      kind="other"
+      case "$name" in
+        *.pkg.tar.zst) kind="package" ;;
+        *.pkg.tar.zst.sig) kind="package-signature" ;;
+        v4-*.meta.json) kind="metadata" ;;
+        "${REPO_DB_NAME}".db|"${REPO_DB_NAME}".db.tar.gz|"${REPO_DB_NAME}".files|"${REPO_DB_NAME}".files.tar.gz) kind="database" ;;
+        "${REPO_DB_NAME}".db.sig|"${REPO_DB_NAME}".db.tar.gz.sig|"${REPO_DB_NAME}".files.sig|"${REPO_DB_NAME}".files.tar.gz.sig) kind="database-signature" ;;
+        "${REPO_DB_NAME}".pub.asc) kind="public-key" ;;
+      esac
+      printf '    {"name": %s, "id": %s, "digest": %s, "kind": %s}' \
+        "$(printf '%s' "$name" | jq -R .)" "$(printf '%s' "$id" | jq -R .)" \
+        "$(printf '%s' "$digest" | jq -R .)" "$(printf '%s' "$kind" | jq -R .)"
+      first=0
+      asset_count=$(( asset_count + 1 ))
+    done < <(gh_api_retry "list assets (${TAG})" \
+        "/repos/${REPO}/releases/tags/${TAG}" \
+        --jq '.assets[] | "\(.name)|\(.id)|\(.digest // "")"' 2>/dev/null)
+    echo
+    echo "  ],"
+    echo "  \"asset_count\": $asset_count"
+    echo "}"
+  } > "$MANIFEST_FILE"
+
+  # Validate the snapshot before arming destructive operations:
+  # 1) valid JSON; 2) the asset inventory was read completely (the listing
+  #    must have succeeded); 3) digest presence is recorded but not
+  #    required at this stage (download-and-hash fallback exists). If the
+  #    inventory query returned nothing and the release previously had
+  #    assets, the snapshot is suspect - list failure is detected via the
+  #    empty asset_count + non-empty remote release probe below.
+  if MANIFEST_JSON="$(jq -e . "$MANIFEST_FILE" 2>/dev/null)" \
+      && jq -e '.schema == "publish-recovery-manifest/v1"' >/dev/null <<<"$MANIFEST_JSON"; then
+    if (( asset_count == 0 )); then
+      # zero assets is legal only when the release truly has none
+      if gh_api_retry "view release (${TAG})" \
+          "/repos/${REPO}/releases/tags/${TAG}" \
+          --jq '.assets | length' 2>/dev/null | grep -qx "0"; then
+        MANIFEST_OK=1
+      else
+        gh_err "recovery snapshot '${name}': asset inventory query produced 0 assets but the release reports assets; snapshot incomplete. Refusing to mutate."
+      fi
+    else
+      MANIFEST_OK=1
+    fi
+  else
+    gh_err "recovery snapshot is not valid JSON or has an unsupported schema; refusing to mutate."
+  fi
+
+  if [[ "$MANIFEST_OK" != "1" ]]; then
+    echo "::error::Pre-mutation recovery snapshot could not be captured/validated. Failing before any remote mutation."
+    rm -rf "$MERGE_DIR"
+    exit 1
+  fi
+  echo "[publish] recorded pre-mutation recovery manifest: $MANIFEST_FILE (assets=$asset_count, schema=v1)"
+  export RECOVERY_SNAPSHOT_OK=1
+  export GH_REQUIRE_RECOVERY_SNAPSHOT=1
+fi
+
 # Publish content-aware (Objective A): skip identical checksums, upload
 # only new/changed assets, never delete a valid asset because its checksum
 # could not be retrieved. Order matters: packages first, then metadata,
@@ -657,35 +740,6 @@ if [[ -n "${GITHUB_WORKSPACE:-}" && -d "$GITHUB_WORKSPACE" ]]; then
     '{timestamp:$ts, release:$release, release_tag:$tag, unchanged:$unchanged,
       uploaded:$uploaded, replaced:$replaced, failed:$failed, api_requests:$api_requests}')" \
     > "$GITHUB_WORKSPACE/publish-summary.json"
-fi
-
-# -- recovery: record the pre-mutation remote asset manifest ----------------
-# Local artifact (never uploaded): captures exactly what the release looked
-# like before this run's mutations. Used to reconcile interrupted publishes
-# and to plan recovery. Written before any mutation happens.
-if [[ "${DRY_RUN:-0}" != "1" ]]; then
-  MANIFEST_FILE="$PWD/publish-manifest-${TAG}.json"
-  {
-    echo "{"
-    echo "  \"repository\": $(printf '%s' "$REPO" | jq -R .),"
-    echo "  \"release_tag\": $(printf '%s' "$TAG" | jq -R .),"
-    echo "  \"recorded_at\": $(date -u +%Y-%m-%dT%H:%M:%SZ | jq -R .),"
-    echo "  \"assets\": ["
-    first=1
-    while IFS='|' read -r name id digest; do
-      [[ -n "$name" ]] || continue
-      [[ $first -eq 0 ]] && echo ","
-      printf '    {"name": %s, "id": %s, "digest": %s}' \
-        "$(printf '%s' "$name" | jq -R .)" "$(printf '%s' "$id" | jq -R .)" "$(printf '%s' "$digest" | jq -R .)"
-      first=0
-    done < <(gh_api_retry "list assets (${TAG})" \
-        "/repos/${REPO}/releases/tags/${TAG}" \
-        --jq '.assets[] | "\(.name)|\(.id)|\(.digest // "")"' 2>/dev/null)
-    echo
-    echo "  ]"
-    echo "}"
-  } > "$MANIFEST_FILE"
-  echo "[publish] recorded pre-mutation manifest: $MANIFEST_FILE"
 fi
 
 # -- drift cleanup: delete only stale un-protected package assets ---------
