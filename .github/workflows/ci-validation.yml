@@ -1,0 +1,232 @@
+name: CI Validation
+
+# Phase 8.1.1 — automated Pull Request validation.
+#
+# Runs on every PR targeting `main` (opened/synchronize/reopened) and on
+# manual workflow_dispatch for CI-only testing. This workflow is strictly
+# READ-ONLY: it never publishes, never mutates releases (repository /
+# repository-v4-test), never touches signing secrets, and never pushes.
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: v1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
+jobs:
+  # ----------------------------------------------------------------------
+  # Job A — static validation (bash syntax, shellcheck, actionlint, YAML,
+  # whitespace). Does not require Docker or network beyond lint installs.
+  # ----------------------------------------------------------------------
+  static-validation:
+    name: Static validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install linting tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          echo "shellcheck version: $(shellcheck --version | head -2 | tail -1)"
+          # actionlint: pinned release + downloaded-checksum verification.
+          AL_URL="https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          curl -fsSL "$AL_URL" -o /tmp/actionlint.tar.gz
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Bash syntax validation (dynamic discovery)
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r f; do
+            if ! bash -n "$f"; then
+              echo "::error::Bash syntax error: $f"
+              failed=1
+            fi
+          done < <(find "$GITHUB_WORKSPACE/.github/scripts" "$GITHUB_WORKSPACE/.github/tests" \
+                     "$GITHUB_WORKSPACE/dashboard/tests" -maxdepth 1 -name '*.sh' -type f | sort)
+          echo "bash_syntax_failed=$failed" >> "$GITHUB_ENV"
+          if [[ "$failed" -ne 0 ]]; then exit 1; fi
+          echo "bash syntax OK: $(find "$GITHUB_WORKSPACE/.github/scripts" "$GITHUB_WORKSPACE/.github/tests" "$GITHUB_WORKSPACE/dashboard/tests" -maxdepth 1 -name '*.sh' -type f | wc -l) scripts"
+
+      - name: ShellCheck (errors fail CI; warnings reported)
+        run: |
+          set -euo pipefail
+          # Policy: `error` findings fail CI. `warning`/`info` findings are
+          # reported in the summary; the 13 legacy files with SC2034/
+          # SC2155/SC2164 warnings are documented in docs/ci/
+          # phase8.1.1-pr-validation.md (variable sourcing/reflection and
+          # test-harness patterns) and are not mass-rewritten. New files
+          # are expected to be warning-clean.
+          error_failed=0
+          warn_count=0
+          while IFS= read -r f; do
+            out="$(shellcheck -S warning -f gcc "$f" 2>&1 || true)"
+            if [[ -n "$out" ]]; then
+              if echo "$out" | grep -q 'error:'; then
+                echo "$out" | grep 'error:' || true
+                echo "::error::ShellCheck error-level findings in $f"
+                error_failed=1
+              fi
+              warn_count=$(( warn_count + $(echo "$out" | grep -c 'warning:' || true) ))
+            fi
+          done < <(find "$GITHUB_WORKSPACE/.github/scripts" "$GITHUB_WORKSPACE/.github/tests" \
+                     "$GITHUB_WORKSPACE/dashboard/tests" -maxdepth 1 -name '*.sh' -type f | sort)
+          echo "shellcheck_warnings=$warn_count" >> "$GITHUB_ENV"
+          echo "shellcheck_error_failed=$error_failed" >> "$GITHUB_ENV"
+          if [[ "$error_failed" -ne 0 ]]; then exit 1; fi
+          echo "ShellCheck OK: no error-level findings (warnings reported: $warn_count)"
+
+      - name: actionlint (workflow validation)
+        run: |
+          set -euo pipefail
+          actionlint "$GITHUB_WORKSPACE/.github/workflows/"*.yml
+
+      - name: YAML validation (workflows)
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/validate-workflows-yaml.py" "$GITHUB_WORKSPACE"
+
+      - name: Whitespace check (diff against base)
+        run: |
+          set -euo pipefail
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            # PR context: diff against the merge-base commit provided by the
+            # event (no extra fetch required with fetch-depth 1).
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            if git diff --check "$base_sha...HEAD" | grep -v '^$'; then
+              echo "::error::git diff --check reported whitespace errors"
+              exit 1
+            fi
+          else
+            # Manual dispatch: no base to compare; only check the working tree.
+            if git diff --check | grep -v '^$'; then
+              echo "::error::git diff --check reported whitespace errors"
+              exit 1
+            fi
+          fi
+          echo "whitespace check OK"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## CI — Static Validation"
+            echo ""
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- PR: ${{ github.event.pull_request.number && format('#{0}', github.event.pull_request.number) || 'manual dispatch' }}"
+            echo "- Bash syntax: ${{ env.bash_syntax_failed == '1' && 'FAIL' || 'PASS' }}"
+            echo "- ShellCheck errors: ${{ env.shellcheck_error_failed == '1' && 'FAIL' || 'PASS' }}"
+            echo "- ShellCheck warnings (legacy, reported): ${{ env.shellcheck_warnings || '0' }}"
+            echo "- actionlint: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------------
+  # Job B — full regression suite (host + Docker/container steps).
+  # ----------------------------------------------------------------------
+  regression-tests:
+    name: Regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install host test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-yaml jq zstd libarchive-tools
+          docker --version
+          echo "host deps installed"
+
+      - name: Run full regression suite
+        env:
+          REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          bash "$REPO_ROOT/.github/tests/run-tests.sh" 2>&1 | tee /tmp/regression.log
+          # tee changes pipe exit status; preserve the runner's verdict
+          status=${PIPESTATUS[0]}
+          echo "regression_exit=$status" >> "$GITHUB_ENV"
+          exit "$status"
+
+      - name: Upload regression log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-regression-log
+          path: /tmp/regression.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## CI — Regression Tests"
+            echo ""
+            echo "- Exit code: ${{ env.regression_exit == '0' && '0 (PASS)' || env.regression_exit || 'not run' }}"
+            echo "- Full log: artifact \`ci-regression-log\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------------
+  # Job C — CI acceptance aggregate.
+  # Fails when any mandatory dependency failed, was cancelled, or was
+  # unexpectedly skipped. `if: success()` is intentionally NOT used so a
+  # skipped/cancelled dependency cannot turn the acceptance into a silent
+  # "skipped" state.
+  # ----------------------------------------------------------------------
+  ci-acceptance:
+    name: CI acceptance
+    runs-on: ubuntu-24.04
+    needs: [static-validation, regression-tests]
+    if: always()
+    steps:
+      - name: Evaluate mandatory checks
+        run: |
+          set -euo pipefail
+          r_s="${{ needs.static-validation.result }}"
+          r_r="${{ needs.regression-tests.result }}"
+          echo "static-validation=$r_s regression-tests=$r_r"
+          failed=0
+          if [[ "$r_s" != "success" ]]; then
+            echo "::error::static-validation did not succeed ($r_s)"
+            failed=1
+          fi
+          if [[ "$r_r" != "success" ]]; then
+            echo "::error::regression-tests did not succeed ($r_r)"
+            failed=1
+          fi
+          if [[ "$failed" -ne 0 ]]; then exit 1; fi
+          echo "all mandatory CI checks passed"
+
+      - name: Summary
+        run: |
+          {
+            echo "## CI Acceptance — PASS"
+            echo ""
+            echo "Static validation: PASS"
+            echo "Regression tests: PASS"
+          } >> "$GITHUB_STEP_SUMMARY"
