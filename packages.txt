@@ -65,3 +65,7 @@ local:opendoas-cpp-git
 dynamips
 ubridge
 vpcs
+
+# Onboarding batch 2 (VCS variants; staging first)
+fzf-git
+swaync-git
