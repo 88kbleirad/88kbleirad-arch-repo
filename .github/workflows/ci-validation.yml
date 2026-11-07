@@ -54,6 +54,7 @@ jobs:
           actionlint -version
 
       - name: Bash syntax validation (dynamic discovery)
+        id: bash_syntax
         run: |
           set -euo pipefail
           failed=0
@@ -69,6 +70,7 @@ jobs:
           echo "bash syntax OK: $(find "$GITHUB_WORKSPACE/.github/scripts" "$GITHUB_WORKSPACE/.github/tests" "$GITHUB_WORKSPACE/dashboard/tests" -maxdepth 1 -name '*.sh' -type f | wc -l) scripts"
 
       - name: ShellCheck (errors fail CI; warnings reported)
+        id: shellcheck
         run: |
           set -euo pipefail
           # Policy: `error` findings fail CI. `warning`/`info` findings are
@@ -97,31 +99,42 @@ jobs:
           echo "ShellCheck OK: no error-level findings (warnings reported: $warn_count)"
 
       - name: actionlint (workflow validation)
+        id: actionlint
         run: |
           set -euo pipefail
           actionlint "$GITHUB_WORKSPACE/.github/workflows/"*.yml
 
       - name: YAML validation (workflows)
+        id: yaml
         run: |
           set -euo pipefail
           python3 "$GITHUB_WORKSPACE/.github/scripts/validate-workflows-yaml.py" "$GITHUB_WORKSPACE"
 
       - name: Whitespace check (diff against base)
+        id: whitespace
         run: |
           set -euo pipefail
           if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
-            # PR context: compare against the PR base commit. The shallow
-            # checkout (fetch-depth 1) does not contain the base object, so
-            # fetch it explicitly before diffing. If the base cannot be
-            # fetched, FAIL (never silently skip the check).
+            # PR context. The shallow checkout (fetch-depth 1) contains the
+            # PR merge commit but not necessarily the base ancestry, so a
+            # three-dot (merge-base) diff can fail with "no merge base".
+            # Use a DIRECT two-dot comparison between the base commit and
+            # HEAD, after making sure both objects exist locally. A Git
+            # infrastructure failure must NEVER be reported as a whitespace
+            # pass: every failure path exits non-zero with a diagnostic.
             base_sha="${{ github.event.pull_request.base.sha }}"
             if ! git cat-file -e "$base_sha^{commit}" 2>/dev/null; then
-              GIT_TERMINAL_PROMPT=0 git fetch --no-tags --depth=1 origin "$base_sha" || {
-                echo "::error::could not fetch PR base $base_sha for whitespace check"
-                exit 1
-              }
+              # fetch the base commit and its parents (deep enough for the
+              # two-dot diff to resolve both endpoints)
+              GIT_TERMINAL_PROMPT=0 git fetch --no-tags --depth=1 origin "$base_sha" \
+                || { echo "::error::could not fetch PR base $base_sha for whitespace check"; exit 1; }
             fi
-            if ! git diff --check "$base_sha...HEAD"; then
+            git cat-file -e "$base_sha^{commit}" 2>/dev/null \
+              || { echo "::error::PR base object $base_sha missing after fetch"; exit 1; }
+            git rev-parse --verify HEAD >/dev/null 2>&1 \
+              || { echo "::error::HEAD is not a valid commit"; exit 1; }
+            # Direct comparison (no merge-base required).
+            if ! git diff --check "$base_sha" HEAD; then
               echo "::error::git diff --check reported whitespace errors"
               exit 1
             fi
@@ -137,15 +150,27 @@ jobs:
       - name: Summary
         if: always()
         run: |
+          report() { # label outcome
+            local label="$1" outcome="$2"
+            case "$outcome" in
+              success) echo "- $label: PASS" ;;
+              failure) echo "- $label: FAIL" ;;
+              skipped) echo "- $label: SKIPPED" ;;
+              *) echo "- $label: INCOMPLETE" ;;
+            esac
+          }
           {
             echo "## CI — Static Validation"
             echo ""
             echo "- Commit: \`${{ github.sha }}\`"
             echo "- PR: ${{ github.event.pull_request.number && format('#{0}', github.event.pull_request.number) || 'manual dispatch' }}"
-            echo "- Bash syntax: ${{ env.bash_syntax_failed == '1' && 'FAIL' || 'PASS' }}"
-            echo "- ShellCheck errors: ${{ env.shellcheck_error_failed == '1' && 'FAIL' || 'PASS' }}"
+            report "Bash syntax" "${{ steps.bash_syntax.outcome }}"
+            report "ShellCheck errors" "${{ steps.shellcheck.outcome }}"
             echo "- ShellCheck warnings (legacy, reported): ${{ env.shellcheck_warnings || '0' }}"
-            echo "- actionlint: ${{ job.status }}"
+            report "actionlint" "${{ steps.actionlint.outcome }}"
+            report "YAML validation" "${{ steps.yaml.outcome }}"
+            report "Git whitespace check" "${{ steps.whitespace.outcome }}"
+            echo "- Overall static validation: ${{ job.status }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ----------------------------------------------------------------------

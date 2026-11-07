@@ -216,8 +216,26 @@ ws_rm() {
   fi
 }
 
+# ws_ensure_host_owned: restore ownership of the bind-mounted workspace to
+# the host runner UID/GID. Container steps run as `builder` (UID 1000)
+# and chown the workspace; the non-root host runner (e.g. UID 1001 on
+# GitHub Actions) cannot create/remove files in builder-owned directories.
+# Scoped strictly to $WS; never touches paths outside it.
+ws_ensure_host_owned() {
+  local uid gid
+  uid="$(id -u)"; gid="$(id -g)"
+  docker exec "$CID" bash -c "chown -R $uid:$gid '$WS'" >/dev/null 2>&1 || true
+}
+
+# ws_mkdir <dir...>: create directory(ies) under the workspace, restoring
+# host ownership first so the host can create/own the new path.
+ws_mkdir() {
+  ws_ensure_host_owned
+  mkdir -p -- "$@"
+}
+
 # build the fake release from the first successful run (snapshot path)
-ws_rm "$WS/fake-release"; mkdir -p "$WS/fake-release"
+ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
 cp "$WORKDIR/snap-build"/hello-v4test-1.0-1-any.pkg.tar.zst "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
   set -euo pipefail
@@ -226,6 +244,7 @@ docker exec -e WS="$WS" "$CID" bash -c "
   repo-add 88kbleirad.db.tar.gz hello-v4test-1.0-1-any.pkg.tar.zst >/dev/null 2>&1
   cp 88kbleirad.db.tar.gz 88kbleirad.files.tar.gz \"\$WS/fake-release/\"
 "
+ws_ensure_host_owned
 cp "$WORKDIR/snap-build/v4-hello-v4test.meta.json" "$WS/fake-release/"
 
 
@@ -277,6 +296,7 @@ note "cache hit metadata is deterministic across repeated identical runs"
 # second publish of the same run produces zero asset mutations.
 # Update the fake release with the first cache run's metadata so this run
 # compares against an identical (skipped) cache hit.
+ws_ensure_host_owned
 cp "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" "$WS/fake-release/"
 rc=$(run_build cache2)
 if [[ "$rc" -eq 0 ]]; then
@@ -340,7 +360,7 @@ fi
 note "fail closed: failing build with no recoverable archive exits nonzero"
 # A PKGBUILD whose build always fails must NOT produce a false-green exit.
 # Add a deliberately broken package to the workspace and build it.
-mkdir -p "$WS/brokepkg/src" "$WS/fake-release-empty"
+ws_mkdir "$WS/brokepkg/src" "$WS/fake-release-empty"
 touch "$WS/fake-release-empty/.created"
 : > "$WS/fake-release-empty/.ids"
 cat > "$WS/brokepkg/PKGBUILD" <<'PB'
@@ -387,7 +407,7 @@ grep -q "failing the build job" "$WORKDIR/broken.log" \
 note "fail closed: metadata-only artifact never passes artifact gate"
 # Simulate the historical ripdrag outcome: status-failed + meta, no
 # archive. The artifact gate in build-in-docker.sh must reject it.
-mkdir -p "$WS/metatest/output"
+ws_mkdir "$WS/metatest/output"
 echo "brokepkg" > "$WS/metatest/output/status-failed-brokepkg.txt"
 printf '{"package":"brokepkg","profile":"x86-64-v4","status":"failed","fingerprint":"x"}\n' \
   > "$WS/metatest/output/v4-brokepkg.meta.json"
@@ -452,7 +472,7 @@ else
 fi
 
 # seed the fake release from the epoch build (db + meta + archive)
-ws_rm "$WS/fake-release"; mkdir -p "$WS/fake-release"
+ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
 cp "$WORKDIR/snap-epochb"/hello-epoch-2.1.0-1-any.pkg.tar.zst "$WS/fake-release/"
 cp "$WORKDIR/snap-epochb/v4-hello-epoch.meta.json" "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
@@ -528,7 +548,7 @@ grep -q 'PKGBUILD/compiler fingerprint changed' "$WORKDIR/skipb.log" \
   && bad "first run should not report fingerprint change" || ok "first run built clean"
 
 # seed the fake release from the first run (db + meta + archive)
-ws_rm "$WS/fake-release"; mkdir -p "$WS/fake-release"
+ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
 cp "$WORKDIR/snap-skipb"/hello-skip-1.0-1-any.pkg.tar.zst "$WS/fake-release/"
 cp "$WORKDIR/snap-skipb/v4-hello-skip.meta.json" "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
@@ -622,7 +642,7 @@ fi
 
 # invalidate: change the payload (source content), rebuild, expect a
 # different fingerprint
-mkdir -p "$WS/src-tarball-mod/hello-skip2-1.0/usr/share"
+ws_mkdir "$WS/src-tarball-mod/hello-skip2-1.0/usr/share"
 printf 'skip-source-MODIFIED\n' > "$WS/src-tarball-mod/hello-skip2-1.0/usr/share/hello-skip2-data"
 ( cd "$WS/src-tarball-mod" && tar -czf "$WS/hello-skip2-mod.tar.gz" hello-skip2-1.0 )
 cp "$WS/hello-skip2-mod.tar.gz" "$WS/hello-skip2/hello-skip2-1.0.tar.gz"
@@ -643,8 +663,8 @@ note "genuine version upgrade: package and metadata update correctly"
 # consistent package identity (hello-skip2): first a pristine v1.0 build,
 # release seeded from it, then an in-place v2.0 upgrade.
 # recreate pristine v1.0 state
-ws_rm "$WS/hello-skip2"; mkdir -p "$WS/hello-skip2"
-ws_rm "$WS/src-tarball/hello-skip2-1.0"; mkdir -p "$WS/src-tarball/hello-skip2-1.0/usr/share"
+ws_rm "$WS/hello-skip2"; ws_mkdir "$WS/hello-skip2"
+ws_rm "$WS/src-tarball/hello-skip2-1.0"; ws_mkdir "$WS/src-tarball/hello-skip2-1.0/usr/share"
 printf 'skip-source\n' > "$WS/src-tarball/hello-skip2-1.0/usr/share/hello-skip2-data"
 ( cd "$WS/src-tarball" && tar -czf "$WS/hello-skip2-1.0.tar.gz" hello-skip2-1.0 )
 cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
@@ -675,7 +695,7 @@ fi
 BASE_FP=$(jq -r '.fingerprint // empty' "$WORKDIR/snap-upbase/v4-hello-skip2.meta.json" 2>/dev/null || true)
 
 # seed the release with the v1.0 baseline
-ws_rm "$WS/fake-release"; mkdir -p "$WS/fake-release"
+ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
 cp "$WORKDIR/snap-upbase/hello-skip2-1.0-1-any.pkg.tar.zst" "$WS/fake-release/"
 cp "$WORKDIR/snap-upbase/v4-hello-skip2.meta.json" "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
@@ -687,7 +707,7 @@ docker exec -e WS="$WS" "$CID" bash -c "
 "
 
 # upgrade in place to v2.0 (same package identity)
-ws_rm "$WS/src-tarball-up/hello-skip2-2.0"; mkdir -p "$WS/src-tarball-up/hello-skip2-2.0/usr/share"
+ws_rm "$WS/src-tarball-up/hello-skip2-2.0"; ws_mkdir "$WS/src-tarball-up/hello-skip2-2.0/usr/share"
 printf 'skip-upgrade\n' > "$WS/src-tarball-up/hello-skip2-2.0/usr/share/hello-skip2-data"
 ( cd "$WS/src-tarball-up" && tar -czf "$WS/hello-skip2-2.0.tar.gz" hello-skip2-2.0 )
 cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
@@ -732,7 +752,7 @@ else
 fi
 
 # restore pristine v1.0 state for the directory
-ws_rm "$WS/hello-skip2"; mkdir -p "$WS/hello-skip2"
+ws_rm "$WS/hello-skip2"; ws_mkdir "$WS/hello-skip2"
 cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
 pkgname=hello-skip2
 pkgver=1.0
@@ -756,7 +776,7 @@ note "corrupted remote metadata: fail closed (rebuild, never blind reuse)"
 # A release whose v4 meta is corrupt (invalid JSON) must NOT be reused:
 # the cache gate sees an unresolvable prev fingerprint and forces a
 # rebuild rather than trusting bad metadata.
-ws_rm "$WS/fake-release"; mkdir -p "$WS/fake-release"
+ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
 cp "$WORKDIR/snap-skipb/hello-skip-1.0-1-any.pkg.tar.zst" "$WS/fake-release/"
 printf 'not-json{{{' > "$WS/fake-release/v4-hello-skip.meta.json"
 docker exec -e WS="$WS" "$CID" bash -c "

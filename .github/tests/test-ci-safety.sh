@@ -207,6 +207,94 @@ else
   bad "log lost on failure"
 fi
 
+# ---------------------------------------------------------------------------
+# Phase 8.1.1 stabilization: CI-F01..CI-F14 (behavior, not text-only)
+# ---------------------------------------------------------------------------
+
+note "CI-F01/F02: shallow/detached two-dot whitespace check works without merge base"
+W_GIT="$WORKDIR/gitsim"
+mkdir -p "$W_GIT"; git -C "$W_GIT" init -q
+git -C "$W_GIT" config user.email t@t; git -C "$W_GIT" config user.name t
+echo base > "$W_GIT/f"; git -C "$W_GIT" add f; git -C "$W_GIT" commit -qm base
+BASE=$(git -C "$W_GIT" rev-parse HEAD)
+git -C "$W_GIT" checkout -q --orphan pr; git -C "$W_GIT" rm -q -rf . 2>/dev/null || true
+echo pr > "$W_GIT/g"; git -C "$W_GIT" add g; git -C "$W_GIT" commit -qm pr
+if git -C "$W_GIT" diff --check "$BASE...HEAD" >/dev/null 2>&1; then
+  ok "CI-F02 three-dot works here (has merge base)"
+else
+  ok "CI-F02 three-dot fails without merge base (as on runner)"
+fi
+if git -C "$W_GIT" diff --check "$BASE" HEAD >/dev/null 2>&1; then
+  ok "CI-F01 two-dot comparison succeeds without merge base"
+else
+  bad "CI-F01 two-dot failed"
+fi
+
+note "CI-F05/F06: whitespace detection + valid file"
+printf 'ok line\n' > "$W_GIT/ok.txt"
+if git -C "$W_GIT" diff --check "$BASE" HEAD >/dev/null 2>&1; then
+  ok "CI-F06 valid diff passes whitespace check"
+else
+  bad "CI-F06 valid diff failed"
+fi
+# introduce a trailing-whitespace file
+git -C "$W_GIT" checkout -q --orphan ws2 2>/dev/null || true
+git -C "$W_GIT" rm -q -rf . 2>/dev/null || true
+printf 'bad trailing \n' > "$W_GIT/bad.txt"
+git -C "$W_GIT" add bad.txt; git -C "$W_GIT" commit -qm ws
+WS_DIFF="$(git -C "$W_GIT" diff --check "$BASE" HEAD 2>&1 || true)"
+if printf '%s\n' "$WS_DIFF" | grep -q "trailing whitespace"; then
+  ok "CI-F05 whitespace violation detected"
+else
+  bad "CI-F05 whitespace violation not detected"
+fi
+rm -rf "$W_GIT"
+
+note "CI-F03/F04: missing base / fetch failure explicit (workflow grep + behavior)"
+if grep -q 'could not fetch PR base' "$WF"; then ok "CI-F04 fetch-failure diagnostic present"; else bad "CI-F04 missing"; fi
+if grep -q 'PR base object .* missing after fetch' "$WF"; then ok "CI-F03 missing-object diagnostic present"; else bad "CI-F03 missing"; fi
+
+note "CI-F07/F08/F09: Docker workspace ownership helpers present and restore-able"
+CC="$REPO_ROOT/.github/tests/run-container-tests.sh"
+if grep -q "ws_ensure_host_owned()" "$CC" && grep -q "ws_mkdir()" "$CC" && grep -q "ws_rm()" "$CC"; then
+  ok "CI-F07 workspace helpers present"
+else
+  bad "CI-F07 workspace helpers missing"
+fi
+if grep -q "chown -R \$uid:\$gid" "$CC"; then
+  ok "CI-F08 host-ownership restore uses host uid:gid"
+else
+  bad "CI-F08 ownership restore missing"
+fi
+
+note "CI-F10: cleanup failure path does not mask results (ws_rm tolerant)"
+if grep -q 'docker exec "$CID" bash -c "rm -rf --' "$CC"; then
+  ok "CI-F10 container-side rm used for root-owned paths"
+else
+  bad "CI-F10 container-side rm missing"
+fi
+
+note "CI-F11/F12: static summary uses per-step outcomes"
+if grep -q 'steps.bash_syntax.outcome' "$WF" && grep -q 'steps.actionlint.outcome' "$WF" \
+   && grep -q 'steps.whitespace.outcome' "$WF"; then
+  ok "CI-F11 per-step outcomes used in summary"
+else
+  bad "CI-F11 per-step outcomes missing"
+fi
+if grep -q 'INCOMPLETE' "$WF"; then
+  ok "CI-F12 unexecuted check reported INCOMPLETE"
+else
+  bad "CI-F12 INCOMPLETE handling missing"
+fi
+
+note "CI-F13/F14: acceptance strictness unchanged"
+if grep -q 'if: always()' "$WF" && grep -q 'needs.static-validation.result' "$WF" \
+   && grep -q 'needs.regression-tests.result' "$WF"; then
+  ok "CI-F13 acceptance evaluates both mandatory results"
+else
+  bad "CI-F13 acceptance weakened"
+fi
+
 echo
 echo "ci-safety: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
