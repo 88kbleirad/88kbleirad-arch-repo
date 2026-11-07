@@ -61,3 +61,7 @@ xlibre-input-libinput
 # Local packages
 local:mcontrolcenter-git
 local:opendoas-cpp-git
+# Onboarding batch 1 (GNS3; staging first)
+dynamips
+ubridge
+vpcs

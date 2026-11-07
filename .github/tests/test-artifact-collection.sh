@@ -308,8 +308,10 @@ if jq -e '.kpis.production_health == "HEALTHY" and .kpis.staging_health == "DEGR
 else
   bad "health separation broken: $(jq -c '.kpis | {p:.production_health,s:.staging_health}' "$SNAP")"
 fi
-if jq -e '.kpis.packages_configured == 55 and .kpis.packages_published == 20' "$SNAP" >/dev/null 2>&1; then
-  ok "configured (55) vs published (20) inventory kept separate"
+EXPECTED_CONFIGURED=$(awk 'NF && $0 !~ /^[[:space:]]*#/' "$REPO_ROOT/packages.txt" | wc -l | tr -d ' ')
+if jq -e --argjson exp "$EXPECTED_CONFIGURED" \
+    '.kpis.packages_configured == $exp and .kpis.packages_published == 20' "$SNAP" >/dev/null 2>&1; then
+  ok "configured ($EXPECTED_CONFIGURED) vs published (20) inventory kept separate"
 else
   bad "inventory separation broken: $(jq -c '.kpis | {c:.packages_configured,p:.packages_published}' "$SNAP")"
 fi
