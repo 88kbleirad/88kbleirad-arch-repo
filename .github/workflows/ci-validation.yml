@@ -1,0 +1,294 @@
+name: CI Validation
+
+# Phase 8.1.1 — automated Pull Request validation.
+#
+# Runs on every PR targeting `main` (opened/synchronize/reopened) and on
+# manual workflow_dispatch for CI-only testing. This workflow is strictly
+# READ-ONLY: it never publishes, never mutates releases (repository /
+# repository-v4-test), never touches signing secrets, and never pushes.
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: v1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
+jobs:
+  # ----------------------------------------------------------------------
+  # Job A — static validation (bash syntax, shellcheck, actionlint, YAML,
+  # whitespace). Does not require Docker or network beyond lint installs.
+  # ----------------------------------------------------------------------
+  static-validation:
+    name: Static validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install linting tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          echo "shellcheck version: $(shellcheck --version | head -2 | tail -1)"
+          # actionlint: pinned release + downloaded-checksum verification.
+          AL_URL="https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          curl -fsSL "$AL_URL" -o /tmp/actionlint.tar.gz
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Bash syntax validation (dynamic discovery)
+        id: bash_syntax
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r f; do
+            if ! bash -n "$f"; then
+              echo "::error::Bash syntax error: $f"
+              failed=1
+            fi
+          done < <(find "$GITHUB_WORKSPACE/.github/scripts" "$GITHUB_WORKSPACE/.github/tests" \
+                     "$GITHUB_WORKSPACE/dashboard/tests" -maxdepth 1 -name '*.sh' -type f | sort)
+          echo "bash_syntax_failed=$failed" >> "$GITHUB_ENV"
+          if [[ "$failed" -ne 0 ]]; then exit 1; fi
+          echo "bash syntax OK: $(find "$GITHUB_WORKSPACE/.github/scripts" "$GITHUB_WORKSPACE/.github/tests" "$GITHUB_WORKSPACE/dashboard/tests" -maxdepth 1 -name '*.sh' -type f | wc -l) scripts"
+
+      - name: ShellCheck (errors fail CI; warnings reported)
+        id: shellcheck
+        run: |
+          set -euo pipefail
+          # Policy: `error` findings fail CI. `warning`/`info` findings are
+          # reported in the summary; the 13 legacy files with SC2034/
+          # SC2155/SC2164 warnings are documented in docs/ci/
+          # phase8.1.1-pr-validation.md (variable sourcing/reflection and
+          # test-harness patterns) and are not mass-rewritten. New files
+          # are expected to be warning-clean.
+          error_failed=0
+          warn_count=0
+          while IFS= read -r f; do
+            out="$(shellcheck -S warning -f gcc "$f" 2>&1 || true)"
+            if [[ -n "$out" ]]; then
+              if echo "$out" | grep -q 'error:'; then
+                echo "$out" | grep 'error:' || true
+                echo "::error::ShellCheck error-level findings in $f"
+                error_failed=1
+              fi
+              warn_count=$(( warn_count + $(echo "$out" | grep -c 'warning:' || true) ))
+            fi
+          done < <(find "$GITHUB_WORKSPACE/.github/scripts" "$GITHUB_WORKSPACE/.github/tests" \
+                     "$GITHUB_WORKSPACE/dashboard/tests" -maxdepth 1 -name '*.sh' -type f | sort)
+          echo "shellcheck_warnings=$warn_count" >> "$GITHUB_ENV"
+          echo "shellcheck_error_failed=$error_failed" >> "$GITHUB_ENV"
+          if [[ "$error_failed" -ne 0 ]]; then exit 1; fi
+          echo "ShellCheck OK: no error-level findings (warnings reported: $warn_count)"
+
+      - name: actionlint (workflow validation)
+        id: actionlint
+        run: |
+          set -euo pipefail
+          actionlint "$GITHUB_WORKSPACE/.github/workflows/"*.yml
+
+      - name: YAML validation (workflows)
+        id: yaml
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/validate-workflows-yaml.py" "$GITHUB_WORKSPACE"
+
+      - name: Whitespace check (diff against base)
+        id: whitespace
+        run: |
+          set -euo pipefail
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            # PR context. The shallow checkout (fetch-depth 1) contains the
+            # PR merge commit but not necessarily the base ancestry, so a
+            # three-dot (merge-base) diff can fail with "no merge base".
+            # Use a DIRECT two-dot comparison between the base commit and
+            # HEAD, after making sure both objects exist locally. A Git
+            # infrastructure failure must NEVER be reported as a whitespace
+            # pass: every failure path exits non-zero with a diagnostic.
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            if ! git cat-file -e "$base_sha^{commit}" 2>/dev/null; then
+              # fetch the base commit and its parents (deep enough for the
+              # two-dot diff to resolve both endpoints)
+              GIT_TERMINAL_PROMPT=0 git fetch --no-tags --depth=1 origin "$base_sha" \
+                || { echo "::error::could not fetch PR base $base_sha for whitespace check"; exit 1; }
+            fi
+            git cat-file -e "$base_sha^{commit}" 2>/dev/null \
+              || { echo "::error::PR base object $base_sha missing after fetch"; exit 1; }
+            git rev-parse --verify HEAD >/dev/null 2>&1 \
+              || { echo "::error::HEAD is not a valid commit"; exit 1; }
+            # Direct comparison (no merge-base required).
+            if ! git diff --check "$base_sha" HEAD; then
+              echo "::error::git diff --check reported whitespace errors"
+              exit 1
+            fi
+          else
+            # Manual dispatch: no base to compare; only check the working tree.
+            if ! git diff --check; then
+              echo "::error::git diff --check reported whitespace errors"
+              exit 1
+            fi
+          fi
+          echo "whitespace check OK"
+
+      - name: Summary
+        if: always()
+        run: |
+          report() { # label outcome
+            local label="$1" outcome="$2"
+            case "$outcome" in
+              success) echo "- $label: PASS" ;;
+              failure) echo "- $label: FAIL" ;;
+              skipped) echo "- $label: SKIPPED" ;;
+              *) echo "- $label: INCOMPLETE" ;;
+            esac
+          }
+          {
+            echo "## CI — Static Validation"
+            echo ""
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- PR: ${{ github.event.pull_request.number && format('#{0}', github.event.pull_request.number) || 'manual dispatch' }}"
+            report "Bash syntax" "${{ steps.bash_syntax.outcome }}"
+            report "ShellCheck errors" "${{ steps.shellcheck.outcome }}"
+            echo "- ShellCheck warnings (legacy, reported): ${{ env.shellcheck_warnings || '0' }}"
+            report "actionlint" "${{ steps.actionlint.outcome }}"
+            report "YAML validation" "${{ steps.yaml.outcome }}"
+            report "Git whitespace check" "${{ steps.whitespace.outcome }}"
+            echo "- Overall static validation: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------------
+  # Job B — full regression suite (host + Docker/container steps).
+  # ----------------------------------------------------------------------
+  regression-tests:
+    name: Regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install host test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # makepkg (Ubuntu/Debian) provides vercmp; pacman-contrib is
+          # Arch-only. Explicit install so update-detection tests run.
+          sudo apt-get install -y -qq python3-yaml jq zstd libarchive-tools makepkg
+          docker --version
+          echo "host deps installed"
+
+      - name: Verify vercmp availability + semantics
+        run: |
+          set -euo pipefail
+          command -v vercmp || { echo "::error::vercmp not found (makepkg failed to install?)"; exit 1; }
+          # Semantic checks (pacman vercmp exits: 1 if >, -1 if <, 0 if =)
+          test "$(vercmp 1.10.0 1.9.0)" = "1"
+          test "$(vercmp 1.9.0 1.10.0)" = "-1"
+          test "$(vercmp 1.10.0 1.10.0)" = "0"
+          # epoch+Averse smoke
+          test "$(vercmp 2:1.0 1:9.9)" = "1"
+          echo "vercmp semantics OK"
+
+      - name: Run full regression suite
+        env:
+          REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          # Capture the true runner exit code; `set -e` is disabled around
+          # the pipeline so PIPESTATUS is recorded even on failure.
+          set +e
+          bash "$REPO_ROOT/.github/tests/run-tests.sh" 2>&1 | tee /tmp/regression.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "regression_exit=$status" >> "$GITHUB_ENV"
+          # Parse final PASS/FAIL counts from the runner log (best effort).
+          pass=$(grep -oE 'overall: PASS=[0-9]+' /tmp/regression.log | tail -1 | grep -oE '[0-9]+' || echo "")
+          fail=$(grep -oE 'FAIL=[0-9]+' /tmp/regression.log | tail -1 | grep -oE '[0-9]+' || echo "")
+          echo "regression_pass=$pass" >> "$GITHUB_ENV"
+          echo "regression_fail=$fail" >> "$GITHUB_ENV"
+          exit "$status"
+
+      - name: Upload regression log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-regression-log
+          path: /tmp/regression.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## CI — Regression Tests"
+            echo ""
+            if [[ "${REGRESSION_EXIT:-}" == "0" ]]; then
+              echo "- Status: **PASS**"
+            elif [[ -n "${REGRESSION_EXIT:-}" ]]; then
+              echo "- Status: **FAIL** (exit ${REGRESSION_EXIT})"
+            else
+              echo "- Status: **INCOMPLETE** (no exit status recorded)"
+            fi
+            echo "- overall pass/fail: ${{ env.regression_pass || 'UNKNOWN' }} / ${{ env.regression_fail || 'UNKNOWN' }}"
+            echo "- Full log: artifact \`ci-regression-log\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----------------------------------------------------------------------
+  # Job C — CI acceptance aggregate.
+  # Fails when any mandatory dependency failed, was cancelled, or was
+  # unexpectedly skipped. `if: success()` is intentionally NOT used so a
+  # skipped/cancelled dependency cannot turn the acceptance into a silent
+  # "skipped" state.
+  # ----------------------------------------------------------------------
+  ci-acceptance:
+    name: CI acceptance
+    runs-on: ubuntu-24.04
+    needs: [static-validation, regression-tests]
+    if: always()
+    steps:
+      - name: Evaluate mandatory checks
+        run: |
+          set -euo pipefail
+          r_s="${{ needs.static-validation.result }}"
+          r_r="${{ needs.regression-tests.result }}"
+          echo "static-validation=$r_s regression-tests=$r_r"
+          failed=0
+          if [[ "$r_s" != "success" ]]; then
+            echo "::error::static-validation did not succeed ($r_s)"
+            failed=1
+          fi
+          if [[ "$r_r" != "success" ]]; then
+            echo "::error::regression-tests did not succeed ($r_r)"
+            failed=1
+          fi
+          if [[ "$failed" -ne 0 ]]; then exit 1; fi
+          echo "all mandatory CI checks passed"
+
+      - name: Summary
+        run: |
+          {
+            echo "## CI Acceptance — PASS"
+            echo ""
+            echo "Static validation: PASS"
+            echo "Regression tests: PASS"
+          } >> "$GITHUB_STEP_SUMMARY"
