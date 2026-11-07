@@ -17,3 +17,27 @@ per-package PKGBUILD dirs. All 54 rows classified; no row is unclassified.
 | deferred addition review | 7 | arc-icon-theme, catppuccin-gtk-theme-frappe, catppuccin-gtk-theme-mocha, clash-geoip, hw-probe, neofetch, proton-authenticator |
 
 Count check: 7+2+9+10+14+3+2+7 = 54 = rows in inventory.
+
+---
+
+## Production onboarding status (current, 2026-11-07)
+
+The following three packages from the `staging candidate` class completed the
+full onboarding pipeline and are **published in the production release
+(`repository`)**: built (x86-64-v4), staged, health-checked, signed, and
+installed/verified on a real Arch Linux x86-64-v4 host.
+
+| Package | Published version | Production status |
+|---|---|---|
+| `dynamips` | 0.2.25-1 | **onboarded (production)** |
+| `ubridge` | 1.3.0-1 | **onboarded (production)** |
+| `vpcs` | 0.8.5-1 | **onboarded (production)** |
+
+Verified production release inventory (2026-11-07): 23 package archives +
+23 detached signatures + signed database; no duplicates.
+See `docs/final-validation.md` → Phase 6 for the full evidence trail.
+
+The historical snapshot in `docs/inventory/omp-package-inventory.csv` and
+the audit workbook are preserved unchanged (installed-version snapshots and
+review categories are historical records); this page is the current-status
+view.

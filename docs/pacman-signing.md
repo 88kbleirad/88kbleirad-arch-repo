@@ -20,19 +20,24 @@ Verify the file is a well-formed OpenPGP public key:
 
 ```bash
 gpg --show-keys 88kbleirad.pub.asc
-# pub   ed25519 YYYY-MM-DD [SC]
-#       1111111111111111111111111111111111111111
-# uid   [ unknown] 88kbleirad <88kbleirad@users.noreply.github.com>
+# pub   ed25519 2026-11-04 [SC] [expires: 2027-11-04]
+#       3B9B8E3E5564A77A73B543D049DD327EE8135B62
+# uid   [ unknown] 88kbleirad Arch Repository <88kbleirad@users.noreply.github.com>
 ```
 
 **Fingerprint verification is mandatory.** Compare the fingerprint above
 with the value published out-of-band (e.g. the repository README or an
 announcement the owner controls). If they do not match, stop — the key
-may be an impersonation. The expected fingerprint for this repository is:
+may be an impersonation. The verified fingerprint for this repository is:
 
 ```
-<FINGERPRINT-PLACEHOLDER>
+3B9B8E3E5564A77A73B543D049DD327EE8135B62
 ```
+
+(Key ID: `49DD327EE8135B62`, ed25519 sign-only key created 2026-11-04,
+expires 2027-11-04. The same key signs the production `repository` and
+staging `repository-v4-test` releases and is exported to every signed
+release as `88kbleirad.pub.asc`.)
 
 ## 2. Import the key with pacman-key
 
@@ -59,14 +64,16 @@ Verify the trust level:
 
 ```bash
 pacman-key --list-keys 88kbleirad@users.noreply.github.com
-# pub   ed25519 YYYY-MM-DD [SC] [trusted: unknown]
-#       ... [expires: ...]
+# pub   ed25519 2026-11-04 [SC] [expires: 2027-11-04] [trusted: unknown]
+#       3B9B8E3E5564A77A73B543D049DD327EE8135B62
 ```
 
 A `[trusted: unknown]` label is expected; proper verification only
 requires the key to be in the keyring and the fingerprint to match.
-(Optional: `--edit-key` → `trust` → `5` also works, but `--lsign-key`
-is cleaner: it asserts the key is trusted by a key you own.)
+`--lsign-key` asserts the key is trusted by a key you own; an alternative
+is `--edit-key` → `trust` → `5` (ultimate). Do **not** use `TrustAll`
+in `pacman.conf` — it accepts any self-signed key and bypasses the
+fingerprint check above.
 
 ## 4. Enable Required signature checks in pacman.conf
 
@@ -85,8 +92,9 @@ Server = https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/re
   accepted. `TrustAll` would accept any self-signed key, which defeats
   the purpose.
 
-Do **not** switch to `Required` until the repository actually publishes
-signatures (the current release is still pre-signing).
+**Current status:** the production `repository` and staging
+`repository-v4-test` releases publish signatures (23 packages + database
+as of the GNS3 onboarding, 2026-11-07). Use `Required TrustedOnly` now.
 
 ## 5. Test signature verification
 
@@ -166,9 +174,26 @@ gpg --verify /var/cache/pacman/pkg/nmtui-go-0.2.7-1-x86_64.pkg.tar.zst.sig \
   `<db>.files.tar.gz`) are signed; the plain `.db.sig`/`.files.sig`
   names pacman fetches are published alongside them.
 - Any signing or verification failure aborts publication before upload.
-- To rotate the key: generate a new key, update `GPG_PRIVATE_KEY` in
-  GitHub secrets, publish the new public key, and re-sign the next run.
-  Clients re-import the new public key and re-trust it.
+- To rotate the key: generate a new ed25519 sign-only key (see
+  `docs/operator-signing.md`), update `GPG_PRIVATE_KEY` (and optional
+  `GPG_PASSPHRASE`) in the `package-signing` environment secrets, publish
+  the new public key, and re-sign the next run. Clients must re-import the
+  **new** public key, verify the new fingerprint out-of-band, re-trust
+  (`pacman-key --lsign-key`), and remove the old key if they want to
+  stop accepting it. Backwards compatibility: a rotated key signs only
+  releases published after the rotation; older release assets keep their
+  old signatures.
 
-See `docs/operator-signing.md` for the full setup and key-generation
-commands.
+## 8. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `error: 88kbleirad: signature from "88kbleirad Arch Repository <…>" is unknown trust` | Key imported but not locally trusted yet → `sudo pacman-key --lsign-key 88kbleirad@users.noreply.github.com` |
+| `error: …: signature from "…" is invalid` | Archive/DB tampered or key mismatch → re-download; `gpg --verify <pkg>.sig <pkg>`; confirm the fingerprint (`3B9B8E3E5564A77A73B543D049DD327EE8135B62`) |
+| `error: …: signature from "…" is not found` | Signature file missing (release published unsigned or download incomplete) → verify the release carries `.sig` assets; never weaken `SigLevel` to paper over it |
+| `unknown trust` still shown after `--lsign-key` | Run `pacman-key --list-keys <uid>` to confirm the `[trusted: …]` flag; keyring sync (`pacman-key --refresh-keys` is not required for a locally signed key) |
+| `failed to retrieve file …: Not Found` | Server URL wrong or old release tag → use the exact production URL: `https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository` |
+| CPU: `Illegal instruction (core dumped)` at runtime | Host lacks x86-64-v4 (AVX-512) → check `/proc/cpuinfo` for `avx512f`/`avx512bw`; this repository's binaries require v4 |
+
+The repository owner's key handling (generation, secrets, environment
+protection) is documented in `docs/operator-signing.md`.
