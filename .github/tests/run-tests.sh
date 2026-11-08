@@ -135,6 +135,13 @@ else
   bad "workflow-audit suite"
 fi
 
+note "CI-safety suite (Phase 8.1.1 PR-validation invariants)"
+if bash "$REPO_ROOT/.github/tests/test-ci-safety.sh"; then
+  ok "CI-safety suite"
+else
+  bad "CI-safety suite"
+fi
+
 note "artifact-collection suite (Phase 5.4; cross-run REST retrieval)"
 if bash "$REPO_ROOT/.github/tests/test-artifact-collection.sh"; then
   ok "artifact-collection suite"

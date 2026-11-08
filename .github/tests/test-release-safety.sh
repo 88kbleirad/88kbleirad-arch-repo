@@ -35,6 +35,15 @@ chmod +x "$WORKDIR/mockbin/gh"
 export PATH="$WORKDIR/mockbin:$PATH"
 
 export FAKE_RELEASE_DIR="$WORKDIR/release"
+
+# Reset the mock release between scenarios. FAKE_RELEASE_DIR is guaranteed
+# non-empty (export uses ${VAR:?}), so the glob can never expand to /*.
+# shellcheck disable=SC2115
+reset_release() {
+  rm -rf "$FAKE_RELEASE_DIR"/*
+  touch "$FAKE_RELEASE_DIR/.created"
+  : > "$FAKE_RELEASE_DIR/.ids"
+}
 mkdir -p "$FAKE_RELEASE_DIR"
 touch "$FAKE_RELEASE_DIR/.created"
 : > "$FAKE_RELEASE_DIR/.ids"
@@ -61,7 +70,7 @@ done
 
 # ---------------------------------------------------------------------------
 note "F03: third package upload fails -> no further mutation (abort ordering)"
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 for i in 1 2 3 4 5; do
   printf 'pkg%s-content\n' "$i" > "$WORKDIR/pkg$i.pkg.tar.zst"
 done
@@ -80,7 +89,7 @@ unset FAIL_500_ON
 
 # ---------------------------------------------------------------------------
 note "F05: HTTP 500 after successful upload -> reconcile by digest"
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 printf 'uploaded-bytes\n' > "$WORKDIR/amb.pkg.tar.zst"
 # FAIL_ONCE_ON: first API call 500, then succeeds; the asset lands; the
 # reconcile path must verify digest equality, not just filename.
@@ -94,7 +103,7 @@ cmp -s "$WORKDIR/amb.pkg.tar.zst" "$FAKE_RELEASE_DIR/amb.pkg.tar.zst" \
 
 # ---------------------------------------------------------------------------
 note "F06: remote filename exists with wrong checksum -> reject as success"
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 printf 'remote-old-bytes\n' > "$FAKE_RELEASE_DIR/fake.pkg.tar.zst"
 printf 'local-new-bytes\n' > "$WORKDIR/fake.pkg.tar.zst"
 export MOCK_GH_NO_DIGEST=1
@@ -112,7 +121,7 @@ cmp -s "$WORKDIR/fake.pkg.tar.zst" "$FAKE_RELEASE_DIR/fake.pkg.tar.zst" \
 
 # ---------------------------------------------------------------------------
 note "F15: identical batch republished -> idempotent (no replacements)"
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 for i in 1 2; do
   printf 'same-%s\n' "$i" > "$WORKDIR/idem$i.pkg.tar.zst"
 done
@@ -128,7 +137,7 @@ after_events=$(wc -l < "$FAKE_EVENTS_LOG")
 
 # ---------------------------------------------------------------------------
 note "F16: older version must not overwrite newer (downgrade protection)"
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 # Build real (minimal) package archives so the same-version identity gate
 # (pkg_identity) can compare .PKGINFO identities.
 mkpkg() { # out.zst name ver
@@ -180,7 +189,7 @@ grep -q 'NEWER' <(bsdtar -xOf "$FAKE_RELEASE_DIR/downgrade.pkg.tar.zst" usr/bin/
 # ---------------------------------------------------------------------------
 note "F17: dry-run blocks all remote mutations"
 export DRY_RUN=1
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 printf 'local-bytes\n' > "$WORKDIR/dry.pkg.tar.zst"
 : > "$FAKE_EVENTS_LOG"
 rc=0
@@ -204,7 +213,7 @@ unset GH_REQUIRE_RECOVERY_SNAPSHOT
 
 # ---------------------------------------------------------------------------
 note "F13: permanent 4xx fails without retry loop"
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 export PERMANENT_ON="perm.pkg.tar.zst"
 printf 'local\n' > "$WORKDIR/perm.pkg.tar.zst"
 rc=0
@@ -215,7 +224,7 @@ unset PERMANENT_ON
 
 # ---------------------------------------------------------------------------
 note "F12: HTTP 429 retries with backoff then succeeds (transient)"
-rm -rf "$FAKE_RELEASE_DIR"/*; touch "$FAKE_RELEASE_DIR/.created"; : > "$FAKE_RELEASE_DIR/.ids"
+reset_release
 export FAIL_429_ONCE="rate.pkg.tar.zst"
 printf 'local\n' > "$WORKDIR/rate.pkg.tar.zst"
 rc=0

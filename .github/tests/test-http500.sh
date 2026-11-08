@@ -1096,8 +1096,8 @@ note "publish-prod: preflight blocks a VCS version regression (downgrade)"
 # using pacman version semantics.
 W12="$WORKDIR/release-preflight-downgrade"
 rm -rf "$W12"; mkdir -p "$W12"; touch "$W12/.created"; : > "$W12/.ids"
-rm -rf "$WORKDIR/pkgbuild/testa"; mkdir -p "$WORKDIR/pkgbuild/testa"
-printf 'payload2\n' > "$WORKDIR/pkgbuild/testa/usr/share/testa" 2>/dev/null || { mkdir -p "$WORKDIR/pkgbuild/testa/usr/share"; printf 'payload2\n' > "$WORKDIR/pkgbuild/testa/usr/share/testa"; }
+rm -rf "$WORKDIR/pkgbuild/testa"; mkdir -p "$WORKDIR/pkgbuild/testa/usr/share"
+printf 'payload2\n' > "$WORKDIR/pkgbuild/testa/usr/share/testa"
 cat > "$WORKDIR/pkgbuild/testa/.PKGINFO" <<PKG
 pkgname = testa
 pkgbase = testa

@@ -254,6 +254,45 @@ validate_pkg_file() {
   return 0
 }
 
+# ensure_build_dirs_writable — fail-closed preflight that mirrors
+# makepkg 7.1's `ensure_writable_dir` gates (BUILDDIR, PKGDEST,
+# SRCDEST; LOGDEST only when LOGGING is enabled — it is not here).
+# Each variable defaults to the package start dir exactly as makepkg
+# does, so the check validates what the build will actually use. Runs as
+# the build user via sudo. Exits 0 when every effective directory is
+# writable, otherwise emits an explicit per-directory diagnostic.
+ensure_build_dirs_writable() {
+  local pkgdir="$WORKSPACE/$PKG"
+  local resolved type dir
+  # Resolve the EFFECTIVE directory values the way makepkg does: source
+  # the main config plus every drop-in (as the build user), then apply
+  # makepkg's "unset -> package start dir" default. This never requires
+  # the *source* tree to be writable — only the dirs the build writes to.
+  resolved=$(sudo -u builder bash -lc "
+    cd '$pkgdir' || exit 1
+    [[ -f /etc/makepkg.conf ]] && source /etc/makepkg.conf
+    for f in /etc/makepkg.conf.d/*.conf; do [[ -f \"\$f\" ]] && source \"\$f\"; done
+    printf '%s\n' \"\${BUILDDIR:-\$PWD}\" \"\${PKGDEST:-\$PWD}\" \"\${SRCDEST:-\$PWD}\"
+  ") || { warn "could not resolve effective makepkg build directories"; return 1; }
+
+  local builddir pkgdest srcdest
+  IFS=$'\n' read -r builddir pkgdest srcdest <<< "$resolved"
+  local -a dirs=( "$builddir" "$pkgdest" "$srcdest" )
+  local -a names=( BUILDDIR PKGDEST SRCDEST )
+  local idx=0
+  for dir in "${dirs[@]}"; do
+    type="${names[$idx]}"
+    [[ -n "$dir" ]] || dir="$pkgdir"
+    if ! sudo -u builder bash -lc "mkdir -p '$dir' && test -w '$dir'"; then
+      echo "::error::[$PKG] build directory $dir (\$$type) is not writable by the build user (builder);"
+      echo "::error::[$PKG] workspace is likely owned by another UID (host $(id -u) vs builder). Refusing to build."
+      return 1
+    fi
+    idx=$((idx + 1))
+  done
+  return 0
+}
+
 write_meta() {
   # usage: write_meta <status> <fingerprint> [extra_json] [built_at_override]
   # built_at_override makes serialization deterministic (e.g. reuse of the
@@ -424,6 +463,20 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
   # checksum verification for committed SKIP sources (as it always has)
   # and validates real checksums against the committed file.
   say "building $PKG"
+  # Permission preflight (fail closed with a precise diagnostic BEFORE
+  # makepkg runs): makepkg 7.1 exits with E_FS_PERMISSIONS (rc=11) when an
+  # effective build/output directory is not writable by the build user —
+  # e.g. when the host workspace is owned by a UID different from
+  # `builder` (GitHub runners: host 1001 vs builder 1000). Only the
+  # directories makepkg ACTUALLY requires are validated (BUILDDIR,
+  # PKGDEST, SRCDEST; each falls back to the package dir when unset), so
+  # a read-only source tree with explicitly-configured writable build/
+  # output dirs is accepted.
+  if ! ensure_build_dirs_writable; then
+    echo "$PKG" > "$WORKSPACE/output/status-failed-$PKG.txt"
+    write_meta failed "$FINGERPRINT"
+    exit 1
+  fi
   ASSUME_PKGS=$(sudo -u builder bash -lc "cd '$WORKSPACE/$PKG' && source PKGBUILD && echo \${pkgname[@]}")
   ASSUME_ARGS=""
   for subpkg in $ASSUME_PKGS; do

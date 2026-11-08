@@ -222,11 +222,34 @@ chmod +x "$MOCK_GH"
 # exercises git push/fetch against a local fake bare remote; the real
 # repository is never touched.
 FAKE_REMOTE="$WORKDIR/fake-remote.git"
-rm -rf "$FAKE_REMOTE" "$WORKDIR/wt"
-git clone -q --bare "$REPO_ROOT" "$FAKE_REMOTE"
-git clone -q "$FAKE_REMOTE" "$WORKDIR/wt"
-git -C "$WORKDIR/wt" config user.name "test"
-git -C "$WORKDIR/wt" config user.email "test@example.com"
+
+# prepare_fake_remote: create a self-contained bare remote and worktree
+# clone. The source checkout may be detached/shallow (GitHub Actions PR
+# merge ref), so we explicitly materialize a `main` branch in the fake
+# remote (pointing at the current HEAD) and install the matching
+# `origin/main` remote-tracking ref in the worktree. This never touches
+# the real remote.
+prepare_fake_remote() {
+  rm -rf "$FAKE_REMOTE" "$WORKDIR/wt"
+  # Preempt "dubious ownership" when the source checkout belongs to a
+  # different UID (e.g. Ubuntu CI container against a bind-mounted host
+  # checkout). Sandboxed to this process's global git config.
+  git config --global --add safe.directory "$REPO_ROOT" 2>/dev/null || true
+  git config --global --add safe.directory "$REPO_ROOT/.git" 2>/dev/null || true
+  git clone -q --bare "$REPO_ROOT" "$FAKE_REMOTE"
+  # ensure a stable `main` ref exists in the fake remote even when the
+  # source checkout is detached/shallow
+  if ! git --git-dir="$FAKE_REMOTE" rev-parse --verify refs/heads/main >/dev/null 2>&1; then
+    git --git-dir="$FAKE_REMOTE" branch -f main HEAD
+  fi
+  git clone -q "$FAKE_REMOTE" "$WORKDIR/wt"
+  git -C "$WORKDIR/wt" config --global --add safe.directory "$WORKDIR/wt" 2>/dev/null || true
+  git -C "$WORKDIR/wt" fetch -q origin main:refs/remotes/origin/main 2>/dev/null || true
+  git -C "$WORKDIR/wt" config user.name "test"
+  git -C "$WORKDIR/wt" config user.email "test@example.com"
+}
+
+prepare_fake_remote
 
 run_push_mock() { # [env=val...] -- [args...] -> rc
   local -a extra_env
@@ -242,11 +265,7 @@ run_push_mock() { # [env=val...] -- [args...] -> rc
   #    be "found" by the idempotent fetch),
   #  - recreate the worktree clone from it,
   #  - remove local untracked fixtures.
-  rm -rf "$FAKE_REMOTE" "$WORKDIR/wt"
-  git clone -q --bare "$REPO_ROOT" "$FAKE_REMOTE"
-  git clone -q "$FAKE_REMOTE" "$WORKDIR/wt"
-  git -C "$WORKDIR/wt" config user.name "test"
-  git -C "$WORKDIR/wt" config user.email "test@example.com"
+  prepare_fake_remote
   set +e
   ( cd "$WORKDIR/wt" \
     && PATH="$WORKDIR:$PATH" \
@@ -443,8 +462,9 @@ note "PR validation: fixture staging contains ONLY validation files"
 # allowed: README.md (manifest) + fixture-plan.json (identity). Anything
 # else (per-package proposal .md files, real index) is a violation.
 FIX_DIR="$OUT_A/validation/phase5-pr-test-$DIG_A"
-FIX_FILES="$(find "$FIX_DIR" -type f | sed "s#^$FIX_DIR/##" | sort)"
-if [[ "$FIX_FILES" == "$(printf 'fixture-plan.json\nREADME.md\n')" ]] \
+FIX_FILES="$(find "$FIX_DIR" -type f | sed "s#^$FIX_DIR/##" | LC_ALL=C sort)"
+EXPECTED_FIX="$(printf 'README.md\nfixture-plan.json\n')"
+if [[ "$FIX_FILES" == "$EXPECTED_FIX" ]] \
     && ! grep -q '## Automatic proposals' "$FIX_DIR/README.md"; then
   ok "fixture payload is exactly manifest + identity plan (no real proposals)"
 else
