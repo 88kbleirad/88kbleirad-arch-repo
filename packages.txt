@@ -79,3 +79,6 @@ clash-geoip
 # Onboarding batch 5 replacement (reliable sources; staging first)
 bluetuith
 python-aiohttp-cors
+
+# Onboarding batch 6 (on-demand selection; staging first)
+lua-lgi-git
