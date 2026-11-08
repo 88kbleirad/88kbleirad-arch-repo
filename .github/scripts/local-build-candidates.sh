@@ -12,6 +12,9 @@
 # Environment:
 #   BUILD_IMAGE (default pinned digest)
 #   KEEP=1 to keep the container after builds (debug)
+#   EXTRA_REPO (optional, forwarded to build-package.sh, e.g.
+#     EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository")
+#   EXTRA_REPO_FINGERPRINT (optional, expected signing-key fingerprint)
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -27,6 +30,7 @@ rm -rf "$WS"
 mkdir -p "$WS/.github/scripts" "$WS/fake-release"
 cp "$REPO_ROOT/.github/scripts/build-package.sh" "$WS/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/pkg-filename-lib.sh" "$WS/.github/scripts/"
+cp "$REPO_ROOT/.github/scripts/extra-repo-lib.sh" "$WS/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/audit-package-isa.sh" "$WS/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/critical-packages.sh" "$WS/.github/scripts/"
 cp "$REPO_ROOT/.github/scripts/rustc-v4-safe.sh" "$WS/.github/scripts/"
@@ -50,7 +54,10 @@ CID=""
 cleanup() { [[ -n "$CID" && "${KEEP:-0}" != "1" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-CID=$(docker create -v "$WS":/ws -w /ws --entrypoint tail "$IMAGE" -f /dev/null)
+CID=$(docker create \
+  -e EXTRA_REPO="${EXTRA_REPO:-}" \
+  -e EXTRA_REPO_FINGERPRINT="${EXTRA_REPO_FINGERPRINT:-}" \
+  -v "$WS":/ws -w /ws --entrypoint tail "$IMAGE" -f /dev/null)
 docker start "$CID" >/dev/null
 
 docker exec -i "$CID" bash -s <<'EOS'
@@ -65,6 +72,13 @@ if grep -q '^\[options\]$' /etc/pacman.conf; then
   cat "$tmp" > /etc/pacman.conf
   rm -f "$tmp"
 fi
+# Optional extra pacman repo with strict signature enforcement (shared helper).
+# The host workspace is bind-mounted at /ws, so the lib lives at /ws/....
+source /ws/.github/scripts/extra-repo-lib.sh
+# The pinned image ships a keyring without a pacman secret key; --init is
+# idempotent and required before --lsign-key can certify trust.
+pacman-key --init >/dev/null 2>&1
+configure_extra_repo
 pacman -Syu --noconfirm --needed \
   base-devel git subversion mercurial sudo rsync github-cli fakeroot \
   binutils pacman-contrib curl awk tar jq rustup
@@ -108,6 +122,8 @@ for pkg in "${PKGS[@]}"; do
     -e GITHUB_STEP_SUMMARY=/ws/summary-$pkg.md \
     -e FAKE_RELEASE_DIR=/ws/fake-release \
     -e FAKE_EVENTS_LOG=/ws/events-$pkg.log \
+    -e EXTRA_REPO="${EXTRA_REPO:-}" \
+    -e EXTRA_REPO_FINGERPRINT="${EXTRA_REPO_FINGERPRINT:-}" \
     "$CID" bash /ws/.github/scripts/build-package.sh > "$OUT/$pkg.log" 2>&1
   rc=$?
   set -e
