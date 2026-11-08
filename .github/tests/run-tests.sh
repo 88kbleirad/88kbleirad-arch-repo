@@ -142,6 +142,13 @@ else
   bad "CI-safety suite"
 fi
 
+note "extra-repo suite (Phase 8.4 Batch 6; EXTRA_REPO forwarding + signature enforcement)"
+if bash "$REPO_ROOT/.github/tests/test-extra-repo.sh"; then
+  ok "extra-repo suite"
+else
+  bad "extra-repo suite"
+fi
+
 note "artifact-collection suite (Phase 5.4; cross-run REST retrieval)"
 if bash "$REPO_ROOT/.github/tests/test-artifact-collection.sh"; then
   ok "artifact-collection suite"

@@ -135,6 +135,13 @@ check_dependencies_resolvable() {
       # 'gcc-libs'): pacman resolves providers here, so a package
       # name missing from -Si is still installable.
       :
+    elif [[ -n "${EXTRA_REPO:-}" ]] && \
+         sudo -E pacman -Sy --noconfirm >/dev/null 2>&1 && \
+         sudo -E pacman -S --print-format '%n' --noconfirm --needed "$dep" \
+        >/dev/null 2>&1; then
+      # resolvable from the configured extra repository (e.g. a package
+      # published in this repository's own release, such as clash-geoip)
+      :
     else
       unresolved["$dep"]=1
     fi

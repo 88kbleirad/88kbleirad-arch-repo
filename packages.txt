@@ -82,3 +82,4 @@ python-aiohttp-cors
 
 # Onboarding batch 6 (on-demand selection; staging first)
 lua-lgi-git
+mihomo

@@ -179,18 +179,14 @@ if grep -q '^\[options\]$' /etc/pacman.conf; then
 fi
 
 # Optional additional pacman repository (e.g. the repository itself, so
-# inter-package dependencies resolve during syncdeps). Format:
-#   name|url
-# Example: EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"
-if [[ -n "${EXTRA_REPO:-}" ]]; then
-  repo_name="${EXTRA_REPO%%|*}"
-  repo_url="${EXTRA_REPO#*|}"
-  if [[ -z "$repo_name" || -z "$repo_url" || "$repo_name" == "$EXTRA_REPO" ]]; then
-    echo "::error::EXTRA_REPO must be 'name|url'"
-    exit 1
-  fi
-  printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' "$repo_name" "$repo_url" >> /etc/pacman.conf
-fi
+# inter-package dependencies resolve during syncdeps). Format:  name|url
+# Security: SigLevel = Required TrustedOnly; key imported only after its
+# fingerprint matches EXTRA_REPO_FINGERPRINT. See extra-repo-lib.sh.
+source "$WS/.github/scripts/extra-repo-lib.sh"
+# The pinned image ships a keyring without a pacman secret key; --init is
+# idempotent and required before --lsign-key can certify trust.
+pacman-key --init >/dev/null 2>&1
+configure_extra_repo
 
 pacman -Syu --noconfirm --needed \
   base-devel git subversion mercurial sudo rsync github-cli fakeroot \

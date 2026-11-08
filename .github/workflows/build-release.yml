@@ -145,6 +145,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ env.BUILD_IMAGE }}
+          # Published in-repo dependencies (e.g. mihomo -> clash-geoip) resolve
+          # from the signed production release; see build-in-docker.sh.
+          EXTRA_REPO: 88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository
         run: |
           bash "$GITHUB_WORKSPACE/.github/scripts/build-in-docker.sh"
 

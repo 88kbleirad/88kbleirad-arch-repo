@@ -1,6 +1,6 @@
 # Phase 8.4 Batch 6 — On-Demand Package Onboarding (`mihomo`, `lua-lgi-git`)
 
-Status: local implementation + validation PASS for `lua-lgi-git` (`APPROVED_FOR_IMPLEMENTATION`); `mihomo` is `BLOCKED` by an inter-package dependency resolution gap in the isolated container builder (`clash-geoip` is in-repo/published, but `build-in-docker.sh` does not configure `EXTRA_REPO` in `build-staging.yml` or `build-release.yml`, so `makepkg --syncdeps` exits `rc=8` with `error: target not found: clash-geoip`).
+Status: local implementation + validation PASS for `lua-lgi-git` (`APPROVED_FOR_IMPLEMENTATION`). The `mihomo` blocker has been resolved (owner-authorized): `EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"` is now set in `build-staging.yml` and `build-release.yml`, and `build-in-docker.sh` configures the extra repository with `SigLevel = Required TrustedOnly` after verifying the exported public key's fingerprint against the pinned value (`3B9B8E3E5564A77A73B543D049DD327EE8135B62`), so `makepkg --syncdeps` resolves published in-repo dependencies such as `clash-geoip`.
 Remote release operations NOT executed — all publication steps below require explicit owner approval.
 
 ## 1. Candidate selection and repository policy
@@ -53,7 +53,7 @@ No additional packages from `packages.txt` or the host installed inventory were 
   - Because `EXTRA_REPO` is not set in `.github/workflows/build-staging.yml` or `.github/workflows/build-release.yml`, the container's `/etc/pacman.conf` only has official Arch repositories (`core`, `extra`).
   - `pacman` inside the container cannot find `clash-geoip` (`error: target not found: clash-geoip`), causing `makepkg` to abort with exit code `8` (`E_INSTALL_DEPS_FAILED`) and the pipeline build job to fail closed (`rc=1`).
   - Resolving this cleanly requires either passing `EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"` in the build workflow or pre-installing in-repo dependencies in `build-package.sh` — both are common build infrastructure / workflow changes outside the scope of a package-only onboarding PR (Gate 14).
-  - Consequently, `mihomo` is classified **`BLOCKED`** for this PR and preserved outside the active build matrix until the inter-package dependency resolution path is authorized.
+  - Consequently, `mihomo` was classified **`BLOCKED`** until the inter-package dependency resolution path was **owner-authorized and implemented** in this PR (see Section 7 EXTRA_REPO integration). With `EXTRA_REPO` wired, the real pipeline build passes (`rc=0`).
 
 ### Package B: `lua-lgi-git`
 
@@ -78,15 +78,15 @@ No additional packages from `packages.txt` or the host installed inventory were 
 | 4. No unexplained install/build network execution | PASS (standard Go module download during build) | PASS (standard git source clone by makepkg; offline `make` build) |
 | 5. No unexpected privileged operations | REVIEW (ships systemd units with `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE`, not auto-enabled) | PASS (no install script, no systemd units, no capabilities) |
 | 6. No secret requirements | PASS | PASS |
-| 7. Compatible runtime dependencies | **FAIL / BLOCKED** in isolated container (`clash-geoip` is in custom repo, not official Arch repos; `makepkg --syncdeps` fails without `EXTRA_REPO`) | PASS (`glibc`, `glib2`, `libffi`, `lua`, `gobject-introspection-runtime` all in official Arch repos) |
+| 7. Compatible runtime dependencies | **PASS** — `clash-geoip` resolves via configured `EXTRA_REPO` (signed release; `SigLevel = Required TrustedOnly`) | PASS (`glibc`, `glib2`, `libffi`, `lua`, `gobject-introspection-runtime` all in official Arch repos) |
 | 8. Compatible build dependencies | PASS (`go` in official Arch `extra`) | PASS (`git`, `gobject-introspection` in official Arch `extra`) |
-| 9. Single-package output | PASS (when `clash-geoip` is pre-installed) | PASS (`lua-lgi-git-0.9.2.r134.g7a2276f-1-x86_64.pkg.tar.zst`) |
+| 9. Single-package output | PASS (one archive, real build) | PASS (`lua-lgi-git-0.9.2.r134.g7a2276f-1-x86_64.pkg.tar.zst`) |
 | 10. Supported x86-64-v4 build configuration | PASS | PASS (compiled with `-march=x86-64-v4`, `EVEX-heuristic=19`) |
 | 11. Compatible package metadata | PASS | PASS (`packager = 88kbleirad <88kbleirad@users.noreply.github.com>`) |
-| 12. Reproducible/deterministic cache behavior | N/A (blocked at build step) | PASS (fresh `MISS` → `HIT` → repeat `HIT` byte-identical meta → corrupt archive rejected & rebuilt) |
-| 13. Compatibility with existing CI/CD pipeline | **FAIL / BLOCKED** (`build-package.sh` exits `rc=1` via `makepkg rc=8`) | PASS (`build-package.sh` exits `rc=0`) |
-| 14. No unapproved modification to signing/publishing/build infra | Enforced (refused to modify `build-in-docker.sh`/`build-staging.yml` without approval) | PASS (no infra files modified) |
-| **Final Gate Verdict** | **`BLOCKED`** | **`APPROVED_FOR_IMPLEMENTATION`** |
+| 12. Reproducible/deterministic cache behavior | PASS (fresh build MISS → HIT → repeat HIT byte-identical meta → corrupt archive rejected & rebuilt) | PASS (fresh `MISS` → `HIT` → repeat `HIT` byte-identical meta → corrupt archive rejected & rebuilt) |
+| 13. Compatibility with existing CI/CD pipeline | PASS (real pipeline build `rc=0` with `EXTRA_REPO`; `build-package.sh` resolves deps via `sudo -E pacman` fallback) | PASS (`build-package.sh` exits `rc=0`) |
+| 14. No unapproved modification to signing/publishing/build infra | Enforced — infra change explicitly owner-authorized for this PR; no private keys touched | PASS (no infra files modified) |
+| **Final Gate Verdict** | **`APPROVED_FOR_IMPLEMENTATION`** | **`APPROVED_FOR_IMPLEMENTATION`** |
 
 ## 5. Real Docker build, runtime smoke test & cache validation (Phase E)
 
@@ -100,8 +100,10 @@ Executed inside pinned `ghcr.io/archlinux/archlinux@sha256:644576e90a71df3b137df
   - `.PKGINFO` verified: `pkgname = lua-lgi-git`, `pkgbase = lua-lgi-git`, `pkgver = 0.9.2.r134.g7a2276f-1`, `arch = x86_64`, `license = custom:MIT`, `packager = 88kbleirad <88kbleirad@users.noreply.github.com>`.
   - ISA audit (`audit-package-isa.sh`): `corelgilua51.so: EVEX-heuristic=19` (compiled with `-march=x86-64-v4 -O3 -flto=auto`).
 - **`mihomo`**:
-  - Pipeline build exit code: **`rc=1`** (`makepkg exited with code 8`: `error: target not found: clash-geoip`).
-  - Diagnostic verification (with `clash-geoip-202610160207-1-any.pkg.tar.zst` pre-installed via `pacman -U` in a diagnostic container): `makepkg` succeeded (`rc=0`), producing `mihomo-1.19.33-1-x86_64.pkg.tar.zst` (58.62 MiB installed), `ldd /usr/bin/mihomo` linked cleanly (`libresolv.so.2`, `libc.so.6`), and `/usr/bin/mihomo -v` output `Mihomo Meta 1.19.33 linux amd64 with go1.27.3-X:nodwarf5 ... Use tags: with_gvisor`. This confirms the package recipe itself is healthy and the only blocker is the container's lack of `EXTRA_REPO` for in-repo dependencies.
+  - Real pipeline build exit code: **`rc=0`** (`status-built-mihomo.txt` written) with `EXTRA_REPO` wired; `makepkg` succeeded, producing exactly one archive `mihomo-1.19.33-1-x86_64.pkg.tar.zst` (17,547,961 bytes compressed; 61,434,891 bytes installed).
+  - `.PKGINFO` verified: `pkgname = mihomo`, `pkgbase = mihomo`, `pkgver = 1.19.33-1`, `arch = x86_64`, `license = GPL3`, `packager = 88kbleirad <88kbleirad@users.noreply.github.com>`, `depend = glibc`, `depend = clash-geoip`, `provides = clash-meta`, `conflict = clash-meta`.
+  - ISA audit (`audit-package-isa.sh`): `mihomo: EVEX-heuristic=20420` (Go `-buildmode=pie` + `-tags with_gvisor`, v4-targeted toolchain).
+  - Clean-container install plus smoke test (with signed `clash-geoip` installed first): `/usr/bin/mihomo -v` → `Mihomo Meta 1.19.33 linux amd64 with go1.27.3-X:nodwarf5 2026-11-08 17:30:03+00:00 / Use tags: with_gvisor`; `ldd /usr/bin/mihomo` linked cleanly (`libc.so.6`).
 
 ### 5.2 Clean-container runtime smoke test (`lua-lgi-git`)
 
@@ -157,5 +159,11 @@ Executed 4-stage cache lifecycle test in the pinned container using `build-packa
    ```
 3. **Production Dry-Run & Signed Production (`repository`)** (requires owner authorization after staging verification):
    - Expands Production inventory from **29 → 30** packages (`lua-lgi-git` added).
-4. **Unblocking `mihomo` (30 → 31)** (separate owner-approved infrastructure change):
-   - Authorize configuring `EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"` in `build-staging.yml` / `build-release.yml` (or local dependency building in `build-package.sh`) so `makepkg --syncdeps` can install published in-repo dependencies (`clash-geoip`), then onboard `mihomo`.
+4. **Unblocking `mihomo` (30 → 31)** — **DONE (owner-authorized)**:
+   - `EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"` configured in `build-staging.yml` / `build-release.yml`; strict signature enforcement implemented in `.github/scripts/extra-repo-lib.sh` (shared by `build-in-docker.sh` and `local-build-candidates.sh`); `mihomo` onboarded to `packages.txt`. See the EXTRA_REPO section added below.
+
+### EXTRA_REPO integration (secure dependency resolution)
+
+- **Root cause**: `build-in-docker.sh` accepted an `EXTRA_REPO` env var and appended it to the container's `/etc/pacman.conf`, but neither workflow set the variable, so `makepkg --syncdeps` only saw official Arch repos and failed with `rc=8: error: target not found: clash-geoip`. Additionally, `check_dependencies_resolvable()` in `build-package.sh` did not consult the extra repo.
+- **Fix**: both workflows now set `EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"`. The container bootstrap sources the new shared `.github/scripts/extra-repo-lib.sh`, which downloads the release's exported public key (`88kbleirad.pub.asc`), verifies its fingerprint against the pinned `3B9B8E3E5564A77A73B543D049DD327EE8135B62` (fail-closed on mismatch or malformed key), imports and locally signs it via `pacman-key`, and appends the repo with `SigLevel = Required TrustedOnly`. `check_dependencies_resolvable()` in `build-package.sh` also falls back to `pacman -Sy` + re-resolution when `EXTRA_REPO` is set, so the dependency gate no longer lies.
+- **Regression coverage**: new suite `.github/tests/test-extra-repo.sh` (15 tests), registered in `run-tests.sh`; it verifies env forwarding in both workflows, strict `SigLevel`, pinned fingerprint fail-closed behavior, live signed-DB sync and `clash-geoip` resolution in the pinned container, valid detached signature on the `clash-geoip` archive, and rejection of a tampered database.

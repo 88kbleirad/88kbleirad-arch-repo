@@ -62,15 +62,15 @@ exactly one status.
   - `lua-lgi-git` 0.9.2.r134.g7a2276f-1 (x86_64): **APPROVED_FOR_IMPLEMENTATION**
     (Lua 5.5 GI bindings; real-pipeline container build rc=0; Lua 5.5 runtime
     smoke test PASS; cache determinism + corrupt-cache rejection PASS).
-  - `mihomo` 1.19.33-1 (x86_64): **BLOCKED** by inter-package dependency
-    resolution in the isolated container builder (`clash-geoip` is published in
-    `repository` and present in the repo tree, so `check_dependencies_resolvable`
-    passes, but `makepkg --syncdeps` fails with `rc=8: target not found:
-    clash-geoip` because `EXTRA_REPO` is not wired in `build-staging.yml` /
-    `build-release.yml`). Requires a separate owner-approved workflow/infra
-    change before onboarding.
-  - Status: **PHASE_8_4_BATCH6_PARTIALLY_READY** (PR prepared for `lua-lgi-git`;
-    not yet published to staging/production). Details:
+  - `mihomo` 1.19.33-1 (x86_64): **UNBLOCKED** — the inter-package dependency
+    gap was closed via owner-authorized EXTRA_REPO integration: both build
+    workflows forward `EXTRA_REPO` into the build container, a shared
+    `extra-repo-lib.sh` enforces `SigLevel = Required TrustedOnly` with
+    pinned-fingerprint key verification, and the dependency gate in
+    `build-package.sh` re-resolves through the extra repo.
+  - Status: **PHASE_8_4_BATCH6_BOTH_PACKAGES_PR_READY** pending final build
+    verification (EXTRA_REPO forwarding implemented in both workflows;
+    strict signed-repo enforcement in container). Details:
     `docs/inventory/batch6-onboarding.md`.
 - Deferred: open-webui, vikunja (heavy web/Go+frontend), equicord-openasar
   (configured-pending, needs its own validation run).
