@@ -182,7 +182,7 @@ fi
 # inter-package dependencies resolve during syncdeps). Format:  name|url
 # Security: SigLevel = Required TrustedOnly; key imported only after its
 # fingerprint matches EXTRA_REPO_FINGERPRINT. See extra-repo-lib.sh.
-source "$WS/.github/scripts/extra-repo-lib.sh"
+source "$GITHUB_WORKSPACE/.github/scripts/extra-repo-lib.sh"
 # The pinned image ships a keyring without a pacman secret key; --init is
 # idempotent and required before --lsign-key can certify trust.
 pacman-key --init >/dev/null 2>&1
