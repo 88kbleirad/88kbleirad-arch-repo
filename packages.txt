@@ -76,6 +76,6 @@ hw-probe
 # Onboarding batch 4 (clash-geoip; staging first)
 clash-geoip
 
-# Onboarding batch 5 (GTK themes; staging first)
-catppuccin-gtk-theme-frappe
-catppuccin-gtk-theme-mocha
+# Onboarding batch 5 replacement (reliable sources; staging first)
+bluetuith
+python-aiohttp-cors
