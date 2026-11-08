@@ -130,3 +130,38 @@ adds exactly 2 packages + signatures + db updates. Production grows
 2. After merge: signed staging run; verify assets/signatures/db/health.
 3. Then a separate owner-approved production dry-run + signed production run.
 4. Separate work item: PGP keyring bootstrap (arc) and split-package support (maplemono).
+
+---
+
+## 16. Replacement (2026-11-08) — catppuccin GTK themes superseded
+
+The two Catppuccin GTK theme packages (`catppuccin-gtk-theme-frappe`,
+`catppuccin-gtk-theme-mocha`) were not publishable: signed staging builds
+failed because GitHub Release-asset downloads returned repeated HTTP 504
+(release CDN outage). They are **superseded** and removed from `packages.txt`
+and the repo tree; this audit remains as historical record.
+
+### Replacement selection
+
+| Candidate | Result | Reason |
+|---|---|---|
+| `bluetuith` | **SELECTED** | git+ tag source (v0.2.7), verified clone; MIT; Go, single archive; official deps (bluez, dbus); LICENSE packaged; matches published Go/git+ precedent (fzf-git). |
+| `python-aiohttp-cors` | **SELECTED** | PyPI source (`files.pythonhosted.org`, verified sha256), not GitHub CDN; Apache-2.0; arch=any; single archive; Python 3.14 + aiohttp 3.14.3 verified compatible. |
+| `mihomo` | deferred | Source verified + go.mod pinned + `clash-geoip` dep now in-repo; but ships a privileged systemd service (CAP_NET_ADMIN/RAW/BIND_SERVICE) and conflicts/provides `clash-meta` — manual-review profile retained. |
+| `noisetorch` | not selected | Viable (git+ + local submodules) but heavier (Go+cmake+C+go generate); bluetuith is simpler and equally safe. |
+| `nitrogen` | deferred | Uses `releases/download` (the failing path) + PGP (`validpgpkeys`). |
+| `bridge-utils` | rejected | Deprecated; kernel.org mirrors + PGP; no compelling justification. |
+| `betterlockscreen` | deferred | i3lock-color AUR-only PAM dependency unchanged. |
+| `scc`, `typioca` | deferred | Archive sources returned HTTP 504 during verification. |
+
+### Replacement implementation
+
+- Removed `catppuccin-gtk-theme-frappe/`, `catppuccin-gtk-theme-mocha/`
+  and their `packages.txt` entries.
+- Added `bluetuith/` (PKGBUILD + .SRCINFO; MIT LICENSE installed from source)
+  and `python-aiohttp-cors/` (PKGBUILD + .SRCINFO + LICENSE; Apache-2.0
+  LICENSE installed per repo convention).
+- `packages.txt`: `# Onboarding batch 5 replacement (reliable sources; staging first)`
+  with the two entries.
+- Both .SRCINFO byte-identical to `makepkg --printsrcinfo`.
+- Real-pipeline pinned-container builds: rc=0 for both (see §10/11).

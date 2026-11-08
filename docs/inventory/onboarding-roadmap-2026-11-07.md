@@ -50,6 +50,9 @@ exactly one status.
   catppuccin-gtk-theme-mocha APPROVED_WITH_CONDITIONS (implemented).
   arc-icon-theme MANUAL_REVIEW (PGP keyring gap). maplemono-nf-*
   DEFERRED (split-package unsupported). See docs/inventory/batch5-onboarding.md.
+  SUPERSEDED (2026-11-08): the two Catppuccin GTK themes were replaced
+  (staging blocked by GitHub Release 504s) by `bluetuith` and
+  `python-aiohttp-cors` — see docs/inventory/batch5-onboarding.md §16.
 - Deferred: open-webui, vikunja (heavy web/Go+frontend), equicord-openasar
   (configured-pending, needs its own validation run).
 - Never: all Exclude-* buckets (documented above).
