@@ -119,7 +119,29 @@ python3 .github/scripts/validate-workflows-yaml.py .
 REPO_ROOT=$PWD bash .github/tests/run-tests.sh
 ```
 
-## 8. Known limitations
+## 8. Container-suite ownership model (Phase 8.1.1 final)
+- makepkg 7.1 exits `E_FS_PERMISSIONS` (rc=11) when an effective build/
+  output directory is not writable by the build user. On GitHub-hosted
+  runners the host UID is 1001, distinct from the container `builder`
+  (1000), so the harness must hand the workspace to `builder` before
+  every build invocation.
+- `run_build()` now chowns `$WS` to `builder` before each scenario, and
+  host-side mkdir/ep of the workspace go through `ws_mkdir()` (host
+  ownership first). Both are scoped strictly to the dedicated `$WS`.
+- `TEST_BUILDER_UID` (default 1000) makes the container `builder` user
+  use the runner-like UID so the mismatch can be reproduced on any host:
+  `TEST_BUILDER_UID=1001 REPO_ROOT=$PWD bash .github/tests/run-container-tests.sh`.
+- `build-package.sh` runs `ensure_build_dirs_writable()` before invoking
+  makepkg: it resolves the effective BUILDDIR/PKGDEST/SRCDEST (falling
+  back to the package dir exactly as makepkg does) and fails closed with
+  an explicit per-directory diagnostic, never a bare rc=11. It does not
+  require a read-only source tree to be writable when the build/output
+  dirs are explicitly configured writable.
+- `test-ci-safety.sh` asserts these invariants (CI-F15/CI-F16) and the
+  container suite covers the permission preflight with a positive control
+  (CB13).
+
+## 9. Known limitations
 - Live GitHub PR checks cannot be simulated locally; `test-ci-safety.sh`
   asserts workflow *properties*, and a real PR is required for
   `PR_CI_VERIFIED`.

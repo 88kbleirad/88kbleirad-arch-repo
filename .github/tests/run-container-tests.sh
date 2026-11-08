@@ -39,6 +39,9 @@ FAIL=0
 note() { printf '\033[1;34m== %s ==\033[0m\n' "$*"; }
 ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
+# show_log <stage>: print the ENTIRE captured build log for a stage on
+# failure (never only the last few lines), so diagnostics stay complete.
+show_log() { [[ -f "$WORKDIR/$1.log" ]] && cat "$WORKDIR/$1.log" || true; }
 
 # -- trivial package --------------------------------------------------------
 cat > "$WS/hello-v4test/PKGBUILD" <<'PB'
@@ -92,7 +95,18 @@ if grep -q '^\[options\]$' /etc/pacman.conf; then
 fi
 pacman -Syu --noconfirm --needed \
   base-devel git sudo rsync fakeroot binutils pacman-contrib curl awk tar jq rustup
-id builder >/dev/null 2>&1 || useradd -m builder
+# The `builder` build user defaults to UID 1000. GitHub-hosted runners
+# run the host test suite as UID 1001, so `TEST_BUILDER_UID=1001`
+# reproduces the real ownership mismatch between host and container
+# (used by CI/developer runs; absent locally the default 1000 matches
+# the host UID and the mismatch cannot be observed).
+if ! id builder >/dev/null 2>&1; then
+  if [[ -n "${TEST_BUILDER_UID:-}" ]]; then
+    useradd -m -u "${TEST_BUILDER_UID:-1000}" builder
+  else
+    useradd -m builder
+  fi
+fi
 grep -q '^builder ALL=(ALL) NOPASSWD: ALL\$' /etc/sudoers \
   || echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 curl -fSL --retry 3 -o /etc/makepkg.conf \
@@ -115,11 +129,24 @@ ln -sf "$WS/.github/scripts/gh-shim-wrapper" /usr/local/bin/gh
 chown -R builder:builder "$WS"
 EOS
 
+# run_build <stage> [pkg] — run the build pipeline for one stage.
+#
+# Ownership invariant: every invocation must hand the workspace to the
+# container build user `builder` BEFORE makepkg runs. makepkg 7.1's
+# BUILDDIR defaults to the package directory (the start dir), and its
+# `ensure_writable_dir` gate exits with E_FS_PERMISSIONS (rc=11) when
+# that directory is not writable by the build user ("You do not have
+# write permission for the directory $BUILDDIR"). On GitHub-hosted
+# runners the host UID is 1001, distinct from `builder` (1000); the
+# harness's ws_ensure_host_owned() transfers the workspace to the host
+# UID between scenarios, so any later scenario that invokes makepkg
+# without a prior builder chown triggers the rc=11 failure (observed in
+# CI: second cache hit, tampered-cache rebuild, epoch build). The chown
+# is scoped strictly to $WS (the dedicated test workspace); nothing
+# outside it is touched.
 run_build() {
-  # usage: run_build <stage> [pkg]
-  # each stage runs in the shared workspace with a fresh output/ dir;
-  # the result is snapshotted to $WORKDIR/snap-<stage> for assertions
   local stage="$1" pkg="${2:-hello-v4test}"
+  docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
   docker exec "$CID" bash -c "rm -rf '$WS/output'; mkdir -p '$WS/output'; rm -f '$WS/$pkg'/*.pkg.tar.zst"
   docker exec \
     -e GH_TOKEN=dummy \
@@ -148,7 +175,7 @@ rc=$(run_build build)
 if [[ "$rc" -eq 0 ]]; then
   ok "build exit 0"
 else
-  bad "build failed (rc=$rc): $(tail -5 "$WORKDIR/build.log")"
+  bad "build failed (rc=$rc): $(show_log build)"
 fi
 if [[ -f "$WORKDIR/snap-build/status-built-hello-v4test.txt" ]]; then
   ok "status-built written"
@@ -236,6 +263,7 @@ ws_mkdir() {
 
 # build the fake release from the first successful run (snapshot path)
 ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
+touch "$WS/fake-release/.created"
 cp "$WORKDIR/snap-build"/hello-v4test-1.0-1-any.pkg.tar.zst "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
   set -euo pipefail
@@ -253,7 +281,7 @@ rc=$(run_build cache)
 if [[ "$rc" -eq 0 ]]; then
   ok "cache run exit 0"
 else
-  bad "cache run failed (rc=$rc): $(tail -5 "$WORKDIR/cache.log")"
+  bad "cache run failed (rc=$rc): $(show_log cache)"
 fi
 if grep -q "package is up to date" "$WORKDIR/cache.log"; then
   ok "cache hit detected"
@@ -302,7 +330,7 @@ rc=$(run_build cache2)
 if [[ "$rc" -eq 0 ]]; then
   ok "second cache run exit 0"
 else
-  bad "second cache run failed (rc=$rc): $(tail -5 "$WORKDIR/cache2.log")"
+  bad "second cache run failed (rc=$rc): $(show_log cache2)"
 fi
 if [[ -f "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" && -f "$WORKDIR/snap-cache2/v4-hello-v4test.meta.json" ]]; then
   if cmp -s "$WORKDIR/snap-cache/v4-hello-v4test.meta.json" \
@@ -337,7 +365,7 @@ rc=$(run_build tampered)
 if [[ "$rc" -eq 0 ]]; then
   ok "tampered-cache run exit 0 (fallback rebuild)"
 else
-  bad "tampered-cache run failed (rc=$rc): $(tail -5 "$WORKDIR/tampered.log")"
+  bad "tampered-cache run failed (rc=$rc): $(show_log tampered)"
 fi
 if grep -q "failed validation" "$WORKDIR/tampered.log"; then
   ok "tampered cached binary detected via validation"
@@ -379,7 +407,9 @@ package() {
   true
 }
 PB
-chown -R builder:builder "$WS" 2>/dev/null || true
+# hand the workspace to builder via the container (the host runner cannot
+# chown to builder: host UID differs and is non-root)
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
 set +e
 docker exec \
   -e GH_TOKEN=dummy \
@@ -427,7 +457,7 @@ note "epoch package: real build validates + cache hit round-trips"
 # whole path: makepkg produces `hello-epoch-2:1.0-1-any...`; the pipeline
 # must canonicalize to `hello-epoch-2.1.0-1-any...`, validate it, publish
 # it under the canonical name, and reuse it on the next run.
-mkdir -p "$WS/hello-epoch"
+ws_mkdir "$WS/hello-epoch"
 cat > "$WS/hello-epoch/PKGBUILD" <<'PB'
 pkgname=hello-epoch
 epoch=2
@@ -447,7 +477,7 @@ rc=$(run_build epochb hello-epoch)
 if [[ "$rc" -eq 0 ]]; then
   ok "epoch build exit 0"
 else
-  bad "epoch build failed (rc=$rc): $(tail -8 "$WORKDIR/epochb.log")"
+  bad "epoch build failed (rc=$rc): $(show_log epochb)"
 fi
 if [[ -f "$WORKDIR/snap-epochb/status-built-hello-epoch.txt" ]]; then
   ok "epoch status-built written"
@@ -473,6 +503,7 @@ fi
 
 # seed the fake release from the epoch build (db + meta + archive)
 ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
+touch "$WS/fake-release/.created"
 cp "$WORKDIR/snap-epochb"/hello-epoch-2.1.0-1-any.pkg.tar.zst "$WS/fake-release/"
 cp "$WORKDIR/snap-epochb/v4-hello-epoch.meta.json" "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
@@ -488,7 +519,7 @@ rc=$(run_build epochc hello-epoch)
 if [[ "$rc" -eq 0 ]]; then
   ok "epoch cache run exit 0"
 else
-  bad "epoch cache run failed (rc=$rc): $(tail -8 "$WORKDIR/epochc.log")"
+  bad "epoch cache run failed (rc=$rc): $(show_log epochc)"
 fi
 if grep -q "package is up to date" "$WORKDIR/epochc.log"; then
   ok "epoch cache hit detected"
@@ -516,10 +547,10 @@ note "fingerprint loop: SKIP-checksum package cache-hits on repeat run"
 # "PKGBUILD/compiler fingerprint changed" and rebuilt forever. The
 # fingerprint now normalizes the effective PKGBUILD state, so a repeat
 # run with identical inputs must cache-hit.
-mkdir -p "$WS/hello-skip"
+ws_mkdir "$WS/hello-skip"
 # local tarball source: no network needed; updpkgsums can compute the real
 # checksum, exactly like the CI container does for a remote tarball.
-mkdir -p "$WS/src-tarball/hello-skip-1.0/usr/share"
+ws_mkdir "$WS/src-tarball/hello-skip-1.0/usr/share"
 printf 'skip-source\n' > "$WS/src-tarball/hello-skip-1.0/usr/share/hello-skip-data"
 ( cd "$WS/src-tarball" && tar -czf "$WS/hello-skip-1.0.tar.gz" hello-skip-1.0 )
 cat > "$WS/hello-skip/PKGBUILD" <<'PB'
@@ -542,13 +573,14 @@ rc=$(run_build skipb hello-skip)
 if [[ "$rc" -eq 0 ]]; then
   ok "SKIP-checksum build exit 0"
 else
-  bad "SKIP-checksum build failed (rc=$rc): $(tail -8 "$WORKDIR/skipb.log")"
+  bad "SKIP-checksum build failed (rc=$rc): $(show_log skipb)"
 fi
 grep -q 'PKGBUILD/compiler fingerprint changed' "$WORKDIR/skipb.log" \
   && bad "first run should not report fingerprint change" || ok "first run built clean"
 
 # seed the fake release from the first run (db + meta + archive)
 ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
+touch "$WS/fake-release/.created"
 cp "$WORKDIR/snap-skipb"/hello-skip-1.0-1-any.pkg.tar.zst "$WS/fake-release/"
 cp "$WORKDIR/snap-skipb/v4-hello-skip.meta.json" "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
@@ -564,7 +596,7 @@ rc=$(run_build skipc hello-skip)
 if [[ "$rc" -eq 0 ]]; then
   ok "SKIP-checksum repeat run exit 0"
 else
-  bad "SKIP-checksum repeat run failed (rc=$rc): $(tail -8 "$WORKDIR/skipc.log")"
+  bad "SKIP-checksum repeat run failed (rc=$rc): $(show_log skipc)"
 fi
 if grep -q "package is up to date" "$WORKDIR/skipc.log"; then
   ok "SKIP-checksum repeat run is a cache hit (fingerprint loop fixed)"
@@ -584,8 +616,8 @@ note "fingerprint distinctness: different SKIP packages must NOT share a fingerp
 # package hash only the shared makepkg.conf → identical fingerprints for
 # all packages. Two different packages must yield two DIFFERENT
 # fingerprints, and neither may equal the config-only hash.
-mkdir -p "$WS/hello-skip2"
-mkdir -p "$WS/src-tarball/hello-skip2-1.0/usr/share"
+ws_mkdir "$WS/hello-skip2"
+ws_mkdir "$WS/src-tarball/hello-skip2-1.0/usr/share"
 printf 'skip-source-2\n' > "$WS/src-tarball/hello-skip2-1.0/usr/share/hello-skip2-data"
 ( cd "$WS/src-tarball" && tar -czf "$WS/hello-skip2-1.0.tar.gz" hello-skip2-1.0 )
 cat > "$WS/hello-skip2/PKGBUILD" <<'PB'
@@ -690,12 +722,13 @@ rc=$(run_build upbase hello-skip2)
 if [[ "$rc" -eq 0 ]]; then
   ok "baseline v1.0 build exit 0"
 else
-  bad "baseline build failed (rc=$rc): $(tail -5 "$WORKDIR/upbase.log")"
+  bad "baseline build failed (rc=$rc): $(show_log upbase)"
 fi
 BASE_FP=$(jq -r '.fingerprint // empty' "$WORKDIR/snap-upbase/v4-hello-skip2.meta.json" 2>/dev/null || true)
 
 # seed the release with the v1.0 baseline
 ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
+touch "$WS/fake-release/.created"
 cp "$WORKDIR/snap-upbase/hello-skip2-1.0-1-any.pkg.tar.zst" "$WS/fake-release/"
 cp "$WORKDIR/snap-upbase/v4-hello-skip2.meta.json" "$WS/fake-release/"
 docker exec -e WS="$WS" "$CID" bash -c "
@@ -732,7 +765,7 @@ rc=$(run_build upgradeb hello-skip2)
 if [[ "$rc" -eq 0 ]]; then
   ok "upgrade build exit 0"
 else
-  bad "upgrade build failed (rc=$rc): $(tail -5 "$WORKDIR/upgradeb.log")"
+  bad "upgrade build failed (rc=$rc): $(show_log upgradeb)"
 fi
 if [[ -f "$WORKDIR/snap-upgradeb/hello-skip2-2.0-1-any.pkg.tar.zst" ]]; then
   ok "new version archive produced"
@@ -777,6 +810,7 @@ note "corrupted remote metadata: fail closed (rebuild, never blind reuse)"
 # the cache gate sees an unresolvable prev fingerprint and forces a
 # rebuild rather than trusting bad metadata.
 ws_rm "$WS/fake-release"; ws_mkdir "$WS/fake-release"
+touch "$WS/fake-release/.created"
 cp "$WORKDIR/snap-skipb/hello-skip-1.0-1-any.pkg.tar.zst" "$WS/fake-release/"
 printf 'not-json{{{' > "$WS/fake-release/v4-hello-skip.meta.json"
 docker exec -e WS="$WS" "$CID" bash -c "
@@ -790,12 +824,12 @@ rc=$(run_build corruptb hello-skip)
 if [[ "$rc" -eq 0 ]]; then
   ok "corrupt-meta run exit 0 (rebuilt)"
 else
-  bad "corrupt-meta run failed (rc=$rc): $(tail -5 "$WORKDIR/corruptb.log")"
+  bad "corrupt-meta run failed (rc=$rc): $(show_log corruptb)"
 fi
 if grep -q "is not reusable\|PKGBUILD/compiler fingerprint changed\|forcing rebuild" "$WORKDIR/corruptb.log"; then
   ok "corrupt remote meta forced rebuild (fail closed)"
 else
-  bad "corrupt remote meta did not force rebuild: $(tail -5 "$WORKDIR/corruptb.log")"
+  bad "corrupt remote meta did not force rebuild: $(show_log corruptb)"
 fi
 # the corrupted meta must NOT be reused verbatim
 if [[ -f "$WORKDIR/snap-corruptb/v4-hello-skip.meta.json" ]] \
@@ -809,6 +843,102 @@ if [[ -f "$WORKDIR/snap-corruptb/status-built-hello-skip.txt" ]]; then
 else
   bad "corrupt-meta rebuild status missing"
 fi
+
+# ---------------------------------------------------------------------------
+note "missing write permission: explicit diagnostic, never an opaque rc=11"
+# CB13: the write-permission preflight must fail closed BEFORE makepkg
+# runs, emit an explicit diagnostic naming the affected directory, and
+# cause zero publication mutation. The negative run executes as the build
+# user `builder` (the pipeline always invokes makepkg via sudo -u
+# builder) against a dedicated fixture whose only unwritable part is the
+# package directory itself. A positive control then proves the same
+# fixture builds fine once permissions are restored.
+ws_mkdir "$WS/permpkg"
+cat > "$WS/permpkg/PKGBUILD" <<'PB'
+pkgname=permpkg
+pkgver=1.0
+pkgrel=1
+pkgdesc="permission check"
+arch=('any')
+source=()
+sha256sums=()
+package() { install -Dm644 /dev/null "$pkgdir/usr/share/permpkg"; }
+PB
+: > "$WS/events-perm.log"   # fresh event log: any upload/create/delete would be recorded
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'; chmod -R a-w '$WS/permpkg'; mkdir -p '$WS/output'"
+set +e
+# run the whole pipeline AS `builder` (not root) so the failing preflight
+# is exercised under the real build user's permissions.
+docker exec \
+  -u builder \
+  -e GH_TOKEN=dummy \
+  -e GITHUB_REPOSITORY=owner/repo \
+  -e RELEASE_TAG=repository-v4-test \
+  -e REPO_DB_NAME=88kbleirad \
+  -e BUILD_PROFILE=x86-64-v4 \
+  -e PKG=permpkg \
+  -e GITHUB_WORKSPACE="$WS" \
+  -e GITHUB_STEP_SUMMARY="$WS/summary-perm.md" \
+  -e FAKE_RELEASE_DIR="$WS/fake-release" \
+  -e FAKE_EVENTS_LOG="$WS/events-perm.log" \
+  "$CID" bash "$WS/.github/scripts/build-package.sh" > "$WORKDIR/perm.log" 2>&1
+perm_rc=$?
+set -e
+if [[ "$perm_rc" -ne 0 ]]; then
+  ok "missing write permission exits nonzero (rc=$perm_rc)"
+else
+  bad "missing write permission exited 0 (false green)"
+fi
+if grep -q "not writable by the build user" "$WORKDIR/perm.log"; then
+  ok "explicit permission diagnostic emitted"
+else
+  bad "explicit permission diagnostic missing: $(show_log perm)"
+fi
+if grep -qE 'permpkg \(\$BUILDDIR\)|permpkg \(\$PKGDEST\)|permpkg \(\$SRCDEST\)' "$WORKDIR/perm.log"; then
+  ok "diagnostic names the affected directory"
+else
+  bad "diagnostic does not identify the affected directory: $(grep -E 'not writable' "$WORKDIR/perm.log" | head -2)"
+fi
+if grep -qE "makepkg --noconfirm|makepkg --syncdeps|paru " "$WORKDIR/perm.log"; then
+  bad "preflight did not stop before makepkg was invoked"
+else
+  ok "no makepkg invocation (preflight exits before build)"
+fi
+if grep -q "makepkg rc=11\|makepkg exited with code 11" "$WORKDIR/perm.log"; then
+  bad "build produced an opaque makepkg rc=11 (diagnostic preflight failed)"
+else
+  ok "no opaque makepkg rc=11 in output"
+fi
+if [[ -s "$WS/events-perm.log" ]]; then
+  bad "publication mutation recorded despite preflight failure: $(cat "$WS/events-perm.log")"
+else
+  ok "zero publication mutations on preflight failure"
+fi
+if [[ -f "$WS/output/status-failed-permpkg.txt" ]]; then
+  ok "status-failed written (fail closed)"
+else
+  bad "status-failed missing after preflight failure"
+fi
+if ls "$WS/output"/permpkg-*.pkg.tar.zst >/dev/null 2>&1; then
+  bad "archive produced despite unwritable build dir"
+else
+  ok "no archive produced by failing preflight"
+fi
+
+# positive control: restore permissions -> same fixture must build clean
+docker exec "$CID" bash -c "chmod -R u+w '$WS/permpkg'"
+rc=$(run_build permpkg permpkg)
+if [[ "$rc" -eq 0 ]]; then
+  ok "positive control: restored permissions build exit 0"
+else
+  bad "positive control failed (rc=$rc): $(show_log permpkg)"
+fi
+if [[ -f "$WORKDIR/snap-permpkg/status-built-permpkg.txt" ]]; then
+  ok "positive control: status-built written"
+else
+  bad "positive control: status-built missing"
+fi
+docker exec "$CID" bash -c "chown -R builder:builder '$WS'"
 
 # ---------------------------------------------------------------------------
 echo

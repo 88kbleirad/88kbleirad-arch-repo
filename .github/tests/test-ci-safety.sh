@@ -295,6 +295,41 @@ else
   bad "CI-F13 acceptance weakened"
 fi
 
+note "CI-F15: every container build scenario hands the workspace to builder"
+# Regression for the Phase 8.1.1 rc=11 root cause: makepkg 7.1 exits
+# E_FS_PERMISSIONS (11) when its build directory (default: the package
+# dir) is not writable by the build user. On GitHub-hosted runners the
+# host UID (1001) differs from `builder` (1000), so run_build must chown
+# the workspace BEFORE every invocation. Without this, the rebuild
+# scenarios (second cache hit, tampered rebuild, epoch build) fail with
+# an opaque rc=11.
+if grep -q "chown -R builder:builder" "$CC" && grep -q 'run_build()' "$CC"; then
+  ok "CI-F15 run_build owns workspace to builder before each run"
+else
+  bad "CI-F15 run_build builder-chown missing"
+fi
+if grep -q "TEST_BUILDER_UID" "$CC"; then
+  ok "CI-F15 builder UID knob present (reproduces runner uid mismatch)"
+else
+  bad "CI-F15 builder UID knob missing"
+fi
+
+note "CI-F16: build-package.sh fails closed with an explicit permission diagnostic"
+# A non-writable package dir must produce a precise error pointing at the
+# ownership problem, never an opaque makepkg rc=11, and never a
+# false-green success. The diagnostic must be distinguishable from the
+# generic fail-closed path.
+if grep -q "not writable by" "$REPO_ROOT/.github/scripts/build-package.sh"; then
+  ok "CI-F16 build-package.sh explicit permission diagnostic present"
+else
+  bad "CI-F16 build-package.sh permission diagnostic missing"
+fi
+if grep -q "fail-closed" "$REPO_ROOT/.github/scripts/build-package.sh"; then
+  ok "CI-F16 fail-closed wording retained"
+else
+  bad "CI-F16 fail-closed wording missing"
+fi
+
 echo
 echo "ci-safety: PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
