@@ -72,3 +72,6 @@ swaync-git
 
 # Onboarding batch 3 (hw-probe; staging first)
 hw-probe
+
+# Onboarding batch 4 (clash-geoip; staging first)
+clash-geoip

@@ -74,3 +74,16 @@ exactly one status.
    alternative `extra/fastfetch` exists but is not a silent substitute).
 7. hw-probe: all official deps; no AUR-only chain; source verified; default
    probe is offline (upload only with explicit `-upload`); arch=any.
+
+## Batch 4 status (2026-11-08)
+
+Batch 4 was planned dependency-first: mihomo needs clash-geoip;
+betterlockscreen needs i3lock-color.
+
+| Package | Verdict | Evidence |
+|---|---|---|
+| `clash-geoip` | APPROVED_FOR_BATCH4 | AUR 202610160207-1 (pngdeity); arch=any data; no deps; Country.mmdb sha256 `64809d26...c4f9fe` verified against upstream release digest; CC-BY-SA-4.0/GPL-3.0-or-later; installs /etc/clash/Country.mmdb only. Real-pipeline build rc=0; cache round-trip byte-identical. |
+| `mihomo` | NEEDS_MANUAL_REVIEW | Go build feasible; but ships a systemd service with CAP_NET_ADMIN/RAW/BIND_SERVICE and conflicts/provides `clash-meta`. Privileged network daemon — owner review required before onboarding. |
+| `betterlockscreen` | DEFER_TO_LATER_BATCH | arch=any, but depends on `i3lock-color>=2.13.c.3` (AUR-only, PAM-integrated, conflicts official `i3lock`, installs /etc/pam.d/i3lock — security-sensitive). Blocked until i3lock-color is separately reviewed/onboarded. |
+
+Details: `docs/inventory/batch4-staging-prep.md`.
