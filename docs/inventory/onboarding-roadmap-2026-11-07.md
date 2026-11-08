@@ -53,6 +53,12 @@ exactly one status.
   SUPERSEDED (2026-11-08): the two Catppuccin GTK themes were replaced
   (staging blocked by GitHub Release 504s) by `bluetuith` and
   `python-aiohttp-cors` — see docs/inventory/batch5-onboarding.md §16.
+  **Phase 8.3 status: COMPLETE — SIGNED PRODUCTION VERIFIED (2026-11-08).**
+  Published: `bluetuith` 1:0.2.7-1 (x86_64), `python-aiohttp-cors`
+  0.8.1-1 (any). PR #12 merged (`93b0363`). Production inventory expanded
+  27 → 29 (29 archives / 29 signatures / 29 metadata); db GPG-verified;
+  health HEALTHY (rc=0). Details: docs/inventory/batch5-onboarding.md §17.
+- Next: **PHASE_8_4_BATCH6_PLANNING_READY** — Batch 6 planned, not implemented.
 - Deferred: open-webui, vikunja (heavy web/Go+frontend), equicord-openasar
   (configured-pending, needs its own validation run).
 - Never: all Exclude-* buckets (documented above).

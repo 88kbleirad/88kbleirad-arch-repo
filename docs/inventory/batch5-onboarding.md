@@ -165,3 +165,57 @@ and the repo tree; this audit remains as historical record.
   with the two entries.
 - Both .SRCINFO byte-identical to `makepkg --printsrcinfo`.
 - Real-pipeline pinned-container builds: rc=0 for both (see §10/11).
+
+---
+
+## 17. Final closure — signed production release (2026-11-08)
+
+**Status: PHASE_8_3_BATCH5_REPLACEMENT_COMPLETE**
+
+### Published packages
+
+| Package | Version | Archive | Architecture |
+|---|---|---|---|
+| `bluetuith` | 1:0.2.7-1 | `bluetuith-1.0.2.7-1-x86_64.pkg.tar.zst` | x86_64 |
+| `python-aiohttp-cors` | 0.8.1-1 | `python-aiohttp-cors-0.8.1-1-any.pkg.tar.zst` | any |
+
+### Git / CI evidence
+
+- PR #12 merged into `main`; merge commit `93b0363` (`feat(packages): replace Batch 5 with bluetuith and python-aiohttp-cors (#12)`).
+- Three mandatory PR checks (CI Validation static-validation / regression-tests / ci-acceptance): PASS.
+- Local regression: 59 PASS / 0 FAIL. Container UID-1001: 61 PASS / 0 FAIL.
+- Release safety: 23 PASS / 0 FAIL. CI safety: 45 PASS / 0 FAIL.
+- Both pinned-container builds: rc=0, single archive each.
+- Cache determinism (fresh → hit → repeat) and corrupted-cache rejection: PASS for both.
+- Python import smoke test (clean container, aiohttp 3.14.3, Python 3.14): PASS.
+
+### Staging / Production evidence
+
+- Signed staging (`repository-v4-test`) completed; package + database GPG verification passed.
+- Production dry-run passed.
+- Signed production (`repository`) completed.
+- Final production inventory: **29 archives / 29 detached signatures / 29 v4-*.meta.json**.
+- Production database verified: readable; GPG Good signature; signer fingerprint
+  `3B9B8E3E5564A77A73B543D049DD327EE8135B62` (EDDSA); 29 unique package identities,
+  no duplicates, no orphaned assets; every db entry has a matching published archive.
+- `bluetuith` db record: version `1:0.2.7-1`, arch x86_64, filename
+  `bluetuith-1.0.2.7-1-x86_64.pkg.tar.zst`, sha256 + PGPSIG present.
+- `python-aiohttp-cors` db record: version `0.8.1-1`, arch any, filename
+  `python-aiohttp-cors-0.8.1-1-any.pkg.tar.zst`, sha256 + PGPSIG present.
+- Production health check (`repo-health.sh`, signed mode): **HEALTHY (rc=0)** —
+  checksum/database/metadata/signing status all PASS.
+- Limitation: the repository maintains no separate canonical published-inventory list
+  independent of the release assets; cross-validation used three independently
+  fetched release records (database `%FILENAME%`/`%NAME%`, archive assets, meta
+  assets), all 29/29/29 consistent.
+
+### Deferred / superseded
+
+The original Batch 5 GTK candidates `catppuccin-gtk-theme-frappe` and
+`catppuccin-gtk-theme-mocha` are superseded and NOT published: their upstream
+release assets repeatedly returned HTTP 504 during staging. Historical audit
+findings above are preserved for traceability. Do not reintroduce them.
+
+### Next phase
+
+Batch 6 is planning-ready, not implemented: `PHASE_8_4_BATCH6_PLANNING_READY`.
