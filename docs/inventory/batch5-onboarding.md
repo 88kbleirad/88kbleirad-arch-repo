@@ -1,0 +1,132 @@
+# Phase 8.3 Batch 5 — GTK themes (2 approved) + 3 deferred
+
+Status: local implementation + validation PASS for two approved candidates.
+Remote operations NOT executed — all below require owner approval.
+
+## 1. Candidate audit summary
+
+| Candidate | AUR | Upstream | Version | Architecture | License | Dependencies | Verdict |
+|---|---|---|---|---|---|---|---|
+| `arc-icon-theme` | arc-icon-theme (bertptrs) | github.com/horst3180/arc-icon-theme | 20161122-4 | any | GPL-3.0 | gtk-update-icon-cache, hicolor-icon-theme | **MANUAL_REVIEW** — PGP-gated source (`validpgpkeys`) that the CI build container cannot verify (key not in keyring; makepkg does not auto-fetch). Same blocker as neofetch in Batch 3. |
+| `catppuccin-gtk-theme-frappe` | catppuccin-gtk-theme-frappe (Dvd-Znf) | github.com/catppuccin/gtk (archived) | 1.0.3-1 | any | GPL-3.0 | none | **APPROVED_WITH_CONDITIONS** — upstream archived but release assets + AUR maintained; LICENSE added per repo convention. |
+| `catppuccin-gtk-theme-mocha` | catppuccin-gtk-theme-mocha (ameerarsala) | github.com/catppuccin/gtk (archived) | 1.0.3-1 | any | GPL-3.0 | none | **APPROVED_WITH_CONDITIONS** — same as frappe. |
+| `maplemono-nf-cn-unhinted` | maplemono-nf-cn-unhinted | github.com/subframe7536/maple-font | 7.9-1 | any | OFL-1.1 | none | **DEFERRED — SPLIT_PACKAGE_UNSUPPORTED** (see §7). |
+| `maplemono-nf-unhinted` | maplemono-nf-unhinted | github.com/subframe7536/maple-font | 7.9-1 | any | OFL-1.1 | none | **DEFERRED — SPLIT_PACKAGE_UNSUPPORTED** (see §7). |
+
+## 2. AUR and upstream references
+
+- arc-icon-theme: https://aur.archlinux.org/packages/arc-icon-theme · https://github.com/horst3180/arc-icon-theme
+- catppuccin-gtk-theme-frappe: https://aur.archlinux.org/packages/catppuccin-gtk-theme-frappe · https://github.com/catppuccin/gtk
+- catppuccin-gtk-theme-mocha: https://aur.archlinux.org/packages/catppuccin-gtk-theme-mocha · https://github.com/catppuccin/gtk
+- maplemono pkgbase: https://aur.archlinux.org/packages/maplemono · https://github.com/subframe7536/maple-font
+
+## 3. Source and version evidence
+
+- arc: tarball sha512 `5d0f1417...fdfad1` verified vs upstream; signature by key
+  `C57DFF0D28DAAE97` (matches `validpgpkeys=A46FD8E741A2A075898462CDC57DFF0D28DAAE97`).
+- catppuccin frappe: all 14 release zips sha256 verified vs AUR (blue `8c79c1e5...34905` … yellow `71c45ed9...1d9e2`).
+- catppuccin mocha: all 14 release zips sha256 verified vs AUR (blue `83811051...753bdc` … yellow `2be7cf6f...99df643`).
+- maplemono: pkgbase source checksums present in AUR PKGBUILD; not built (deferred).
+
+## 4. License and redistribution analysis
+
+- catppuccin themes: upstream LICENSE is GPL-3.0 (verified byte-identical from
+  v1.0.3 tag, sha256 `3972dc97...b36986`). The AUR package does not ship the
+  license in the archive; this repository's convention (see
+  catppuccin-obs-theme-git, coccoc-browser-stable) ships license files inside
+  the package. Added `LICENSE` as a source + installed to
+  `/usr/share/licenses/$pkgname`. Themes contain CSS/SVG/PNG assets only,
+  redistributable under GPL-3.0.
+- arc: GPL-3.0 COPYING present in source tree; redistribution OK (deferred for PGP, not license).
+- maplemono: OFL-1.1; fonts redistributable; deferred for split-package unsupported, not license.
+
+## 5. Dependencies and conflicts
+
+- catppuccin themes: no runtime deps; no conflicts/provides; install to `/usr/share/themes`.
+- arc: gtk-update-icon-cache + hicolor-icon-theme (both official); no conflicts.
+- maplemono: no deps; no conflicts.
+
+## 6. Architecture decisions
+
+All five are architecture-independent (`arch=any`). The x86-64-v4 build
+profile is orchestration-only for these; the produced packages declare
+`arch = any` — never falsely labeled v4-optimized.
+
+## 7. Security findings
+
+- arc: **PGP keyring gap** — `makepkg` fails with `FAILED (unknown public key
+  C57DFF0D28DAAE97)` in the pinned build container because `validpgpkeys` are
+  not pre-imported (repo has no bootstrap keyring import; all existing
+  `validpgpkeys` packages icu74/linux-nanoka/pacman/scx-manager are unpublished
+  or critical). Onboarding arc requires a build-infra change (trusted-key
+  import) — out of scope for a package PR; flagged for owner review.
+- maplemono: **split-package integration gap** — pkgbase `maplemono` produces
+  11 subpackages (+ debug). The pipeline builds all of them from one dir, but
+  the meta file is keyed to the dir name (`v4-maplemono-nf-unhinted.meta.json`)
+  while the pacman database records `%BASE%=maplemono`, so `validate-release.sh`
+  would demand `v4-maplemono.meta.json` and fail. Onboarding the named
+  subpackages individually without pipeline changes (dir=pkgbase, meta
+  per-base, inventory by base) is not supported. Per owner decision: no
+  publishing-architecture modification; both maplemono candidates deferred.
+
+## 8. Package approval decisions
+
+- APPROVED_WITH_CONDITIONS: catppuccin-gtk-theme-frappe, catppuccin-gtk-theme-mocha
+  (condition: upstream archived; AUR maintained; LICENSE added per repo convention).
+- MANUAL_REVIEW: arc-icon-theme (PGP keyring bootstrap).
+- DEFERRED — SPLIT_PACKAGE_UNSUPPORTED: maplemono-nf-cn-unhinted, maplemono-nf-unhinted.
+
+## 9. Implementation details
+
+- Added `catppuccin-gtk-theme-frappe/`: PKGBUILD (AUR-verbatim + LICENSE install),
+  `.SRCINFO` (regenerated via `makepkg --printsrcinfo`, byte-identical), `LICENSE`.
+- Added `catppuccin-gtk-theme-mocha/`: same.
+- `packages.txt`: `# Onboarding batch 5 (GTK themes; staging first)` +
+  the two entries (no duplicates).
+
+## 10. Local build results
+
+- catppuccin-gtk-theme-frappe: pipeline build rc=0; archive
+  `catppuccin-gtk-theme-frappe-1.0.3-1-any.pkg.tar.zst`; `arch=any`;
+  packager metadata correct; LICENSE member present under
+  `/usr/share/licenses/`.
+- catppuccin-gtk-theme-mocha: same result.
+- arc-icon-theme: build fails in container at PGP verification (rc=1, unknown key) — documented.
+- maplemono: pipeline builds all 11 subarchives but meta mismatch proven (build rc=0; meta `v4-maplemono-nf-unhinted.meta.json` vs db base `maplemono`) — deferred.
+
+## 11. Validation results
+
+- `makepkg --printsrcinfo` vs `.SRCINFO`: identical for both approved packages.
+- Source checksums: all 14+14 zips + LICENSE verified.
+- `bash -n` PKGBUILDs: pass. `git diff --check`: pass.
+- Full regression suite + container suite: see run records (PASS=59 FAIL=0 etc.).
+- Matrix generation (staging + production subset): `["catppuccin-gtk-theme-frappe","catppuccin-gtk-theme-mocha"]` accepted.
+
+## 12. Deferred candidates and blockers
+
+- arc-icon-theme: blocks on PGP keyring bootstrap (build infra change).
+- maplemono-*: blocks on first-class split-package support. Future work item:
+  pkgbase→subpackage mappings, metadata ownership (per-base `v4-<base>.meta.json`),
+  duplicate detection, cache handling, signature generation, database consistency,
+  safe publication, and regression tests.
+
+## 13. Expected staging changes
+
+A future signed staging run (`repository-v4-test`) with
+`packages=catppuccin-gtk-theme-frappe,catppuccin-gtk-theme-mocha`
+adds exactly 2 packages + signatures + db updates. Production grows
+27 → 29 after a separately authorized signed production run.
+
+## 14. Known risks and rollback considerations
+
+- Upstream catppuccin/gtk archived: pinned v1.0.3 assets remain downloadable; AUR
+  packages maintained. If upstream assets disappear, package pins break — monitor.
+- Rollback: remove the two packages.txt lines + dirs in a PR; next staging run
+  prunes them. Production untouched until explicit authorization.
+
+## 15. Next steps
+
+1. Owner review this branch & approve PR.
+2. After merge: signed staging run; verify assets/signatures/db/health.
+3. Then a separate owner-approved production dry-run + signed production run.
+4. Separate work item: PGP keyring bootstrap (arc) and split-package support (maplemono).

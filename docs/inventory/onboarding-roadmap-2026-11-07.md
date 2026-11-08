@@ -46,6 +46,10 @@ exactly one status.
   dependency-first batch, then the consumers.
 - Batch 5 (noarch): arc-icon-theme, catppuccin-gtk-theme-{frappe,mocha},
   maplemono-nf-{cn-,}unhinted, clash-geoip (if not already in Batch 4).
+  Status (2026-11-08): catppuccin-gtk-theme-frappe and
+  catppuccin-gtk-theme-mocha APPROVED_WITH_CONDITIONS (implemented).
+  arc-icon-theme MANUAL_REVIEW (PGP keyring gap). maplemono-nf-*
+  DEFERRED (split-package unsupported). See docs/inventory/batch5-onboarding.md.
 - Deferred: open-webui, vikunja (heavy web/Go+frontend), equicord-openasar
   (configured-pending, needs its own validation run).
 - Never: all Exclude-* buckets (documented above).
