@@ -59,19 +59,19 @@ exactly one status.
   27 → 29 (29 archives / 29 signatures / 29 metadata); db GPG-verified;
   health HEALTHY (rc=0). Details: docs/inventory/batch5-onboarding.md §17.
 - Batch 6 (Phase 8.4 — on-demand selection: `mihomo`, `lua-lgi-git`):
-  - `lua-lgi-git` 0.9.2.r134.g7a2276f-1 (x86_64): **APPROVED_FOR_IMPLEMENTATION**
-    (Lua 5.5 GI bindings; real-pipeline container build rc=0; Lua 5.5 runtime
-    smoke test PASS; cache determinism + corrupt-cache rejection PASS).
-  - `mihomo` 1.19.33-1 (x86_64): **UNBLOCKED** — the inter-package dependency
-    gap was closed via owner-authorized EXTRA_REPO integration: both build
-    workflows forward `EXTRA_REPO` into the build container, a shared
-    `extra-repo-lib.sh` enforces `SigLevel = Required TrustedOnly` with
-    pinned-fingerprint key verification, and the dependency gate in
-    `build-package.sh` re-resolves through the extra repo.
-  - Status: **PHASE_8_4_BATCH6_BOTH_PACKAGES_PR_READY** pending final build
-    verification (EXTRA_REPO forwarding implemented in both workflows;
-    strict signed-repo enforcement in container). Details:
-    `docs/inventory/batch6-onboarding.md`.
+  - `lua-lgi-git` 0.9.2.r134.g7a2276f-1 (x86_64): **PUBLISHED** (onboarding
+    complete; production since 2026-11-09).
+  - `mihomo` 1.19.33-1 (x86_64): **PUBLISHED** (onboarding complete after
+    owner-authorized EXTRA_REPO integration; production since 2026-11-09).
+  - Status: **PHASE_8_4_BATCH6_COMPLETE** — **COMPLETE — SIGNED PRODUCTION
+    VERIFIED**. Production expanded 29 → 31 packages (31 archives / 31
+    signatures / 31 metadata). Staging run `42511015358`, production dry-run
+    `42556285662`, signed production run `42558423232` (commit `1521861`);
+    GPG fingerprint `3B9B8E3E5564A77A73B543D049DD327EE8135B62`; health HEALTHY
+    (rc=0). Details: `docs/inventory/batch6-onboarding.md`.
+  - NEXT_PHASE: **ON_DEMAND_PACKAGE_ONBOARDING_READY** — no Batch 7
+    candidates auto-selected; new onboarding occurs only when the repository
+    owner explicitly selects additional packages.
 - Deferred: open-webui, vikunja (heavy web/Go+frontend), equicord-openasar
   (configured-pending, needs its own validation run).
 - Never: all Exclude-* buckets (documented above).

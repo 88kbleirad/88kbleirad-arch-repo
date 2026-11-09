@@ -1,7 +1,12 @@
 # Phase 8.4 Batch 6 — On-Demand Package Onboarding (`mihomo`, `lua-lgi-git`)
 
-Status: local implementation + validation PASS for `lua-lgi-git` (`APPROVED_FOR_IMPLEMENTATION`). The `mihomo` blocker has been resolved (owner-authorized): `EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"` is now set in `build-staging.yml` and `build-release.yml`, and `build-in-docker.sh` configures the extra repository with `SigLevel = Required TrustedOnly` after verifying the exported public key's fingerprint against the pinned value (`3B9B8E3E5564A77A73B543D049DD327EE8135B62`), so `makepkg --syncdeps` resolves published in-repo dependencies such as `clash-geoip`.
-Remote release operations NOT executed — all publication steps below require explicit owner approval.
+Status: **COMPLETE — SIGNED PRODUCTION VERIFIED** (2026-11-09). Both packages published to Production `repository`; inventory expanded 29 → 31.
+
+Lifecycle evidence (all verified in this phase):
+
+- **Signed Staging**: workflow run `42511015358` — all jobs success on main `1521861`; both packages built, signed, published to `repository-v4-test`; signed DB integrity verified; staging health HEALTHY.
+- **Production Dry-Run**: workflow run `42556285662` — planned 29 → 31; exactly 6 new assets (2 archives + 2 sigs + 2 meta); exactly 8 DB replacements; no deletions/unauthorized mutations; production baseline HEALTHY.
+- **Signed Production**: workflow run `42558423232` on main `1521861` — `unchanged=88 uploaded=6 replaced=8 failed=0`, no stale deletions, remote verification passed, post-publication health HEALTHY (rc=0). Final production: 31 archives / 31 sigs / 31 metadata, signed DB, zero missing/unexpected assets. GPG fingerprint `3B9B8E3E5564A77A73B543D049DD327EE8135B62` verified; DB identity consistency and SHA256 checks verified.
 
 ## 1. Candidate selection and repository policy
 
@@ -147,20 +152,42 @@ Executed 4-stage cache lifecycle test in the pinned container using `build-packa
   - `dashboard/tests/test-dashboard.sh`: `PASS=19 FAIL=0`.
 - Full end-to-end regression suite (`run-tests.sh` including container signing/publish/health/cache and UID-1001 container tests): `PASS=59 FAIL=0` (`run-container-tests.sh` `PASS=61 FAIL=0`).
 
-## 7. Next steps and release readiness
+## 7. Release lifecycle record (staging → production)
 
-1. Review and merge the Batch 6 PR (`feat/phase8.4-batch6-mihomo-lua-lgi`) after GitHub Actions `CI Validation` passes.
-2. **Signed Staging (`repository-v4-test`)** (requires owner authorization):
-   ```bash
-   gh workflow run build-staging.yml \
-     --repo 88kbleirad/88kbleirad-arch-repo \
-     --ref main \
-     --json '{"packages":"lua-lgi-git"}'
-   ```
-3. **Production Dry-Run & Signed Production (`repository`)** (requires owner authorization after staging verification):
-   - Expands Production inventory from **29 → 30** packages (`lua-lgi-git` added).
-4. **Unblocking `mihomo` (30 → 31)** — **DONE (owner-authorized)**:
-   - `EXTRA_REPO="88kbleirad|https://github.com/88kbleirad/88kbleirad-arch-repo/releases/download/repository"` configured in `build-staging.yml` / `build-release.yml`; strict signature enforcement implemented in `.github/scripts/extra-repo-lib.sh` (shared by `build-in-docker.sh` and `local-build-candidates.sh`); `mihomo` onboarded to `packages.txt`. See the EXTRA_REPO section added below.
+All steps below executed with explicit owner authorization; no workflow/package files changed after the PR merge. Main commit for all runs: `1521861`.
+
+### 7.1 Signed Staging — run `42511015358`
+
+- Workflow: `build-staging.yml` on main `1521861`; packages `mihomo,lua-lgi-git`.
+- Job conclusions: prepare / build (mihomo) / build (lua-lgi-git) / publish / health-check — all success.
+- Both archives published to `repository-v4-test` with detached GPG signatures and `v4-*.meta.json`; package signatures verified; signed DB (`88kbleirad.db.tar.gz` + `.sig`) integrity verified; staging health HEALTHY.
+- Staging verdict: `PHASE_8_4_BATCH6_SIGNED_STAGING_PASS`.
+
+### 7.2 Production Dry-Run — run `42556285662`
+
+- Workflow: `build-release.yml` on main `1521861`; `confirm-production=YES`, `signing-mode=signed`, `dry-run=true`.
+- Publish-signed plan: `preflight: all 31 package assets conflict-free`; `Inventory OK: all 2 requested packages are present and validated`; `DRY-RUN: would upload` 6 assets (2 archives + 2 sigs + 2 meta); `DRY-RUN: would replace database` 8 assets; `SUMMARY unchanged=88 uploaded=6 replaced=8 failed=0`; no `would delete` lines; exit 0.
+- Verified read-only: every mutation path gated on `DRY_RUN=1`; production untouched (asset diff empty, 29/29/29, DB sig Good, health HEALTHY).
+- Verdict: `PHASE_8_4_BATCH6_PRODUCTION_DRY_RUN_PASS`.
+
+### 7.3 Signed Production — run `42558423232`
+
+- Workflow: `build-release.yml` on main `1521861`; `confirm-production=YES`, `signing-mode=signed`, `dry-run=false`.
+- Job conclusions: prepare / build (both) / cache-verify / publish-signed / health-check — all success; `publish` (unsigned) correctly skipped.
+- Publish evidence: `preflight: all 31 package assets conflict-free`; `Inventory OK: all 2 requested packages are present and validated`; 29 existing archives + 29 sigs + 29 meta `UNCHANGED`; `NEW` for `mihomo-1.19.33-1-x86_64` (+ `.sig`), `lua-lgi-git-0.9.2.r134.g7a2276f-1-x86_64` (+ `.sig`), `v4-mihomo.meta.json`, `v4-lua-lgi-git.meta.json`; `CHANGED database` ×8; `SUMMARY unchanged=88 uploaded=6 replaced=8 failed=0`; `No stale assets to delete.`; `== Remote verification passed ==`; exit 0.
+- Post-publication verification: 31/31/31 archives/sigs/meta; zero removals; no orphaned sigs; DB sig Good with fingerprint `3B9B8E3E5564A77A73B543D049DD327EE8135B62`; mihomo + lua-lgi-git package sigs Good; DB 31 entries, no duplicates; `mihomo 1.19.33-1 x86_64` and `lua-lgi-git 0.9.2.r134.g7a2276f-1 x86_64`; local sha256 == API digest == DB `%SHA256SUM%`; mihomo declares `depends=('glibc' 'clash-geoip')`; health HEALTHY (rc=0).
+- Verdict: `PHASE_8_4_BATCH6_SIGNED_PRODUCTION_PASS`.
+
+### 7.4 Release asset inventory (final)
+
+- **Package assets**: 31 archives + 31 detached signatures + 31 `v4-*.meta.json` (29 pre-existing preserved byte-identical; 6 new).
+- **Database assets**: `88kbleirad.db`, `88kbleirad.db.tar.gz`, `88kbleirad.files`, `88kbleirad.files.tar.gz` (+ `.sig` for each) — all 8 replaced with freshly signed regenerated DB.
+- **Public-key asset**: `88kbleirad.pub.asc` (signing key export; unchanged).
+- Total release assets: 102.
+
+### 7.5 Known limitation (preserved)
+
+No independent canonical published-inventory list exists in the repository; the expected inventory is derived at publish time from `packages.txt` + the prepare matrix + the live release/DB (verified via `verify-remote-release.sh` and `repo-health.sh`).
 
 ### EXTRA_REPO integration (secure dependency resolution)
 
