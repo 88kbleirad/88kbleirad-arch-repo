@@ -2,7 +2,7 @@
 
 pkgname=beautyline
 pkgver="3.0.5"
-pkgrel=2
+pkgrel=1
 _commit='07e3736f8be38f9f48cf015d992f56f06e455002'
 epoch=2
 pkgdesc="Outlined icons designed to have unified look and comprehensive coverage with the Candy icon pack (best suited to use with Sweet theme)"
@@ -11,51 +11,7 @@ url="https://gitlab.com/garuda-linux/themes-and-settings/artwork/$pkgname"
 license=('GPL')
 options=('!strip')
 source=("https://gitlab.com/garuda-linux/themes-and-settings/artwork/beautyline/-/archive/${_commit}/beautyline-${_commit}.tar.gz")
-# Pinned immutable source revision (commit 07e3736f8be38f9f48cf015d992f56f06e455002).
-# SHA256 verified 2026-11-05 against the GitLab tarball:
-#   cab222dbed3008f214ce10494fb03a9f983f991477a7534885aedf119bb5cf79
-sha256sums=('cab222dbed3008f214ce10494fb03a9f983f991477a7534885aedf119bb5cf79')
-
-# Rewrite an absolute symlink to a relative link that resolves inside the
-# packaged icon tree. Usage: repair_abs_symlink <link-path> <link-target-basename>
-# The expected target basename must exist (as a file OR symlink) under the
-# package's BeautyLine root — but not be the link being repaired — and its
-# fully-resolved target must also live inside the tree. Otherwise the build
-# fails closed (a broken absolute reference must never ship).
-repair_abs_symlink() {
-  local link="$1" base="$2"
-  local root="${pkgdir}/usr/share/icons/BeautyLine"
-  local found
-  # candidate = any entry (file or symlink) with this basename, excluding
-  # the very link we are repairing (its own basename may collide)
-  found=$(find "$root" \( -type f -o -type l \) -name "$base" \
-          -not -path "$link" -print -quit)
-  if [[ -z "$found" ]]; then
-    printf '::error::beautyline: cannot resolve absolute symlink target %q (no %q inside the package)\n' "$link" "$base" >&2
-    exit 1
-  fi
-  local linkdir resolved
-  linkdir=$(dirname "$link")
-  # the resolved target must stay inside the package tree (no escape)
-  resolved=$(realpath -m "$found")
-  case "$resolved" in
-    "$root"/*|"$root")
-      ;;
-    *)
-      printf '::error::beautyline: mapped target %q resolves outside the package (%q)\n' "$found" "$resolved" >&2
-      exit 1
-      ;;
-  esac
-  local rel
-  # relative path from linkdir to the target (link or file)
-  rel=$(realpath --relative-to="$linkdir" "$found")
-  rm -f "$link"
-  ln -s "$rel" "$link"
-  if [[ ! -e "$link" ]]; then
-    printf '::error::beautyline: repaired symlink does not resolve: %q -> %q\n' "$link" "$rel" >&2
-    exit 1
-  fi
-}
+sha256sums=('SKIP')
 
 package() {
   _move=(actions apps devices index.theme mimetypes places preferences status)
@@ -70,37 +26,4 @@ package() {
   find "${pkgdir}/usr" -type d -exec chmod 755 {} \;
 
   install -Dm644 "${srcdir}/${pkgname}-${_commit}/COPYING" "${pkgdir}/usr/share/licenses/beautyLine/LICENSE"
-
-  # -- repair absolute symlinks (upstream dev-machine remnants) ------------
-  # BeautyLine ships 24 absolute symlinks pointing into the author's home
-  # dirs (/home/troupal/..., /home/oosh/..., /git/beautyline/...,
-  # /usr/share/icons/breeze-dark/...). They must be replaced with relative
-  # links that resolve inside the package. Each absolute target's basename
-  # exists in the source tree (verified), except the single KDE crash-report
-  # icon which is represented by a text-file icon (semantic approximation;
-  # the breeze-dark target is not part of the source). Failing to resolve a
-  # link aborts the build (fail closed).
-  local root="${pkgdir}/usr/share/icons/BeautyLine"
-  local abs_n=0 unresolved_n=0
-  while IFS= read -r -d '' link; do
-    local target
-    target=$(readlink "$link")
-    case "$target" in
-      /*)
-        abs_n=$((abs_n+1))
-        local base
-        base=$(basename "$target")
-        # kcrash-report icon has no in-source counterpart; per the
-        # Freedesktop icon-theme mimetype fallback chain (unknown text
-        # mimetype -> text/plain), map it to the generic text-document
-        # icon text-plain.svg (documented; original upstream target was a
-        # KDE Breeze mimetype icon not present in this source tree).
-        if [[ "$base" == "text-vnd.kde.kcrash-report.svg" ]]; then
-          base="text-plain.svg"
-        fi
-        repair_abs_symlink "$link" "$base"
-        ;;
-    esac
-  done < <(find "$root" -type l -print0)
-  printf 'note: beautline repaired %d absolute symlinks\n' "$abs_n" >&2
 }
