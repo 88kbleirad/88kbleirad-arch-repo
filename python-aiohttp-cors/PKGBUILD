@@ -21,10 +21,4 @@ build() {
 package() {
   cd $_name-$pkgver
   python setup.py install --root="$pkgdir" --optimize=1 --skip-build
-  # Install the upstream Apache-2.0 license (repo convention: license file
-  # ships inside the package). The LICENSE is part of the verified source
-  # tarball (aiohttp_cors-0.8.1/LICENSE), so no extra source entry is needed.
-  install -Dm644 \
-    "$srcdir/aiohttp_cors-${pkgver}/LICENSE" \
-    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
